@@ -220,12 +220,12 @@ class Roles(interactions.Extension):
         self.bot: Final[interactions.Client] = bot
         self.config: Final[Config] = Config()
         self.vetting_roles: Data = Data()
-        self.custom_roles: Dict[str, Set[int]] = defaultdict(set)
+        self.custom_roles: Dict[str, Set[int]] = {}
+        self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
+        self.stats: Counter[str] = Counter()
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, ApprovalInfo] = {}
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
-        self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
-        self.stats: Counter[str] = Counter()
         self.cache = TTLCache(maxsize=100, ttl=300)
 
         self.base_path: Final[Path] = Path(__file__).parent
@@ -239,9 +239,25 @@ class Roles(interactions.Extension):
             self.model.load_data("stats.json", Counter[str]),
         ]
         asyncio.gather(*self.load_tasks)
+        self.load_data()
 
-    async def save_data(self, file_name: str, data: T) -> None:
-        await self.model.save_data(file_name, data)
+    async def load_data(self):
+        try:
+            self.vetting_roles = await self.model.load_data("vetting.json", Data)
+            self.custom_roles = await self.model.load_data(
+                "custom.json", Dict[str, Set[int]]
+            )
+            self.incarcerated_members = await self.model.load_data(
+                "incarcerated_members.json", Dict[str, Dict[str, Any]]
+            )
+            self.stats = Counter(
+                await self.model.load_data("stats.json", Dict[str, int])
+            )
+
+            logger.info("All data loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
+            raise
 
     # Decorator
 
@@ -565,7 +581,7 @@ class Roles(interactions.Extension):
     async def configure_custom_roles(
         self, ctx: interactions.SlashContext, roles: str, action: str
     ) -> None:
-        if not self.validate_custom_permissions(ctx):
+        if self.validate_custom_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to use this command."
             )
@@ -585,7 +601,7 @@ class Roles(interactions.Extension):
 
         if updated_roles:
             await self.save_custom_roles()
-            action_past = "added" if action == Action.ADD else "removed"
+            action_past = "added" if action == "add" else "removed"
             await self.send_success(
                 ctx,
                 f"The following roles were {action_past}: {', '.join(updated_roles)}",
@@ -601,7 +617,7 @@ class Roles(interactions.Extension):
         self, ctx: interactions.ContextMenuContext
     ) -> None:
         member: interactions.Member = ctx.target
-        if not self.validate_custom_permissions(ctx):
+        if self.validate_custom_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to use this command."
             )
@@ -613,13 +629,13 @@ class Roles(interactions.Extension):
 
         components = interactions.StringSelectMenu(
             custom_id=f"manage_roles_menu_{member.id}",
-            options=options,
             placeholder="选择操作",
+            *options,
         )
 
         await ctx.send(
             f"选择为{member.mention}的自定义身份组：",
-            components=[components],
+            components=components,
             ephemeral=True,
         )
 
@@ -637,7 +653,7 @@ class Roles(interactions.Extension):
     async def mention_custom_roles(
         self, ctx: interactions.SlashContext, roles: str
     ) -> None:
-        if not self.validate_custom_permissions(ctx):
+        if self.validate_custom_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to use this command."
             )
@@ -1734,9 +1750,7 @@ class Roles(interactions.Extension):
         )
         await asyncio.to_thread(notify_func)
 
-    custom_roles_menu_pattern: Final[re.Pattern] = re.compile(
-        r"manage_roles_menu_([0-9]+)"
-    )
+    custom_roles_menu_pattern = re.compile(r"manage_roles_menu_([0-9]+)")
 
     @lru_cache(maxsize=128)
     def get_custom_role_options(self) -> tuple[interactions.StringSelectOption, ...]:
@@ -1745,7 +1759,7 @@ class Roles(interactions.Extension):
             for role in self.custom_roles.keys()
         )
 
-    @interactions.component_callback(r"manage_roles_menu_[0-9]+")
+    @interactions.component_callback(custom_roles_menu_pattern)
     async def handle_custom_roles_menu(
         self, ctx: interactions.ComponentContext
     ) -> None:
@@ -1777,9 +1791,7 @@ class Roles(interactions.Extension):
             ephemeral=True,
         )
 
-    role_menu_regex_pattern: Final[re.Pattern] = re.compile(
-        r"(add|remove)_roles_menu_([0-9]+)"
-    )
+    role_menu_regex_pattern = re.compile(r"(add|remove)_roles_menu_([0-9]+)")
 
     @interactions.component_callback(r"(add|remove)_roles_menu_[0-9]+")
     async def on_role_menu_select(self, ctx: interactions.ComponentContext) -> None:
@@ -1832,6 +1844,7 @@ class Roles(interactions.Extension):
     async def save_custom_roles(self) -> None:
         try:
             await self.model.save_data("custom.json", self.custom_roles)
+            logger.info("Custom roles saved successfully")
         except Exception as e:
             logger.error(f"Failed to save custom roles: {e}")
             raise
