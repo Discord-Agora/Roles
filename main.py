@@ -1,9 +1,6 @@
 import asyncio
-import inspect
-import itertools
 import logging
 import os
-import re
 import time
 import traceback
 from collections import Counter, defaultdict
@@ -12,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import (
     Any,
@@ -32,12 +30,13 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    cast,
 )
 
 import aiofiles
+import cysimdjson
 import interactions
-from cysimdjson import dumps, loads
+import regex as re
+from cachetools import TTLCache
 from interactions.api.events import (
     ExtensionLoad,
     ExtensionUnload,
@@ -54,10 +53,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE: Final[str] = os.path.join(LOG_DIR, "roles.log")
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-file_handler: Final[logging.handlers.RotatingFileHandler] = (
-    logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=1 * 1024 * 1024, backupCount=1
-    )
+file_handler: Final[RotatingFileHandler] = RotatingFileHandler(
+    LOG_FILE, maxBytes=1 * 1024 * 1024, backupCount=1
 )
 file_handler.setLevel(logging.DEBUG)
 formatter: Final[logging.Formatter] = logging.Formatter(
@@ -70,7 +67,7 @@ logger.addHandler(file_handler)
 # Model
 
 
-T = TypeVar("T")
+T = TypeVar("T", bound=BaseModel)
 P = ParamSpec("P")
 
 
@@ -106,24 +103,26 @@ class Data(BaseModel):
 
 @dataclass(frozen=True)
 class Config:
-    FORUM_ID: int = 1164834982737489930
-    VETTING_ROLE_IDS: List[int] = field(default_factory=lambda: [1200066469300551782])
-    ELECTORAL_ROLE_ID: int = 1200043628899356702
-    APPROVED_ROLE_ID: int = 1282944839679344721
-    TEMPORARY_ROLE_ID: int = 1164761892015833129
-    INCARCERATED_ROLE_ID: int = 1247284720044085370
-    AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
+    VETTING_FORUM_ID: Final[int] = 1164834982737489930
+    VETTING_ROLE_IDS: Final[List[int]] = field(
+        default_factory=lambda: [1200066469300551782]
+    )
+    ELECTORAL_ROLE_ID: Final[int] = 1200043628899356702
+    APPROVED_ROLE_ID: Final[int] = 1282944839679344721
+    TEMPORARY_ROLE_ID: Final[int] = 1164761892015833129
+    INCARCERATED_ROLE_ID: Final[int] = 1247284720044085370
+    AUTHORIZED_CUSTOM_ROLE_IDS: Final[List[int]] = field(
         default_factory=lambda: [1213490790341279754]
     )
-    AUTHORIZED_PENITENTIARY_ROLE_IDS: List[int] = field(
+    AUTHORIZED_PENITENTIARY_ROLE_IDS: Final[List[int]] = field(
         default_factory=lambda: [1200097748259717193, 1247144717083476051]
     )
-    REQUIRED_APPROVALS: int = 3
-    REQUIRED_REJECTIONS: int = 3
-    REJECTION_WINDOW_DAYS: int = 7
-    LOG_CHANNEL_ID: int = 1166627731916734504
+    REQUIRED_APPROVALS: Final[int] = 3
+    REQUIRED_REJECTIONS: Final[int] = 3
+    REJECTION_WINDOW_DAYS: Final[int] = 7
+    LOG_FORUM_ID: Final[int] = 1166627731916734504
     LOG_POST_ID: Final[int] = 1279118293936111707
-    GUILD_ID: int = 1150630510696075404
+    GUILD_ID: Final[int] = 1150630510696075404
 
 
 @dataclass
@@ -142,15 +141,16 @@ class ApprovalInfo:
 
 class Model(Generic[T]):
     def __init__(self):
-        self.base_path = URL(str(Path(__file__).parent))
+        self.base_path: Final[URL] = URL(str(Path(__file__).parent))
         self._data_cache: Dict[str, Any] = {}
-        self._lock = asyncio.Lock()
+        self.parser: Final[cysimdjson.JSONParser] = cysimdjson.JSONParser()
+        self._lock: Final[asyncio.Lock] = asyncio.Lock()
 
     @staticmethod
-    def async_retry(max_retries: int = 3, delay: float = 1.0):
-        def decorator(func):
+    def async_retry(max_retries: int = 3, delay: float = 1.0) -> Callable:
+        def decorator(func: Callable[..., Coroutine]) -> Callable[..., Coroutine]:
             @wraps(func)
-            async def wrapper(*args, **kwargs):
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
                 for attempt in range(max_retries):
                     try:
                         return await func(*args, **kwargs)
@@ -166,6 +166,15 @@ class Model(Generic[T]):
 
         return decorator
 
+    @asynccontextmanager
+    async def _file_operation(self, file_path: Path, mode: str):
+        try:
+            async with aiofiles.open(str(file_path), mode) as file:
+                yield file
+        except IOError as e:
+            logging.error(f"IO operation failed for {file_path}: {e}")
+            raise
+
     @async_retry()
     async def load_data(self, file_name: str, model: Type[T]) -> T:
         async with self._lock:
@@ -174,10 +183,10 @@ class Model(Generic[T]):
 
             file_path = self.base_path / file_name
             try:
-                async with aiofiles.open(str(file_path), "r") as file:
+                async with self._file_operation(file_path, "r") as file:
                     content = await file.read()
-                    data = loads(content)
-                instance = model(**data)
+                    data = self.parser.loads(content)
+                instance = model.parse_obj(data)
                 self._data_cache[file_name] = instance
                 return instance
             except FileNotFoundError:
@@ -194,46 +203,13 @@ class Model(Generic[T]):
         async with self._lock:
             file_path = self.base_path / file_name
             try:
-                json_data = dumps(data.dict(), indent=2)
-                async with aiofiles.open(str(file_path), "w") as file:
+                json_data = self.parser.dumps(data.dict(), indent=2)
+                async with self._file_operation(file_path, "w") as file:
                     await file.write(json_data)
                 self._data_cache[file_name] = data
             except Exception as e:
                 logging.error(f"Error saving {file_name}: {e}")
                 raise
-
-    async def load_vetting_roles(self) -> None:
-        self.vetting_roles = await self.load_data("vetting.json", Data)
-
-    async def load_custom_roles(self) -> None:
-        self.custom_roles = await self.load_data("custom.json", Dict[str, list])
-
-    async def save_custom_roles(self) -> None:
-        await self.save_data("custom.json", self.custom_roles)
-
-    async def load_stats_roles(self) -> None:
-        stats_data = await self.load_data("stats.json", Dict[str, int])
-        self.stats = Counter(stats_data)
-
-    async def save_stats_roles(self) -> None:
-        await self.save_data("stats.json", dict(self.stats))
-
-    async def load_incarcerated_members(self) -> None:
-        self.incarcerated_members = await self.load_data(
-            "incarcerated_members.json", Dict[str, Dict[str, Any]]
-        )
-
-    async def save_incarcerated_members(self) -> None:
-        await self.save_data("incarcerated_members.json", self.incarcerated_members)
-
-    async def clear_cache(self) -> None:
-        async with self._lock:
-            self._data_cache.clear()
-
-    async def refresh_data(self, file_name: str, model: Type[T]) -> T:
-        async with self._lock:
-            self._data_cache.pop(file_name, None)
-            return await self.load_data(file_name, model)
 
 
 # Controller
@@ -250,15 +226,22 @@ class Roles(interactions.Extension):
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
         self.stats: Counter[str] = Counter()
+        self.cache = TTLCache(maxsize=100, ttl=300)
 
         self.base_path: Final[Path] = Path(__file__).parent
+        self.model = Model()
         self.load_tasks: List[Coroutine] = [
-            self.load_data("vetting.json", Data),
-            self.load_data("custom.json", Dict[str, Set[int]]),
-            self.load_data("incarcerated_members.json", Dict[str, Dict[str, Any]]),
-            self.load_data("stats.json", Counter[str]),
+            self.model.load_data("vetting.json", Data),
+            self.model.load_data("custom.json", Dict[str, Set[int]]),
+            self.model.load_data(
+                "incarcerated_members.json", Dict[str, Dict[str, Any]]
+            ),
+            self.model.load_data("stats.json", Counter[str]),
         ]
         asyncio.gather(*self.load_tasks)
+
+    async def save_data(self, file_name: str, data: T) -> None:
+        await self.model.save_data(file_name, data)
 
     # Decorator
 
@@ -339,7 +322,12 @@ class Roles(interactions.Extension):
 
     @lru_cache(maxsize=128)
     def _get_category_role_ids(self, category: str) -> FrozenSet[int]:
-        return frozenset(self.vetting_roles.assigned_roles.get(category, {}).values())
+        cache_key = f"category_role_ids_{category}"
+        if cache_key not in self.cache:
+            self.cache[cache_key] = frozenset(
+                self.vetting_roles.assigned_roles.get(category, {}).values()
+            )
+        return self.cache[cache_key]
 
     async def check_role_assignment_conflicts(
         self,
@@ -378,7 +366,9 @@ class Roles(interactions.Extension):
         embed = interactions.Embed(
             title=title, description=description, color=color.value
         )
-        guild: Optional[interactions.Guild] = await self.bot.fetch_guild(self.GUILD_ID)
+        guild: Optional[interactions.Guild] = await self.bot.fetch_guild(
+            self.config.GUILD_ID
+        )
         if guild and guild.icon:
             embed.set_footer(text=guild.name, icon_url=guild.icon.url)
         embed.timestamp = datetime.now()
@@ -423,7 +413,7 @@ class Roles(interactions.Extension):
 
     @lru_cache(maxsize=1)
     def _get_log_channels(self) -> tuple[int, int]:
-        return self.config.LOG_CHANNEL_ID, self.config.LOG_POST_ID
+        return self.config.LOG_FORUM_ID, self.config.LOG_POST_ID
 
     async def send_response(
         self,
@@ -447,25 +437,25 @@ class Roles(interactions.Extension):
         if ctx:
             tasks.append(ctx.send(embed=embed, ephemeral=True))
 
-        log_channel_id, log_post_id = self._get_log_channels()
+        LOG_FORUM_ID, log_post_id = self._get_log_channels()
 
         async def send_to_channel(channel_id: int) -> None:
             try:
                 channel = await self.bot.fetch_channel(channel_id)
                 if isinstance(
-                    channel, (interactions.TextChannel, interactions.ThreadChannel)
+                    channel, (interactions.GuildText, interactions.ThreadChannel)
                 ):
                     await channel.send(embed=embed)
                 else:
                     logger.error(
                         f"Channel ID {channel_id} is not a valid text or thread channel."
                     )
-            except interactions.errors.NotFound:
+            except NotFound:
                 logger.error(f"Channel with ID {channel_id} not found.")
             except Exception as e:
                 logger.error(f"Error sending message to channel {channel_id}: {e}")
 
-        tasks.extend(map(send_to_channel, (log_channel_id, log_post_id)))
+        tasks.extend(map(send_to_channel, (LOG_FORUM_ID, log_post_id)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1024,7 +1014,7 @@ class Roles(interactions.Extension):
         self.approval_counts[thread.id] = thread_approvals
 
         if thread_approvals.count >= self.config.REQUIRED_APPROVALS:
-            role_updated = await self.update_member_roles(
+            await self.update_member_roles(
                 member, roles["electoral"], roles["approved"], current_roles
             )
             thread_approvals.approval_time = datetime.now()
@@ -1062,7 +1052,7 @@ class Roles(interactions.Extension):
         self.approval_counts[thread.id] = thread_approvals
 
         if abs(thread_approvals.count) >= self.config.REQUIRED_REJECTIONS:
-            role_updated = await self.update_member_roles(
+            await self.update_member_roles(
                 member, roles["approved"], roles["electoral"], current_roles
             )
             await self.send_rejection_notification(thread, member, thread_approvals)
@@ -1146,7 +1136,7 @@ class Roles(interactions.Extension):
     async def view_servant_roles(self, ctx: interactions.SlashContext) -> None:
         await ctx.defer()
         guild = ctx.guild
-        filtered_roles = self.filter_roles(guild.roles)
+        filtered_roles = self.filter_roles(tuple(guild.roles))
         role_members_list = self.extract_role_members_list(filtered_roles)
         total_members = sum(
             role_member.member_count for role_member in role_members_list
@@ -1190,10 +1180,12 @@ class Roles(interactions.Extension):
         await paginator.send(ctx)
 
     @staticmethod
-    @lru_cache(maxsize=None)
-    def filter_roles(roles: Tuple[interactions.Role, ...]) -> List[interactions.Role]:
+    @lru_cache(maxsize=128)
+    def filter_roles(
+        roles: Tuple[interactions.Role, ...]
+    ) -> Tuple[interactions.Role, ...]:
         if not roles:
-            return []
+            return ()
 
         sorted_roles = sorted(roles, key=lambda role: role.position, reverse=True)
         bot_role_index = next(
@@ -1205,14 +1197,14 @@ class Roles(interactions.Extension):
             len(sorted_roles),
         )
 
-        return [
+        return tuple(
             role
-            for role in itertools.islice(sorted_roles, 0, bot_role_index)
+            for role in sorted_roles[:bot_role_index]
             if not role.name.startswith(("——", "══")) and not role.bot_managed
-        ]
+        )
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=128)
     def extract_role_members_list(
         roles: Tuple[interactions.Role, ...]
     ) -> List[Servant]:
@@ -1534,16 +1526,16 @@ class Roles(interactions.Extension):
         if not event.message.author.bot:
             author_id: Final[str] = str(event.message.author.id)
             self.stats[author_id] += 1
-            await self.save_data("stats.json", dict(self.stats))
+            await self.model.save_data("stats.json", dict(self.stats))
 
     @interactions.listen(ExtensionLoad)
-    async def on_extension_load(self, event: ExtensionLoad) -> None:
+    async def on_extension_load(self) -> None:
         self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
 
     @interactions.listen(ExtensionUnload)
-    async def on_extension_unload(self, event: ExtensionUnload) -> None:
+    async def on_extension_unload(self) -> None:
         tasks_to_stop: Final[tuple] = (
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
@@ -1567,7 +1559,7 @@ class Roles(interactions.Extension):
 
         if not all(
             (
-                event.thread.parent_id == self.config.FORUM_ID,
+                event.thread.parent_id == self.config.VETTING_FORUM_ID,
                 event.thread.id not in self.processed_thread_ids,
                 event.thread.owner_id is not None,
             )
@@ -1604,7 +1596,9 @@ class Roles(interactions.Extension):
                     releasable_prisoners.append((member_id, data))
                 elif (release_time - now) <= 60:
                     delay: float = max(0, release_time - now)
-                    asyncio.create_task(self.schedule_release(member_id, data, delay))
+                    asyncio.create_task(
+                        partial(self.schedule_release, member_id, data, delay)
+                    )
             except Exception as e:
                 logger.error(f"Error processing member {member_id}: {e}")
 
@@ -1740,7 +1734,9 @@ class Roles(interactions.Extension):
         )
         await asyncio.to_thread(notify_func)
 
-    custom_roles_menu_pattern: Final = re.compile(r"manage_roles_menu_([0-9]+)")
+    custom_roles_menu_pattern: Final[re.Pattern] = re.compile(
+        r"manage_roles_menu_([0-9]+)"
+    )
 
     @lru_cache(maxsize=128)
     def get_custom_role_options(self) -> tuple[interactions.StringSelectOption, ...]:
@@ -1749,7 +1745,7 @@ class Roles(interactions.Extension):
             for role in self.custom_roles.keys()
         )
 
-    @interactions.component_callback(custom_roles_menu_pattern)
+    @interactions.component_callback(r"manage_roles_menu_[0-9]+")
     async def handle_custom_roles_menu(
         self, ctx: interactions.ComponentContext
     ) -> None:
@@ -1762,7 +1758,7 @@ class Roles(interactions.Extension):
 
         try:
             member: interactions.Member = await ctx.guild.fetch_member(member_id)
-        except interactions.errors.NotFound:
+        except NotFound:
             await self.send_error(ctx, f"Member with ID {member_id} not found.")
             return
 
@@ -1781,9 +1777,11 @@ class Roles(interactions.Extension):
             ephemeral=True,
         )
 
-    role_menu_regex_pattern = re.compile(r"(add|remove)_roles_menu_([0-9]+)")
+    role_menu_regex_pattern: Final[re.Pattern] = re.compile(
+        r"(add|remove)_roles_menu_([0-9]+)"
+    )
 
-    @interactions.component_callback(role_menu_regex_pattern)
+    @interactions.component_callback(r"(add|remove)_roles_menu_[0-9]+")
     async def on_role_menu_select(self, ctx: interactions.ComponentContext) -> None:
         if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
             return await self.send_error(ctx, "Invalid custom ID format.")
@@ -1793,7 +1791,7 @@ class Roles(interactions.Extension):
 
         try:
             member = await ctx.guild.fetch_member(member_id)
-        except interactions.errors.NotFound:
+        except NotFound:
             return await self.send_error(ctx, f"Member with ID {member_id} not found.")
 
         selected_roles = set(ctx.values)
@@ -1833,7 +1831,23 @@ class Roles(interactions.Extension):
 
     async def save_custom_roles(self) -> None:
         try:
-            await self.save_data("custom.json", self.custom_roles)
+            await self.model.save_data("custom.json", self.custom_roles)
         except Exception as e:
             logger.error(f"Failed to save custom roles: {e}")
+            raise
+
+    async def save_stats_roles(self) -> None:
+        try:
+            await self.model.save_data("stats.json", dict(self.stats))
+        except Exception as e:
+            logger.error(f"Failed to save stats roles: {e}")
+            raise
+
+    async def save_incarcerated_members(self) -> None:
+        try:
+            await self.model.save_data(
+                "incarcerated_members.json", self.incarcerated_members
+            )
+        except Exception as e:
+            logger.error(f"Failed to save incarcerated members: {e}")
             raise
