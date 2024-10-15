@@ -196,43 +196,49 @@ class Model(Generic[T]):
                 content = await file.read()
 
             loop = asyncio.get_running_loop()
-            json_data = await loop.run_in_executor(
-                self._executor, self.parser.parse, content
-            )
+            try:
+                json_parsed = await loop.run_in_executor(
+                    self._executor, orjson.loads, content
+                )
+            except orjson.JSONDecodeError:
+                logging.warning(
+                    f"`orjson` failed to parse {file_name}, falling back to `cysimdjson`"
+                )
+                json_parsed = await loop.run_in_executor(
+                    self._executor, self.parser.parse, content
+                )
 
             if issubclass(model, BaseModel):
-                dict_data = {}
-                for key in json_data.keys():
-                    dict_data[key] = json_data.at_pointer(f"/{key}")
-                instance = await loop.run_in_executor(
-                    self._executor, model.model_validate, dict_data
-                )
+                try:
+                    instance = await loop.run_in_executor(
+                        self._executor, model.model_validate, json_parsed
+                    )
+                except ValidationError as ve:
+                    logging.error(f"Validation error for {file_name}: {ve}")
+                    raise
             elif model == Counter:
-                counter_data = {}
-                for key in json_data.keys():
-                    counter_data[key] = json_data.at_pointer(f"/{key}")
-                instance = Counter(counter_data)
+                instance = Counter(json_parsed)
             else:
-                instance = {}
-                for key in json_data.keys():
-                    instance[key] = json_data.at_pointer(f"/{key}")
+                instance = json_parsed
 
             self._data_cache[file_name] = instance
             logging.info(f"Successfully loaded data from {file_name}")
             return instance
         except FileNotFoundError:
-            logging.warning(f"{file_name} not found. Creating an empty file.")
-            default_instance = model()
-            await self.save_data(file_name, default_instance)
-            return default_instance
-        except (ValueError, ValidationError) as e:
-            logging.error(f"Error loading {file_name}: {e}")
-            default_instance = model()
-            await self.save_data(file_name, default_instance)
-            return default_instance
+            logging.info(f"{file_name} not found. Creating a new one.")
+            if issubclass(model, BaseModel):
+                instance = model()
+            elif model == Counter:
+                instance = Counter()
+            else:
+                instance = {}
+
+            await self.save_data(file_name, instance)
+            return instance
         except Exception as e:
-            logging.error(f"Unexpected error loading {file_name}: {e}")
-            raise
+            error_msg = f"Unexpected error loading {file_name}: {e}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
 
     @async_retry(max_retries=3, delay=1.0)
     async def save_data(self, file_name: str, data: T) -> None:
@@ -288,7 +294,18 @@ class Roles(interactions.Extension):
             self.model.load_data("incarcerated_members.json", dict),
             self.model.load_data("stats.json", Counter),
         ]
-        asyncio.gather(*self.load_tasks)
+
+        try:
+            results = asyncio.gather(*self.load_tasks)
+            (
+                self.vetting_roles,
+                self.custom_roles,
+                self.incarcerated_members,
+                self.stats,
+            ) = results
+        except Exception as e:
+            logger.critical(f"Failed to load critical data: {e}")
+            raise
 
     # Decorator
 
@@ -1731,7 +1748,7 @@ class Roles(interactions.Extension):
                     and roles["approved"].id not in member_role_ids
                 ):
                     reason: str = (
-                        f"已发送 {message_count} 条消息，从<@&{self.config.TEMPORARY_ROLE_ID}>升级为<@&{self.config.APPROVED_ROLE_ID}>。"
+                        f"Sent {message_count} messages, upgraded from {self.config.TEMPORARY_ROLE_ID} to {self.config.APPROVED_ROLE_ID}."
                     )
                     return (
                         int(member_id),
