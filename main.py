@@ -399,10 +399,10 @@ class Roles(interactions.Extension):
     ) -> None:
         guild = await self.bot.fetch_guild(thread.guild.id)
 
-        embed = interactions.Embed(
+        embed = await self.create_embed(
             title=f"Voter Identity Approval #{timestamp}",
             description=f"[Click to jump: {thread.name}](https://discord.com/channels/{thread.guild.id}/{thread.id})",
-            color=0x00FFFF,
+            color=EmbedColor.INFO,
         )
 
         async def process_role(role_id: int) -> None:
@@ -453,7 +453,7 @@ class Roles(interactions.Extension):
         if ctx:
             tasks.append(ctx.send(embed=embed, ephemeral=True))
 
-        LOG_FORUM_ID, log_post_id = self._get_log_channels()
+        LOG_FORUM_ID, LOG_POST_ID = self._get_log_channels()
 
         async def send_to_channel(channel_id: int) -> None:
             try:
@@ -471,7 +471,7 @@ class Roles(interactions.Extension):
             except Exception as e:
                 logger.error(f"Error sending message to channel {channel_id}: {e}")
 
-        tasks.extend(map(send_to_channel, (LOG_FORUM_ID, log_post_id)))
+        tasks.extend(map(send_to_channel, (LOG_FORUM_ID, LOG_POST_ID)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -541,7 +541,7 @@ class Roles(interactions.Extension):
     # Command groups
 
     module_base = interactions.SlashCommand(
-        name="roles", description="interactions.Role management commands"
+        name="roles", description="Role management commands"
     )
     module_group_custom: interactions.SlashCommand = module_base.group(
         name="custom", description="Custom roles management"
@@ -563,7 +563,7 @@ class Roles(interactions.Extension):
     )
     @interactions.slash_option(
         name="roles",
-        description="Roles (comma-separated for multiple)",
+        description="Roles",
         opt_type=interactions.OptionType.STRING,
         required=True,
     )
@@ -612,7 +612,7 @@ class Roles(interactions.Extension):
                 "No changes made. The specified roles were already in the desired state.",
             )
 
-    @interactions.user_context_menu(name="自定义身份组")
+    @interactions.user_context_menu(name="Custom Roles")
     @error_handler
     async def custom_roles_context_menu(
         self, ctx: interactions.ContextMenuContext
@@ -630,18 +630,18 @@ class Roles(interactions.Extension):
                 )
 
             options = [
-                interactions.StringSelectOption(label="增添", value="add"),
-                interactions.StringSelectOption(label="移除", value="remove"),
+                interactions.StringSelectOption(label="Add", value="add"),
+                interactions.StringSelectOption(label="Remove", value="remove"),
             ]
 
             components = interactions.StringSelectMenu(
                 custom_id=f"manage_roles_menu_{member.id}",
-                placeholder="选择操作",
+                placeholder="Select action",
                 *options,
             )
 
             await ctx.send(
-                f"选择为{member.mention}的自定义身份组：",
+                f"Choose custom roles for {member.mention}:",
                 components=components,
                 ephemeral=True,
             )
@@ -652,11 +652,11 @@ class Roles(interactions.Extension):
             await self.send_error(ctx, f"An error occurred: {str(e)}")
 
     @module_group_custom.subcommand(
-        "mention", sub_cmd_description="提及自定义身份组成员"
+        "mention", sub_cmd_description="Mention custom role members"
     )
     @interactions.slash_option(
         name="roles",
-        description="roles (comma-separated for multiple)",
+        description="Roles",
         opt_type=interactions.OptionType.STRING,
         required=True,
         autocomplete=True,
@@ -961,7 +961,7 @@ class Roles(interactions.Extension):
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
     ) -> str:
-        if not self.validate_vetting_permissions(ctx):
+        if self.validate_vetting_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to perform this action."
             )
@@ -1166,7 +1166,7 @@ class Roles(interactions.Extension):
 
     # Servant commands
 
-    @module_group_servant.subcommand("view", sub_cmd_description="公职人员名册")
+    @module_group_servant.subcommand("view", sub_cmd_description="Servant Directory")
     async def view_servant_roles(self, ctx: interactions.SlashContext) -> None:
         await ctx.defer()
         guild = ctx.guild
@@ -1178,7 +1178,7 @@ class Roles(interactions.Extension):
 
         embeds = []
         current_embed = await self.create_embed(
-            title=f"公职人员（{total_members}人）名册",
+            title=f"Servant Directory ({total_members} people)",
             description="",
             color=EmbedColor.INFO,
         )
@@ -1190,14 +1190,14 @@ class Roles(interactions.Extension):
                 if field_count >= 25:
                     embeds.append(current_embed)
                     current_embed = await self.create_embed(
-                        title=f"公职人员（{total_members}人）名册",
+                        title=f"Servant Directory ({total_members} people)",
                         description="",
                         color=EmbedColor.INFO,
                     )
                     field_count = 0
 
                 current_embed.add_field(
-                    name=f"{role_member.role_name}（{role_member.member_count}人）",
+                    name=f"{role_member.role_name} ({role_member.member_count} people)",
                     value=members_str,
                     inline=True,
                 )
@@ -1207,7 +1207,7 @@ class Roles(interactions.Extension):
             embeds.append(current_embed)
 
         if not embeds:
-            await self.send_error(ctx, "没有找到符合条件的角色。")
+            await self.send_error(ctx, "No matching roles found.")
             return
 
         paginator = Paginator.create_from_embeds(self.bot, *embeds, timeout=300)
@@ -1274,7 +1274,7 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         duration: str,
     ) -> None:
-        if not self.validate_penitentiary_permissions(ctx):
+        if self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to use this command."
             )
@@ -1319,7 +1319,7 @@ class Roles(interactions.Extension):
     async def release_member(
         self, ctx: interactions.SlashContext, member: interactions.Member
     ) -> None:
-        if not self.validate_penitentiary_permissions(ctx):
+        if self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to use this command."
             )
@@ -1630,9 +1630,7 @@ class Roles(interactions.Extension):
                     releasable_prisoners.append((member_id, data))
                 elif (release_time - now) <= 60:
                     delay: float = max(0, release_time - now)
-                    asyncio.create_task(
-                        partial(self.schedule_release, member_id, data, delay)
-                    )
+                    asyncio.create_task(self.schedule_release(member_id, data, delay))
             except Exception as e:
                 logger.error(f"Error processing member {member_id}: {e}")
 
