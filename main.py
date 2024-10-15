@@ -5,6 +5,7 @@ import re
 import time
 import traceback
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -36,6 +37,7 @@ from typing import (
 import aiofiles
 import cysimdjson
 import interactions
+import orjson
 from cachetools import TTLCache
 from interactions.api.events import (
     ExtensionLoad,
@@ -45,7 +47,7 @@ from interactions.api.events import (
 )
 from interactions.client.errors import NotFound
 from interactions.ext.paginators import Paginator
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from yarl import URL
 
 LOG_DIR: Final[str] = os.path.join(os.path.dirname(__file__), "logs")
@@ -67,7 +69,8 @@ logger.addHandler(file_handler)
 # Model
 
 
-T = TypeVar("T", bound=BaseModel)
+T = TypeVar("T", bound=Union[BaseModel, Counter, Dict[str, Any]])
+
 P = ParamSpec("P")
 
 
@@ -95,10 +98,15 @@ class Action(Enum):
 
 
 class Data(BaseModel):
-    assigned_roles: Dict[str, Dict[str, int]] = {}
-    authorized_roles: Dict[str, int] = {}
-    assignable_roles: Dict[str, List[str]] = {}
-    incarcerated_members: Dict[str, Dict[str, Any]] = {}
+    assigned_roles: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    authorized_roles: Dict[str, int] = Field(default_factory=dict)
+    assignable_roles: Dict[str, List[str]] = Field(default_factory=dict)
+    incarcerated_members: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    class Config:
+        json_encoders = {
+            set: list,
+        }
 
 
 @dataclass(frozen=True)
@@ -144,7 +152,8 @@ class Model(Generic[T]):
         self.base_path: Final[URL] = URL(str(Path(__file__).parent))
         self._data_cache: Dict[str, Any] = {}
         self.parser: Final[cysimdjson.JSONParser] = cysimdjson.JSONParser()
-        self._lock: Final[asyncio.Lock] = asyncio.Lock()
+        self._file_locks: Dict[str, asyncio.Lock] = {}
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     @staticmethod
     def async_retry(max_retries: int = 3, delay: float = 1.0) -> Callable:
@@ -166,50 +175,90 @@ class Model(Generic[T]):
 
         return decorator
 
+    async def _get_file_lock(self, file_name: str) -> asyncio.Lock:
+        return self._file_locks.setdefault(file_name, asyncio.Lock())
+
     @asynccontextmanager
     async def _file_operation(self, file_path: Path, mode: str):
+        async with await self._get_file_lock(str(file_path)):
+            try:
+                async with aiofiles.open(str(file_path), mode) as file:
+                    yield file
+            except IOError as e:
+                logging.error(f"IO operation failed for {file_path}: {e}")
+                raise
+
+    @async_retry(max_retries=3, delay=1.0)
+    async def load_data(self, file_name: str, model: Type[T]) -> T:
+        file_path = self.base_path / file_name
         try:
-            async with aiofiles.open(str(file_path), mode) as file:
-                yield file
-        except IOError as e:
-            logging.error(f"IO operation failed for {file_path}: {e}")
+            async with self._file_operation(file_path, "rb") as file:
+                content = await file.read()
+
+            loop = asyncio.get_running_loop()
+            json_data = await loop.run_in_executor(
+                self._executor, self.parser.parse, content
+            )
+
+            if issubclass(model, BaseModel):
+                dict_data = {}
+                for key in json_data.keys():
+                    dict_data[key] = json_data.at_pointer(f"/{key}")
+                instance = await loop.run_in_executor(
+                    self._executor, model.model_validate, dict_data
+                )
+            elif model == Counter:
+                counter_data = {}
+                for key in json_data.keys():
+                    counter_data[key] = json_data.at_pointer(f"/{key}")
+                instance = Counter(counter_data)
+            else:
+                instance = {}
+                for key in json_data.keys():
+                    instance[key] = json_data.at_pointer(f"/{key}")
+
+            self._data_cache[file_name] = instance
+            logging.info(f"Successfully loaded data from {file_name}")
+            return instance
+        except FileNotFoundError:
+            logging.warning(f"{file_name} not found. Creating an empty file.")
+            default_instance = model()
+            await self.save_data(file_name, default_instance)
+            return default_instance
+        except (ValueError, ValidationError) as e:
+            logging.error(f"Error loading {file_name}: {e}")
+            default_instance = model()
+            await self.save_data(file_name, default_instance)
+            return default_instance
+        except Exception as e:
+            logging.error(f"Unexpected error loading {file_name}: {e}")
             raise
 
-    @async_retry()
-    async def load_data(self, file_name: str, model: Type[T]) -> T:
-        async with self._lock:
-            if file_name in self._data_cache:
-                return self._data_cache[file_name]
-
-            file_path = self.base_path / file_name
-            try:
-                async with self._file_operation(file_path, "r") as file:
-                    content = await file.read()
-                    data = self.parser.loads(content)
-                instance = model.parse_obj(data)
-                self._data_cache[file_name] = instance
-                return instance
-            except FileNotFoundError:
-                logging.warning(f"{file_name} not found. Creating an empty file.")
-                default_instance = model()
-                await self.save_data(file_name, default_instance)
-                return default_instance
-            except (ValueError, ValidationError) as e:
-                logging.error(f"Error loading {file_name}: {e}")
-                raise
-
-    @async_retry()
+    @async_retry(max_retries=3, delay=1.0)
     async def save_data(self, file_name: str, data: T) -> None:
-        async with self._lock:
-            file_path = self.base_path / file_name
-            try:
-                json_data = self.parser.dumps(data.dict(), indent=2)
-                async with self._file_operation(file_path, "w") as file:
-                    await file.write(json_data)
-                self._data_cache[file_name] = data
-            except Exception as e:
-                logging.error(f"Error saving {file_name}: {e}")
-                raise
+        file_path = self.base_path / file_name
+        try:
+            loop = asyncio.get_running_loop()
+            json_data = await loop.run_in_executor(
+                self._executor,
+                partial(
+                    orjson.dumps,
+                    data.dict() if hasattr(data, "dict") else data,
+                    option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY,
+                ),
+            )
+
+            async with self._file_operation(file_path, "wb") as file:
+                await file.write(json_data)
+
+            self._data_cache[file_name] = data
+            logging.info(f"Successfully saved data to {file_name}")
+        except Exception as e:
+            logging.error(f"Error saving {file_name}: {e}")
+            raise
+
+    def __del__(self):
+        self._executor.shutdown(wait=True)
 
 
 # Controller
@@ -222,42 +271,24 @@ class Roles(interactions.Extension):
         self.vetting_roles: Data = Data()
         self.custom_roles: Dict[str, Set[int]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
-        self.stats: Counter[str] = Counter()
+        self.stats: Final[Counter[str]] = Counter()
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, ApprovalInfo] = {}
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
+        self._stats_lock: Final[asyncio.Lock] = asyncio.Lock()
+        self._save_stats_task: asyncio.Task | None = None
+
         self.cache = TTLCache(maxsize=100, ttl=300)
 
         self.base_path: Final[Path] = Path(__file__).parent
         self.model = Model()
         self.load_tasks: List[Coroutine] = [
             self.model.load_data("vetting.json", Data),
-            self.model.load_data("custom.json", Dict[str, Set[int]]),
-            self.model.load_data(
-                "incarcerated_members.json", Dict[str, Dict[str, Any]]
-            ),
-            self.model.load_data("stats.json", Counter[str]),
+            self.model.load_data("custom.json", dict),
+            self.model.load_data("incarcerated_members.json", dict),
+            self.model.load_data("stats.json", Counter),
         ]
         asyncio.gather(*self.load_tasks)
-        self.load_data()
-
-    async def load_data(self):
-        try:
-            self.vetting_roles = await self.model.load_data("vetting.json", Data)
-            self.custom_roles = await self.model.load_data(
-                "custom.json", Dict[str, Set[int]]
-            )
-            self.incarcerated_members = await self.model.load_data(
-                "incarcerated_members.json", Dict[str, Dict[str, Any]]
-            )
-            self.stats = Counter(
-                await self.model.load_data("stats.json", Dict[str, int])
-            )
-
-            logger.info("All data loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading data: {e}")
-            raise
 
     # Decorator
 
@@ -1559,17 +1590,36 @@ class Roles(interactions.Extension):
     async def on_message_create(self, event: MessageCreate) -> None:
         if not event.message.author.bot:
             author_id: Final[str] = str(event.message.author.id)
-            self.stats[author_id] += 1
-            await self.model.save_data("stats.json", dict(self.stats))
+            async with self._stats_lock:
+                self.stats[author_id] += 1
+            await self._debounce_save_stats()
+
+    async def _debounce_save_stats(self) -> None:
+        if self._save_stats_task is not None:
+            self._save_stats_task.cancel()
+        self._save_stats_task = asyncio.create_task(self._delayed_save_stats())
+
+    async def _delayed_save_stats(self) -> None:
+        try:
+            await asyncio.sleep(5)
+            async with self._stats_lock:
+                stats_copy = self.stats.copy()
+            await self.save_stats_roles()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in _delayed_save_stats: {e}", exc_info=True)
+        finally:
+            self._save_stats_task = None
 
     @interactions.listen(ExtensionLoad)
-    async def on_extension_load(self) -> None:
+    async def on_extension_load(self, event: ExtensionLoad) -> None:
         self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
 
     @interactions.listen(ExtensionUnload)
-    async def on_extension_unload(self) -> None:
+    async def on_extension_unload(self, event: ExtensionUnload) -> None:
         tasks_to_stop: Final[tuple] = (
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
@@ -1667,13 +1717,13 @@ class Roles(interactions.Extension):
         }
 
         async def process_member(
-            member_id: int, message_count: int
+            member_id: str, message_count: int
         ) -> Tuple[int, str, List[interactions.Role], List[interactions.Role]]:
             if message_count < 50:
-                return member_id, "", [], []
+                return int(member_id), "", [], []
 
             try:
-                member: interactions.Member = await guild.fetch_member(member_id)
+                member: interactions.Member = await guild.fetch_member(int(member_id))
                 member_role_ids: Set[int] = {role.id for role in member.roles}
 
                 if (
@@ -1683,19 +1733,24 @@ class Roles(interactions.Extension):
                     reason: str = (
                         f"已发送 {message_count} 条消息，从<@&{self.config.TEMPORARY_ROLE_ID}>升级为<@&{self.config.APPROVED_ROLE_ID}>。"
                     )
-                    return member_id, reason, [roles["temporary"]], [roles["approved"]]
+                    return (
+                        int(member_id),
+                        reason,
+                        [roles["temporary"]],
+                        [roles["approved"]],
+                    )
             except Exception as e:
                 logger.error(
                     f"Error processing member {member_id}: {str(e)}\n{traceback.format_exc()}"
                 )
 
-            return member_id, "", [], []
+            return int(member_id), "", [], []
 
         results: List[
             Tuple[int, str, List[interactions.Role], List[interactions.Role]]
         ] = await asyncio.gather(
             *(
-                process_member(int(member_id), count)
+                process_member(member_id, count)
                 for member_id, count in self.stats.items()
             )
         )
@@ -1907,8 +1962,9 @@ class Roles(interactions.Extension):
     async def save_stats_roles(self) -> None:
         try:
             await self.model.save_data("stats.json", dict(self.stats))
+            logger.info(f"Stats saved successfully: {self.stats}")
         except Exception as e:
-            logger.error(f"Failed to save stats roles: {e}")
+            logger.error(f"Failed to save stats roles: {e}", exc_info=True)
             raise
 
     async def save_incarcerated_members(self) -> None:
