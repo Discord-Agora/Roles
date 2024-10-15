@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import traceback
 from collections import Counter, defaultdict
@@ -35,7 +36,6 @@ from typing import (
 import aiofiles
 import cysimdjson
 import interactions
-import regex as re
 from cachetools import TTLCache
 from interactions.api.events import (
     ExtensionLoad,
@@ -613,38 +613,50 @@ class Roles(interactions.Extension):
             )
 
     @interactions.user_context_menu(name="自定义身份组")
+    @error_handler
     async def custom_roles_context_menu(
         self, ctx: interactions.ContextMenuContext
     ) -> None:
-        member: interactions.Member = ctx.target
-        if self.validate_custom_permissions(ctx):
-            return await self.send_error(
-                ctx, "You don't have permission to use this command."
+        try:
+            logger.info(f"Context menu triggered for user: {ctx.target.id}")
+
+            member: interactions.Member = ctx.target
+            if self.validate_custom_permissions(ctx):
+                logger.warning(
+                    f"User {ctx.author.id} lacks permission for custom roles menu"
+                )
+                return await self.send_error(
+                    ctx, "You don't have permission to use this command."
+                )
+
+            options = [
+                interactions.StringSelectOption(label="增添", value="add"),
+                interactions.StringSelectOption(label="移除", value="remove"),
+            ]
+
+            components = interactions.StringSelectMenu(
+                custom_id=f"manage_roles_menu_{member.id}",
+                placeholder="选择操作",
+                *options,
             )
 
-        options = [
-            interactions.StringSelectOption(label="增添", value="add"),
-            interactions.StringSelectOption(label="移除", value="remove"),
-        ]
-
-        components = interactions.StringSelectMenu(
-            custom_id=f"manage_roles_menu_{member.id}",
-            placeholder="选择操作",
-            *options,
-        )
-
-        await ctx.send(
-            f"选择为{member.mention}的自定义身份组：",
-            components=components,
-            ephemeral=True,
-        )
+            await ctx.send(
+                f"选择为{member.mention}的自定义身份组：",
+                components=components,
+                ephemeral=True,
+            )
+            logger.info(f"Context menu response sent for user: {ctx.target.id}")
+        except Exception as e:
+            logger.error(f"Error in custom_roles_context_menu: {str(e)}")
+            logger.error(traceback.format_exc())
+            await self.send_error(ctx, f"An error occurred: {str(e)}")
 
     @module_group_custom.subcommand(
         "mention", sub_cmd_description="提及自定义身份组成员"
     )
     @interactions.slash_option(
         name="roles",
-        description="身份组 (comma-separated for multiple)",
+        description="roles (comma-separated for multiple)",
         opt_type=interactions.OptionType.STRING,
         required=True,
         autocomplete=True,
@@ -822,23 +834,29 @@ class Roles(interactions.Extension):
         )
         await manage_func(ctx, member, role_ids)
 
-    @staticmethod
-    def create_autocomplete(
-        role_type: str,
-    ) -> Callable[[Any, interactions.AutocompleteContext], Coroutine[Any, Any, None]]:
-        async def autocomplete_roles(
-            self, ctx: interactions.AutocompleteContext
-        ) -> None:
-            return await self.autocomplete_vetting_role(ctx, role_type)
+    @assign_vetting_roles.autocomplete("ideology")
+    async def autocomplete_ideology_assign(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "ideology")
 
-        return autocomplete_roles
+    @assign_vetting_roles.autocomplete("domicile")
+    async def autocomplete_domicile_assign(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "domicile")
 
-    assign_vetting_roles.autocomplete("ideology")(create_autocomplete("ideology"))
-    assign_vetting_roles.autocomplete("domicile")(create_autocomplete("domicile"))
-    assign_vetting_roles.autocomplete("status")(create_autocomplete("status"))
-    remove_vetting_roles.autocomplete("ideology")(create_autocomplete("ideology"))
-    remove_vetting_roles.autocomplete("domicile")(create_autocomplete("domicile"))
-    remove_vetting_roles.autocomplete("status")(create_autocomplete("status"))
+    @assign_vetting_roles.autocomplete("status")
+    async def autocomplete_status_assign(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "status")
+
+    @remove_vetting_roles.autocomplete("ideology")
+    async def autocomplete_ideology_remove(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "ideology")
+
+    @remove_vetting_roles.autocomplete("domicile")
+    async def autocomplete_domicile_remove(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "domicile")
+
+    @remove_vetting_roles.autocomplete("status")
+    async def autocomplete_status_remove(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "status")
 
     async def autocomplete_vetting_role(
         self, ctx: interactions.AutocompleteContext, role_type: str
@@ -1750,16 +1768,11 @@ class Roles(interactions.Extension):
         )
         await asyncio.to_thread(notify_func)
 
-    custom_roles_menu_pattern = re.compile(r"manage_roles_menu_([0-9]+)")
+    custom_roles_menu_pattern: Final[re.Pattern] = re.compile(
+        r"manage_roles_menu_([0-9]+)"
+    )
 
-    @lru_cache(maxsize=128)
-    def get_custom_role_options(self) -> tuple[interactions.StringSelectOption, ...]:
-        return tuple(
-            interactions.StringSelectOption(label=role, value=role)
-            for role in self.custom_roles.keys()
-        )
-
-    @interactions.component_callback(custom_roles_menu_pattern)
+    @interactions.component_callback("manage_roles_menu_*")
     async def handle_custom_roles_menu(
         self, ctx: interactions.ComponentContext
     ) -> None:
@@ -1776,12 +1789,27 @@ class Roles(interactions.Extension):
             await self.send_error(ctx, f"Member with ID {member_id} not found.")
             return
 
+        options = [
+            interactions.StringSelectOption(label=role, value=role)
+            for role in self.custom_roles.keys()
+        ]
+
+        if not options:
+            await self.send_error(ctx, "No custom roles available.")
+            return
+
+        if len(options) > 25:
+            await self.send_error(
+                ctx, "Too many custom roles. Pagination not implemented yet."
+            )
+            return
+
         components = [
             interactions.StringSelectMenu(
                 custom_id=f"{action}_roles_menu_{member.id}",
-                options=self.get_custom_role_options(),
                 placeholder="Select role",
                 max_values=1,
+                *options,
             )
         ]
 
@@ -1791,41 +1819,70 @@ class Roles(interactions.Extension):
             ephemeral=True,
         )
 
-    role_menu_regex_pattern = re.compile(r"(add|remove)_roles_menu_([0-9]+)")
+    role_menu_regex_pattern: Final[re.Pattern] = re.compile(
+        r"(add|remove)_roles_menu_([0-9]+)"
+    )
 
-    @interactions.component_callback(r"(add|remove)_roles_menu_[0-9]+")
+    @interactions.component_callback("add_roles_menu_*", "remove_roles_menu_*")
     async def on_role_menu_select(self, ctx: interactions.ComponentContext) -> None:
-        if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
-            return await self.send_error(ctx, "Invalid custom ID format.")
-
-        action, member_id = match.groups()
-        member_id = int(member_id)
-
         try:
-            member = await ctx.guild.fetch_member(member_id)
-        except NotFound:
-            return await self.send_error(ctx, f"Member with ID {member_id} not found.")
-
-        selected_roles = set(ctx.values)
-        updated_roles = await self.update_custom_roles(
-            member_id, selected_roles, Action(action)
-        )
-
-        if updated_roles:
-            action_past = "added to" if action == "add" else "removed from"
-            await self.send_success(
-                ctx,
-                f"The following roles have been {action_past} {member.mention}: {', '.join(sorted(updated_roles))}",
+            logger.info(
+                f"on_role_menu_select triggered with custom_id: {ctx.custom_id}"
             )
-        else:
-            await self.send_error(ctx, "No roles were updated.")
+
+            if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
+                logger.error(f"Invalid custom ID format: {ctx.custom_id}")
+                return await self.send_error(ctx, "Invalid custom ID format.")
+
+            action, member_id = match.groups()
+            member_id = int(member_id)
+            logger.info(f"Parsed action: {action}, member_id: {member_id}")
+
+            try:
+                member = await ctx.guild.fetch_member(member_id)
+            except NotFound:
+                logger.error(f"Member with ID {member_id} not found.")
+                return await self.send_error(
+                    ctx, f"Member with ID {member_id} not found."
+                )
+
+            if not ctx.values:
+                logger.warning("No role selected.")
+                return await self.send_error(ctx, "No role selected.")
+
+            selected_role = ctx.values[0]
+            logger.info(f"Selected role: {selected_role}")
+
+            updated_roles = await self.update_custom_roles(
+                member_id, {selected_role}, Action(action)
+            )
+
+            if updated_roles:
+                action_past = "added to" if action == "add" else "removed from"
+                success_message = (
+                    f"The role {selected_role} has been {action_past} {member.mention}."
+                )
+                logger.info(success_message)
+                await self.send_success(ctx, success_message)
+                await self.save_custom_roles()
+            else:
+                logger.warning("No roles were updated.")
+                await self.send_error(ctx, "No roles were updated.")
+
+        except Exception as e:
+            logger.error(f"Error in on_role_menu_select: {str(e)}")
+            logger.error(traceback.format_exc())
+            await self.send_error(ctx, f"An unexpected error occurred: {str(e)}")
 
     async def update_custom_roles(
         self, user_id: int, roles: Set[str], action: Action
     ) -> Set[str]:
         updated_roles = set()
         for role in roles:
-            role_members = self.custom_roles.setdefault(role, set())
+            if role not in self.custom_roles:
+                self.custom_roles[role] = set()
+
+            role_members = self.custom_roles[role]
             if action == Action.ADD:
                 if user_id not in role_members:
                     role_members.add(user_id)
