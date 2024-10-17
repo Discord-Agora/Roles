@@ -1,7 +1,6 @@
 aiofiles
 cysimdjson
 discord-py-interactions
-regex
 cachetools
 pydantic
 yarl
