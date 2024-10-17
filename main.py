@@ -207,8 +207,9 @@ class Model(Generic[T]):
                 json_parsed = await loop.run_in_executor(
                     self._executor, self.parser.parse, content
                 )
-
-            if issubclass(model, BaseModel):
+            if file_name == "custom.json":
+                instance = {role: set(members) for role, members in json_parsed.items()}
+            elif issubclass(model, BaseModel):
                 try:
                     instance = await loop.run_in_executor(
                         self._executor, model.model_validate, json_parsed
@@ -295,17 +296,20 @@ class Roles(interactions.Extension):
             self.model.load_data("stats.json", Counter),
         ]
 
+        asyncio.create_task(self.load_initial_data())
+
+    async def load_initial_data(self):
         try:
-            results = asyncio.gather(*self.load_tasks)
+            results = await asyncio.gather(*self.load_tasks)
             (
                 self.vetting_roles,
                 self.custom_roles,
                 self.incarcerated_members,
                 self.stats,
             ) = results
+            logger.info("Initial data loaded successfully")
         except Exception as e:
             logger.critical(f"Failed to load critical data: {e}")
-            raise
 
     # Decorator
 
@@ -320,7 +324,7 @@ class Roles(interactions.Extension):
         ) -> T:
             try:
                 result = await asyncio.shield(func(self, ctx, *args, **kwargs))
-                logger.info(f"{func.__name__} completed successfully: {result}")
+                logger.info(f"`{func.__name__}` completed successfully: {result}")
                 return result
             except asyncio.CancelledError:
                 logger.warning(f"{func.__name__} was cancelled")
@@ -359,16 +363,23 @@ class Roles(interactions.Extension):
     def get_vetting_role_ids(self) -> frozenset[int]:
         return frozenset(self.vetting_roles.authorized_roles.values())
 
-    validate_vetting_permissions: Callable[[Any, interactions.ContextType], bool] = (
-        create_role_validator(get_vetting_role_ids)
-    )
+    def validate_vetting_permissions(self, ctx: interactions.ContextType) -> bool:
+        user_role_ids = set(role.id for role in ctx.author.roles)
+        vetting_role_ids = self.get_vetting_role_ids()
+        common_roles = user_role_ids & vetting_role_ids
+
+        result = bool(common_roles)
+
+        return result
 
     def validate_vetting_permissions_with_roles(
         self, ctx: interactions.ContextType, role_ids_to_add: Iterable[int]
     ) -> bool:
-        return self.validate_vetting_permissions(ctx) and frozenset(
-            role_ids_to_add
-        ).issubset(self.get_assignable_role_ids())
+        has_vetting_permission = self.validate_vetting_permissions(ctx)
+        assignable_roles = self.get_assignable_role_ids()
+        roles_are_assignable = frozenset(role_ids_to_add).issubset(assignable_roles)
+
+        return has_vetting_permission and roles_are_assignable
 
     get_custom_role_ids: Callable[[], frozenset[int]] = lambda self: frozenset(
         self.config.AUTHORIZED_CUSTOM_ROLE_IDS
@@ -436,7 +447,7 @@ class Roles(interactions.Extension):
         if guild and guild.icon:
             embed.set_footer(text=guild.name, icon_url=guild.icon.url)
         embed.timestamp = datetime.now()
-        embed.set_footer(text="键政大舞台")
+        embed.set_footer(text="鍵政大舞台")
         return embed
 
     async def notify_vetting_reviewers(
@@ -561,25 +572,25 @@ class Roles(interactions.Extension):
         )
 
         reviewers_text = (
-            "、".join(f"<@{reviewer_id}>" for reviewer_id in approval_info.reviewer_ids)
-            or "尚未核准"
+            ", ".join(f"<@{reviewer_id}>" for reviewer_id in approval_info.reviewer_ids)
+            or "Not yet approved"
         )
 
         embed = await self.create_embed(
-            title="成员身份核准",
-            description=f"核准数：{approval_count}/{required_count}\n核准人：{reviewers_text}",
+            title="Member Identity Approval",
+            description=f"Approvals: {approval_count}/{required_count}\nReviewers: {reviewers_text}",
             color=EmbedColor.INFO,
         )
 
         buttons = [
             interactions.Button(
                 style=interactions.ButtonStyle.SUCCESS,
-                label="核准",
+                label="Approve",
                 custom_id="approve",
             ),
             interactions.Button(
                 style=interactions.ButtonStyle.DANGER,
-                label="拒收",
+                label="Reject",
                 custom_id="reject",
             ),
         ]
@@ -863,7 +874,14 @@ class Roles(interactions.Extension):
         )
 
         if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
-            await self.send_error(ctx, "Invalid permissions.")
+            if not self.validate_vetting_permissions(ctx):
+                await self.send_error(
+                    ctx, "You don't have permission to perform this action."
+                )
+            else:
+                await self.send_error(
+                    ctx, "Some of the roles you're trying to assign are not assignable."
+                )
             return
 
         if not role_ids:
@@ -1226,7 +1244,7 @@ class Roles(interactions.Extension):
 
         embeds = []
         current_embed = await self.create_embed(
-            title=f"Servant Directory ({total_members} people)",
+            title=f"Servant Directory ({total_members} members)",
             description="",
             color=EmbedColor.INFO,
         )
@@ -1238,14 +1256,14 @@ class Roles(interactions.Extension):
                 if field_count >= 25:
                     embeds.append(current_embed)
                     current_embed = await self.create_embed(
-                        title=f"Servant Directory ({total_members} people)",
+                        title=f"Servant Directory ({total_members} members)",
                         description="",
                         color=EmbedColor.INFO,
                     )
                     field_count = 0
 
                 current_embed.add_field(
-                    name=f"{role_member.role_name} ({role_member.member_count} people)",
+                    name=f"{role_member.role_name} ({role_member.member_count} members)",
                     value=members_str,
                     inline=True,
                 )
@@ -1302,16 +1320,18 @@ class Roles(interactions.Extension):
 
     # Penitentiary commands
 
-    @module_group_penitentiary.subcommand("incarcerate", sub_cmd_description="監禁")
+    @module_group_penitentiary.subcommand(
+        "incarcerate", sub_cmd_description="Incarcerate"
+    )
     @interactions.slash_option(
         name="member",
-        description="成员",
+        description="Member",
         required=True,
         opt_type=interactions.OptionType.USER,
     )
     @interactions.slash_option(
         name="duration",
-        description="监禁时长 (例如: 1d 2h 30m)",
+        description="Incarceration duration (e.g.: 1d 2h 30m)",
         required=True,
         opt_type=interactions.OptionType.STRING,
     )
@@ -1342,7 +1362,7 @@ class Roles(interactions.Extension):
         matches = duration_regex.findall(duration.lower())
         if not matches:
             raise ValueError(
-                "Invalid duration format. Use combinations of 'd' (days), 'h' (hours), and 'm' (minutes)."
+                "Invalid duration format. Use combinations of `d` (days), `h` (hours), and `m` (minutes)."
             )
 
         total_seconds = sum(
@@ -1355,10 +1375,10 @@ class Roles(interactions.Extension):
 
         return timedelta(seconds=total_seconds)
 
-    @module_group_penitentiary.subcommand("release", sub_cmd_description="解禁")
+    @module_group_penitentiary.subcommand("release", sub_cmd_description="Release")
     @interactions.slash_option(
         name="member",
-        description="成员",
+        description="Member",
         required=True,
         opt_type=interactions.OptionType.USER,
         autocomplete=True,
@@ -1603,13 +1623,13 @@ class Roles(interactions.Extension):
 
     # Events
 
-    @interactions.listen(MessageCreate)
-    async def on_message_create(self, event: MessageCreate) -> None:
-        if not event.message.author.bot:
-            author_id: Final[str] = str(event.message.author.id)
-            async with self._stats_lock:
-                self.stats[author_id] += 1
-            await self._debounce_save_stats()
+    # @interactions.listen(MessageCreate)
+    # async def on_message_create(self, event: MessageCreate) -> None:
+    #     if not event.message.author.bot:
+    #         author_id: Final[str] = str(event.message.author.id)
+    #      async with self._stats_lock:
+    #             self.stats[author_id] += 1
+    #         await self._debounce_save_stats()
 
     async def _debounce_save_stats(self) -> None:
         if self._save_stats_task is not None:
@@ -1620,8 +1640,7 @@ class Roles(interactions.Extension):
         try:
             await asyncio.sleep(5)
             async with self._stats_lock:
-                stats_copy = self.stats.copy()
-            await self.save_stats_roles()
+                await self.save_stats_roles()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -1631,14 +1650,14 @@ class Roles(interactions.Extension):
 
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
-        self.update_roles_based_on_activity.start()
+        # self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
         tasks_to_stop: Final[tuple] = (
-            self.update_roles_based_on_activity,
+            # self.update_roles_based_on_activity,
             self.cleanup_old_locks,
             self.check_incarcerated_members,
         )
@@ -1838,11 +1857,9 @@ class Roles(interactions.Extension):
         )
         await asyncio.to_thread(notify_func)
 
-    custom_roles_menu_pattern: Final[re.Pattern] = re.compile(
-        r"manage_roles_menu_([0-9]+)"
-    )
+    custom_roles_menu_pattern = re.compile(r"manage_roles_menu_(\d+)")
 
-    @interactions.component_callback("manage_roles_menu_*")
+    @interactions.component_callback(custom_roles_menu_pattern)
     async def handle_custom_roles_menu(
         self, ctx: interactions.ComponentContext
     ) -> None:
@@ -1851,6 +1868,11 @@ class Roles(interactions.Extension):
             return
 
         member_id: int = int(match.group(1))
+
+        if not ctx.values:
+            await self.send_error(ctx, "No action selected.")
+            return
+
         action: Literal["add", "remove"] = ctx.values[0]
 
         try:
@@ -1876,10 +1898,10 @@ class Roles(interactions.Extension):
 
         components = [
             interactions.StringSelectMenu(
+                *options,
                 custom_id=f"{action}_roles_menu_{member.id}",
                 placeholder="Select role",
                 max_values=1,
-                *options,
             )
         ]
 
@@ -1889,24 +1911,27 @@ class Roles(interactions.Extension):
             ephemeral=True,
         )
 
-    role_menu_regex_pattern: Final[re.Pattern] = re.compile(
-        r"(add|remove)_roles_menu_([0-9]+)"
-    )
+    role_menu_regex_pattern = re.compile(r"(add|remove)_roles_menu_(\d+)")
 
-    @interactions.component_callback("add_roles_menu_*", "remove_roles_menu_*")
+    @interactions.component_callback(role_menu_regex_pattern)
     async def on_role_menu_select(self, ctx: interactions.ComponentContext) -> None:
         try:
             logger.info(
                 f"on_role_menu_select triggered with custom_id: {ctx.custom_id}"
             )
 
-            if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
+            match = self.role_menu_regex_pattern.match(ctx.custom_id)
+            if not match:
                 logger.error(f"Invalid custom ID format: {ctx.custom_id}")
                 return await self.send_error(ctx, "Invalid custom ID format.")
 
             action, member_id = match.groups()
             member_id = int(member_id)
             logger.info(f"Parsed action: {action}, member_id: {member_id}")
+
+            if action not in [Action.ADD.value, Action.REMOVE.value]:
+                logger.error(f"Invalid action: {action}")
+                return await self.send_error(ctx, f"Invalid action: {action}")
 
             try:
                 member = await ctx.guild.fetch_member(member_id)
@@ -1970,7 +1995,10 @@ class Roles(interactions.Extension):
 
     async def save_custom_roles(self) -> None:
         try:
-            await self.model.save_data("custom.json", self.custom_roles)
+            serializable_custom_roles = {
+                role: list(members) for role, members in self.custom_roles.items()
+            }
+            await self.model.save_data("custom.json", serializable_custom_roles)
             logger.info("Custom roles saved successfully")
         except Exception as e:
             logger.error(f"Failed to save custom roles: {e}")
