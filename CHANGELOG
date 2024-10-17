@@ -1,0 +1,28 @@
+## 2024-10-17
+### Major Changes
+- Implemented the MVC pattern.
+- Separated the Model from the Controller in `interactions.Extension`.
+### Refactoring
+- Organized the Controller into distinct sections.
+- Streamlined JSON parsing and error handling in the Model:
+  - Replaced `cysimdjson` with `orjson` for improved performance.
+  - Simplified data extraction into dictionaries for model validation.
+  - Enhanced error handling for file not found and validation errors.
+  - Updated logging messages for better traceability.
+- Optimized role management and improved code structure:
+  - Removed custom roles set conversion to enhance performance.
+  - Simplified vetting permissions validation.
+  - Enhanced error handling and input validation.
+  - Optimized callback registrations for role menus.
+  - Minor code cleanup and formatting improvements.
+### Performance Improvements
+- Replaced unsupported `as_dict()` method with `at_pointer()` for `cysimdjson`.
+- Implemented separate parsing logic for `BaseModel`, `Counter`, and `dict` types.
+### Features
+- Introduced `vetting.json` with updated assignable roles.
+### Fixes
+- Corrected JSON parsing in the `load_data` method of the Model.
+- Resolved issues with `cysimdjson` JSONObject parsing.
+- Fixed minor bugs related to role management and validation.
+### Documentation
+- Updated `README` for version 2024.10.17.
