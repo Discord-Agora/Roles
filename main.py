@@ -128,6 +128,7 @@ class Config:
     REQUIRED_APPROVALS: Final[int] = 3
     REQUIRED_REJECTIONS: Final[int] = 3
     REJECTION_WINDOW_DAYS: Final[int] = 7
+    LOG_CHANNEL_ID: Final[int] = 1159097493875871784
     LOG_FORUM_ID: Final[int] = 1159097493875871784
     LOG_POST_ID: Final[int] = 1279118293936111707
     GUILD_ID: Final[int] = 1150630510696075404
@@ -487,8 +488,12 @@ class Roles(interactions.Extension):
         await asyncio.gather(*(process_role(role_id) for role_id in reviewer_role_ids))
 
     @lru_cache(maxsize=1)
-    def _get_log_channels(self) -> tuple[int, int]:
-        return self.config.LOG_FORUM_ID, self.config.LOG_POST_ID
+    def _get_log_channels(self) -> tuple[int, int, int]:
+        return (
+            self.config.LOG_CHANNEL_ID,
+            self.config.LOG_POST_ID,
+            self.config.LOG_FORUM_ID,
+        )
 
     async def send_response(
         self,
@@ -512,25 +517,44 @@ class Roles(interactions.Extension):
         if ctx:
             tasks.append(ctx.send(embed=embed, ephemeral=True))
 
-        LOG_FORUM_ID, LOG_POST_ID = self._get_log_channels()
+        LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
 
         async def send_to_channel(channel_id: int) -> None:
             try:
                 channel = await self.bot.fetch_channel(channel_id)
-                if isinstance(
-                    channel, (interactions.GuildText, interactions.ThreadChannel)
-                ):
+                if isinstance(channel, interactions.GuildText):
                     await channel.send(embed=embed)
                 else:
                     logger.error(
-                        f"Channel ID {channel_id} is not a valid text or thread channel."
+                        f"Channel ID {channel_id} is not a valid text channel."
                     )
             except NotFound:
                 logger.error(f"Channel with ID {channel_id} not found.")
             except Exception as e:
                 logger.error(f"Error sending message to channel {channel_id}: {e}")
 
-        tasks.extend(map(send_to_channel, (LOG_FORUM_ID, LOG_POST_ID)))
+        async def send_to_forum_post(forum_id: int, post_id: int) -> None:
+            try:
+                forum = await self.bot.fetch_channel(forum_id)
+                if isinstance(forum, interactions.GuildForum):
+                    post = await forum.fetch_message(post_id)
+                    if isinstance(post, interactions.Message):
+                        await post.reply(embed=embed)
+                    else:
+                        logger.error(f"Post with ID {post_id} is not a valid message.")
+                else:
+                    logger.error(f"Channel ID {forum_id} is not a valid forum channel.")
+            except NotFound:
+                logger.error(
+                    f"Forum or post not found. Forum ID: {forum_id}, Post ID: {post_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error sending message to forum post. Forum ID: {forum_id}, Post ID: {post_id}. Error: {e}"
+                )
+
+        tasks.append(send_to_channel(LOG_CHANNEL_ID))
+        tasks.append(send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1109,22 +1133,22 @@ class Roles(interactions.Extension):
         if roles["electoral"].id in current_roles:
             return await self.send_error(ctx, "This member has already been approved.")
 
-        thread_approvals.count += 1
-        thread_approvals.reviewers.add(ctx.author.id)
+        thread_approvals.approval_count += 1
+        thread_approvals.reviewer_ids.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
-        if thread_approvals.count >= self.config.REQUIRED_APPROVALS:
+        if thread_approvals.approval_count >= self.config.REQUIRED_APPROVALS:
             await self.update_member_roles(
                 member, roles["electoral"], roles["approved"], current_roles
             )
-            thread_approvals.approval_time = datetime.now()
+            thread_approvals.last_approval_time = datetime.now()
             await self.send_approval_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Approved {member.mention} and updated roles"
         else:
             return await self.send_success(
                 ctx,
-                f"Approval registered. Current approvals: {thread_approvals.count}/{self.config.REQUIRED_APPROVALS}",
+                f"Approval registered. Current approvals: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
             )
 
     async def process_rejection(
@@ -1139,7 +1163,7 @@ class Roles(interactions.Extension):
         if roles["electoral"].id not in current_roles:
             return await self.send_error(ctx, "This member is not currently approved.")
 
-        if thread_approvals.approval_time and self.is_rejection_window_closed(
+        if thread_approvals.last_approval_time and self.is_rejection_window_closed(
             thread_approvals
         ):
             return await self.send_error(
@@ -1147,11 +1171,11 @@ class Roles(interactions.Extension):
                 f"The {self.config.REJECTION_WINDOW_DAYS}-day window for rejection has passed.",
             )
 
-        thread_approvals.count -= 1
-        thread_approvals.reviewers.add(ctx.author.id)
+        thread_approvals.approval_count -= 1
+        thread_approvals.reviewer_ids.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
-        if abs(thread_approvals.count) >= self.config.REQUIRED_REJECTIONS:
+        if abs(thread_approvals.approval_count) >= self.config.REQUIRED_REJECTIONS:
             await self.update_member_roles(
                 member, roles["approved"], roles["electoral"], current_roles
             )
@@ -1161,7 +1185,7 @@ class Roles(interactions.Extension):
         else:
             return await self.send_success(
                 ctx,
-                f"Rejection registered. Current rejections: {abs(thread_approvals.count)}/{self.config.REQUIRED_REJECTIONS}",
+                f"Rejection registered. Current rejections: {abs(thread_approvals.approval_count)}/{self.config.REQUIRED_REJECTIONS}",
             )
 
     def is_rejection_window_closed(self, thread_approvals: ApprovalInfo) -> bool:
@@ -1207,7 +1231,7 @@ class Roles(interactions.Extension):
         thread_approvals: ApprovalInfo,
     ) -> None:
         reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
+            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewer_ids
         )
         await self.send_success(
             thread,
@@ -1222,7 +1246,7 @@ class Roles(interactions.Extension):
         thread_approvals: ApprovalInfo,
     ) -> None:
         reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
+            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewer_ids
         )
         await self.send_success(
             thread,
