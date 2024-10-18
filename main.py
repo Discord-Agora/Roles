@@ -361,12 +361,9 @@ class Roles(interactions.Extension):
             )
         )
 
-    def get_vetting_role_ids(self) -> frozenset[int]:
-        return frozenset(self.vetting_roles.authorized_roles.values())
-
     def validate_vetting_permissions(self, ctx: interactions.ContextType) -> bool:
         user_role_ids = set(role.id for role in ctx.author.roles)
-        vetting_role_ids = self.get_vetting_role_ids()
+        vetting_role_ids = set(self.config.VETTING_ROLE_IDS)
         common_roles = user_role_ids & vetting_role_ids
 
         result = bool(common_roles)
@@ -1051,7 +1048,7 @@ class Roles(interactions.Extension):
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
     ) -> str:
-        if self.validate_vetting_permissions(ctx):
+        if not self.validate_vetting_permissions(ctx):
             return await self.send_error(
                 ctx, "You don't have permission to perform this action."
             )
