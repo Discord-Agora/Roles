@@ -128,7 +128,7 @@ class Config:
     REQUIRED_APPROVALS: Final[int] = 3
     REQUIRED_REJECTIONS: Final[int] = 3
     REJECTION_WINDOW_DAYS: Final[int] = 7
-    LOG_CHANNEL_ID: Final[int] = 1159097493875871784
+    LOG_CHANNEL_ID: Final[int] = 1166627731916734504
     LOG_FORUM_ID: Final[int] = 1159097493875871784
     LOG_POST_ID: Final[int] = 1279118293936111707
     GUILD_ID: Final[int] = 1150630510696075404
@@ -146,6 +146,7 @@ class ApprovalInfo:
     approval_count: int = 0
     reviewer_ids: Set[int] = field(default_factory=set)
     last_approval_time: Optional[datetime] = None
+    reviewers: Set[int] = field(default_factory=set)
 
 
 class Model(Generic[T]):
@@ -469,20 +470,18 @@ class Roles(interactions.Extension):
                     logger.error(f"Reviewer role with ID {role_id} not found.")
                     return
 
-                async def send_embed(member: interactions.Member) -> None:
+                for member in role.members:
                     try:
                         await member.send(embed=embed)
+                        logger.info(f"Sent notification to member {member.id}")
                     except Exception as e:
                         logger.error(f"Failed to send embed to {member.id}: {str(e)}")
 
-                await asyncio.gather(
-                    *(send_embed(member) for member in role.members),
-                    return_exceptions=True,
-                )
             except Exception as e:
                 logger.error(f"Error processing role {role_id}: {str(e)}")
 
         await asyncio.gather(*(process_role(role_id) for role_id in reviewer_role_ids))
+        logger.info(f"Notifications sent for thread {thread.id}")
 
     @lru_cache(maxsize=1)
     def _get_log_channels(self) -> tuple[int, int, int]:
@@ -504,6 +503,7 @@ class Roles(interactions.Extension):
         title: str,
         message: str,
         color: EmbedColor,
+        log_to_channel: bool = True,
     ) -> None:
         embed: Final[interactions.Embed] = await self.create_embed(
             title, message, color
@@ -514,46 +514,46 @@ class Roles(interactions.Extension):
         if ctx:
             tasks.append(ctx.send(embed=embed, ephemeral=True))
 
-        LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
-
-        async def send_to_channel(channel_id: int) -> None:
-            try:
-                channel = await self.bot.fetch_channel(channel_id)
-                if isinstance(channel, interactions.GuildText):
-                    await channel.send(embed=embed)
-                else:
-                    logger.error(
-                        f"Channel ID {channel_id} is not a valid text channel."
-                    )
-            except NotFound:
-                logger.error(f"Channel with ID {channel_id} not found.")
-            except Exception as e:
-                logger.error(f"Error sending message to channel {channel_id}: {e}")
-
-        async def send_to_forum_post(forum_id: int, post_id: int) -> None:
-            try:
-                forum = await self.bot.fetch_channel(forum_id)
-                if isinstance(forum, interactions.GuildForum):
-                    post = await forum.fetch_message(post_id)
-                    if isinstance(post, interactions.Message):
-                        await post.reply(embed=embed)
-                    else:
-                        logger.error(f"Post with ID {post_id} is not a valid message.")
-                else:
-                    logger.error(f"Channel ID {forum_id} is not a valid forum channel.")
-            except NotFound:
-                logger.error(
-                    f"Forum or post not found. Forum ID: {forum_id}, Post ID: {post_id}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error sending message to forum post. Forum ID: {forum_id}, Post ID: {post_id}. Error: {e}"
-                )
-
-        tasks.append(send_to_channel(LOG_CHANNEL_ID))
-        tasks.append(send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID))
+        if log_to_channel:
+            LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
+            tasks.append(self.send_to_channel(LOG_CHANNEL_ID, embed))
+            tasks.append(self.send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID, embed))
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_to_channel(self, channel_id: int, embed: interactions.Embed) -> None:
+        try:
+            channel = await self.bot.fetch_channel(channel_id)
+            if isinstance(channel, interactions.GuildText):
+                await channel.send(embed=embed)
+            else:
+                logger.error(f"Channel ID {channel_id} is not a valid text channel.")
+        except NotFound:
+            logger.error(f"Channel with ID {channel_id} not found.")
+        except Exception as e:
+            logger.error(f"Error sending message to channel {channel_id}: {e}")
+
+    async def send_to_forum_post(
+        self, forum_id: int, post_id: int, embed: interactions.Embed
+    ) -> None:
+        try:
+            forum = await self.bot.fetch_channel(forum_id)
+            if isinstance(forum, interactions.GuildForum):
+                thread = await forum.fetch_post(post_id)
+                if isinstance(thread, interactions.GuildPublicThread):
+                    await thread.send(embed=embed)
+                else:
+                    logger.error(f"Post with ID {post_id} is not a valid thread.")
+            else:
+                logger.error(f"Channel ID {forum_id} is not a valid forum channel.")
+        except NotFound:
+            logger.error(
+                f"Forum or post not found. Forum ID: {forum_id}, Post ID: {post_id}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Error sending message to forum post. Forum ID: {forum_id}, Post ID: {post_id}. Error: {e}"
+            )
 
     async def send_error(
         self,
@@ -565,8 +565,11 @@ class Roles(interactions.Extension):
             ]
         ],
         message: str,
+        log_to_channel: bool = False,
     ) -> None:
-        await self.send_response(ctx, "Error", message, EmbedColor.ERROR)
+        await self.send_response(
+            ctx, "Error", message, EmbedColor.ERROR, log_to_channel
+        )
 
     async def send_success(
         self,
@@ -578,8 +581,11 @@ class Roles(interactions.Extension):
             ]
         ],
         message: str,
+        log_to_channel: bool = True,
     ) -> None:
-        await self.send_response(ctx, "Success", message, EmbedColor.INFO)
+        await self.send_response(
+            ctx, "Success", message, EmbedColor.INFO, log_to_channel
+        )
 
     async def create_review_components(
         self, thread: interactions.GuildPublicThread
@@ -663,7 +669,9 @@ class Roles(interactions.Extension):
     ) -> None:
         if self.validate_custom_permissions(ctx):
             return await self.send_error(
-                ctx, "You don't have permission to use this command."
+                ctx,
+                "You don't have permission to use this command.",
+                log_to_channel=False,
             )
 
         role_list = [role.strip() for role in roles.split(",")]
@@ -706,7 +714,9 @@ class Roles(interactions.Extension):
                     f"User {ctx.author.id} lacks permission for custom roles menu"
                 )
                 return await self.send_error(
-                    ctx, "You don't have permission to use this command."
+                    ctx,
+                    "You don't have permission to use this command.",
+                    log_to_channel=False,
                 )
 
             options = [
@@ -747,7 +757,9 @@ class Roles(interactions.Extension):
     ) -> None:
         if self.validate_custom_permissions(ctx):
             return await self.send_error(
-                ctx, "You don't have permission to use this command."
+                ctx,
+                "You don't have permission to use this command.",
+                log_to_channel=False,
             )
 
         role_list = [role.strip() for role in roles.split(",")]
@@ -897,7 +909,9 @@ class Roles(interactions.Extension):
         if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
             if not self.validate_vetting_permissions(ctx):
                 await self.send_error(
-                    ctx, "You don't have permission to perform this action."
+                    ctx,
+                    "You don't have permission to use this command.",
+                    log_to_channel=False,
                 )
             else:
                 await self.send_error(
@@ -1050,7 +1064,9 @@ class Roles(interactions.Extension):
     ) -> str:
         if not self.validate_vetting_permissions(ctx):
             return await self.send_error(
-                ctx, "You don't have permission to perform this action."
+                ctx,
+                "You don't have permission to use this command.",
+                log_to_channel=False,
             )
 
         thread = await self.bot.fetch_channel(ctx.channel_id)
@@ -1069,12 +1085,14 @@ class Roles(interactions.Extension):
                 if not all(roles.values()):
                     return await self.send_error(ctx, "Required roles not found.")
 
-                current_roles = {role.id for role in member.roles}
+                current_roles = set(role.id for role in member.roles)
                 thread_approvals = self.get_thread_approvals(thread.id)
 
                 if ctx.author.id in thread_approvals.reviewers:
                     return await self.send_error(
-                        ctx, "You have already voted on this thread."
+                        ctx,
+                        "You have already voted on this thread.",
+                        log_to_channel=False,
                     )
 
                 return await self.process_approval_status(
@@ -1084,7 +1102,7 @@ class Roles(interactions.Extension):
             except Exception as e:
                 logger.error(f"Error updating member status: {str(e)}")
                 return await self.send_error(
-                    thread, "An error occurred. Please try again later."
+                    ctx, "An error occurred. Please try again later."
                 )
 
             finally:
@@ -1128,10 +1146,13 @@ class Roles(interactions.Extension):
         thread: interactions.GuildPublicThread,
     ) -> str:
         if roles["electoral"].id in current_roles:
-            return await self.send_error(ctx, "This member has already been approved.")
+            return await self.send_error(
+                ctx, "This member has already been approved.", log_to_channel=False
+            )
 
         thread_approvals.approval_count += 1
         thread_approvals.reviewer_ids.add(ctx.author.id)
+        thread_approvals.reviewers.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
         if thread_approvals.approval_count >= self.config.REQUIRED_APPROVALS:
@@ -1146,6 +1167,7 @@ class Roles(interactions.Extension):
             return await self.send_success(
                 ctx,
                 f"Approval registered. Current approvals: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
+                log_to_channel=False,
             )
 
     async def process_rejection(
@@ -1158,7 +1180,9 @@ class Roles(interactions.Extension):
         thread: interactions.GuildPublicThread,
     ) -> str:
         if roles["electoral"].id not in current_roles:
-            return await self.send_error(ctx, "This member is not currently approved.")
+            return await self.send_error(
+                ctx, "This member is not currently approved.", log_to_channel=False
+            )
 
         if thread_approvals.last_approval_time and self.is_rejection_window_closed(
             thread_approvals
@@ -1166,10 +1190,12 @@ class Roles(interactions.Extension):
             return await self.send_error(
                 ctx,
                 f"The {self.config.REJECTION_WINDOW_DAYS}-day window for rejection has passed.",
+                log_to_channel=False,
             )
 
         thread_approvals.approval_count -= 1
         thread_approvals.reviewer_ids.add(ctx.author.id)
+        thread_approvals.reviewers.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
         if abs(thread_approvals.approval_count) >= self.config.REQUIRED_REJECTIONS:
@@ -1183,6 +1209,7 @@ class Roles(interactions.Extension):
             return await self.send_success(
                 ctx,
                 f"Rejection registered. Current rejections: {abs(thread_approvals.approval_count)}/{self.config.REQUIRED_REJECTIONS}",
+                log_to_channel=False,
             )
 
     def is_rejection_window_closed(self, thread_approvals: ApprovalInfo) -> bool:
@@ -1365,13 +1392,15 @@ class Roles(interactions.Extension):
     ) -> None:
         if self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
-                ctx, "You don't have permission to use this command."
+                ctx,
+                "You don't have permission to use this command.",
+                log_to_channel=False,
             )
 
         try:
             incarceration_duration = self.parse_duration(duration)
         except ValueError as e:
-            return await self.send_error(ctx, str(e))
+            return await self.send_error(ctx, str(e), log_to_channel=False)
 
         await self.manage_penitentiary_status(
             ctx, member, "incarcerate", duration=incarceration_duration
@@ -1410,7 +1439,9 @@ class Roles(interactions.Extension):
     ) -> None:
         if self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
-                ctx, "You don't have permission to use this command."
+                ctx,
+                "You don't have permission to use this command.",
+                log_to_channel=False,
             )
 
         await self.manage_penitentiary_status(ctx, member, "release")
@@ -1856,7 +1887,9 @@ class Roles(interactions.Extension):
             await asyncio.gather(
                 thread.edit(name=new_title),
                 self._send_review_components(thread),
-                self._notify_vetting_reviewers(thread, timestamp),
+                self.notify_vetting_reviewers(
+                    self.config.VETTING_ROLE_IDS, thread, timestamp
+                ),
             )
         except Exception as e:
             logger.exception(f"Error processing new post: {str(e)}")
@@ -1866,17 +1899,6 @@ class Roles(interactions.Extension):
     ) -> None:
         embed, buttons = await self.create_review_components(thread)
         await thread.send(embed=embed, components=buttons)
-
-    async def _notify_vetting_reviewers(
-        self, thread: interactions.GuildPublicThread, timestamp: str
-    ) -> None:
-        notify_func = partial(
-            self.notify_vetting_reviewers,
-            self.config.VETTING_ROLE_IDS,
-            thread,
-            timestamp,
-        )
-        await asyncio.to_thread(notify_func)
 
     custom_roles_menu_pattern = re.compile(r"manage_roles_menu_(\d+)")
 
@@ -1891,7 +1913,7 @@ class Roles(interactions.Extension):
         member_id: int = int(match.group(1))
 
         if not ctx.values:
-            await self.send_error(ctx, "No action selected.")
+            await self.send_error(ctx, "No action selected.", log_to_channel=False)
             return
 
         action: Literal["add", "remove"] = ctx.values[0]
@@ -1908,12 +1930,16 @@ class Roles(interactions.Extension):
         ]
 
         if not options:
-            await self.send_error(ctx, "No custom roles available.")
+            await self.send_error(
+                ctx, "No custom roles available.", log_to_channel=False
+            )
             return
 
         if len(options) > 25:
             await self.send_error(
-                ctx, "Too many custom roles. Pagination not implemented yet."
+                ctx,
+                "Too many custom roles. Pagination not implemented yet.",
+                log_to_channel=False,
             )
             return
 
@@ -1964,7 +1990,9 @@ class Roles(interactions.Extension):
 
             if not ctx.values:
                 logger.warning("No role selected.")
-                return await self.send_error(ctx, "No role selected.")
+                return await self.send_error(
+                    ctx, "No role selected.", log_to_channel=False
+                )
 
             selected_role = ctx.values[0]
             logger.info(f"Selected role: {selected_role}")
