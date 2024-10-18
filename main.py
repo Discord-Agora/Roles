@@ -209,6 +209,7 @@ class Model(Generic[T]):
                 json_parsed = await loop.run_in_executor(
                     self._executor, self.parser.parse, content
                 )
+
             if file_name == "custom.json":
                 instance = {role: set(members) for role, members in json_parsed.items()}
             elif issubclass(model, BaseModel):
@@ -290,7 +291,7 @@ class Roles(interactions.Extension):
         self.cache = TTLCache(maxsize=100, ttl=300)
 
         self.base_path: Final[Path] = Path(__file__).parent
-        self.model = Model()
+        self.model: Model[Any] = Model()
         self.load_tasks: List[Coroutine] = [
             self.model.load_data("vetting.json", Data),
             self.model.load_data("custom.json", dict),
@@ -988,7 +989,9 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         role_ids_to_add: List[int],
     ) -> None:
-        roles_to_add = list(filter(None, map(ctx.guild.get_role, role_ids_to_add)))
+        roles_to_add: List[interactions.Role] = list(
+            filter(None, map(ctx.guild.get_role, role_ids_to_add))
+        )
         if not roles_to_add:
             return await self.send_error(ctx, "No valid roles found to add.")
 
@@ -1213,7 +1216,7 @@ class Roles(interactions.Extension):
             )
 
     def is_rejection_window_closed(self, thread_approvals: ApprovalInfo) -> bool:
-        return (datetime.now() - thread_approvals.approval_time) > timedelta(
+        return (datetime.now() - thread_approvals.last_approval_time) > timedelta(
             days=self.config.REJECTION_WINDOW_DAYS
         )
 
@@ -1533,7 +1536,7 @@ class Roles(interactions.Extension):
     ) -> None:
         try:
             incarcerated_role = roles["incarcerated"]
-            roles_to_remove = [
+            roles_to_remove: List[interactions.Role] = [
                 role
                 for role_key in ("electoral", "approved", "temporary")
                 if (role := roles.get(role_key)) and role in member.roles
@@ -1596,7 +1599,7 @@ class Roles(interactions.Extension):
         member_data = self.incarcerated_members.get(str(member.id), {})
         original_roles = member_data.get("original_roles", [])
 
-        roles_to_add = [
+        roles_to_add: List[interactions.Role] = [
             role
             for role in member.guild.roles
             if role.id in original_roles and role not in member.roles
