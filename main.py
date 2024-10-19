@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
 from logging.handlers import RotatingFileHandler
@@ -447,8 +447,10 @@ class Roles(interactions.Extension):
             self.config.GUILD_ID
         )
         if guild and guild.icon:
-            embed.set_footer(text=guild.name, icon_url=guild.icon.url)
-        embed.timestamp = datetime.now()
+            embed.set_footer(
+                text=guild.name, icon_url=guild.icon.url if guild.icon else None
+            )
+        embed.timestamp = datetime.now(timezone.utc)
         embed.set_footer(text="鍵政大舞台")
         return embed
 
@@ -459,6 +461,9 @@ class Roles(interactions.Extension):
         timestamp: str,
     ) -> None:
         guild = await self.bot.fetch_guild(thread.guild.id)
+        if guild is None:
+            logger.error(f"Guild with ID {thread.guild.id} could not be fetched.")
+            raise ValueError(f"Guild with ID {thread.guild.id} could not be fetched.")
 
         embed = await self.create_embed(
             title=f"Voter Identity Approval #{timestamp}",
@@ -469,22 +474,31 @@ class Roles(interactions.Extension):
         async def process_role(role_id: int) -> None:
             try:
                 role = await guild.fetch_role(role_id)
-                if not role:
+                if role is None:
                     logger.error(f"Reviewer role with ID {role_id} not found.")
                     return
 
-                for member in role.members:
-                    try:
-                        await member.send(embed=embed)
-                        logger.info(f"Sent notification to member {member.id}")
-                    except Exception as e:
-                        logger.error(f"Failed to send embed to {member.id}: {str(e)}")
-
+                send_tasks = [
+                    self.send_direct_message(member, embed) for member in role.members
+                ]
+                await asyncio.gather(*send_tasks)
+                logger.info(
+                    f"Notifications sent to role ID {role_id} in thread {thread.id}"
+                )
             except Exception as e:
-                logger.error(f"Error processing role {role_id}: {str(e)}")
+                logger.error(f"Error processing role {role_id}: {e}")
 
         await asyncio.gather(*(process_role(role_id) for role_id in reviewer_role_ids))
-        logger.info(f"Notifications sent for thread {thread.id}")
+        logger.info(f"All reviewer notifications sent for thread {thread.id}")
+
+    async def send_direct_message(
+        self, member: interactions.Member, embed: interactions.Embed
+    ) -> None:
+        try:
+            await member.send(embed=embed)
+            logger.debug(f"Sent notification to member {member.id}")
+        except Exception as e:
+            logger.error(f"Failed to send embed to {member.id}: {e}")
 
     @lru_cache(maxsize=1)
     def _get_log_channels(self) -> tuple[int, int, int]:
@@ -593,35 +607,44 @@ class Roles(interactions.Extension):
     async def create_review_components(
         self, thread: interactions.GuildPublicThread
     ) -> Tuple[interactions.Embed, List[interactions.Button]]:
-        approval_info = self.approval_counts.get(thread.id, ApprovalInfo())
-        approval_count = approval_info.approval_count
-        required_count = (
+        approval_info: ApprovalInfo = self.approval_counts.get(
+            thread.id, ApprovalInfo()
+        )
+        approval_count: int = approval_info.approval_count
+        required_count: int = (
             self.config.REQUIRED_APPROVALS
-            if approval_count >= 0
+            if approval_count < self.config.REQUIRED_APPROVALS
             else self.config.REQUIRED_REJECTIONS
         )
 
-        reviewers_text = (
-            ", ".join(f"<@{reviewer_id}>" for reviewer_id in approval_info.reviewers)
-            or "Not yet approved"
+        reviewers_text: str = (
+            ", ".join(
+                f"<@{reviewer_id}>" for reviewer_id in sorted(approval_info.reviewers)
+            )
+            or "No approvals yet."
         )
 
-        embed = await self.create_embed(
-            title="Member Identity Approval",
-            description=f"Approvals: {approval_count}/{required_count}\nReviewers: {reviewers_text}",
+        embed: interactions.Embed = await self.create_embed(
+            title="Voter Identity Approval",
+            description=(
+                f"**Approvals:** {approval_count}/{self.config.REQUIRED_APPROVALS}\n"
+                f"**Reviewers:** {reviewers_text}"
+            ),
             color=EmbedColor.INFO,
         )
 
-        buttons = [
+        buttons: List[interactions.Button] = [
             interactions.Button(
                 style=interactions.ButtonStyle.SUCCESS,
                 label="Approve",
-                custom_id="approve",
+                custom_id=f"approve",
+                disabled=False,
             ),
             interactions.Button(
                 style=interactions.ButtonStyle.DANGER,
                 label="Reject",
-                custom_id="reject",
+                custom_id=f"reject",
+                disabled=False,
             ),
         ]
 
@@ -1044,35 +1067,37 @@ class Roles(interactions.Extension):
 
     @interactions.component_callback("approve")
     @error_handler
-    async def on_approve_member(self, ctx: interactions.ComponentContext) -> str:
+    async def on_approve_member(
+        self, ctx: interactions.ComponentContext
+    ) -> Optional[str]:
         return await self.process_approval_status_change(ctx, Status.APPROVED)
 
     @interactions.component_callback("reject")
     @error_handler
-    async def on_reject_member(self, ctx: interactions.ComponentContext) -> str:
+    async def on_reject_member(
+        self, ctx: interactions.ComponentContext
+    ) -> Optional[str]:
         return await self.process_approval_status_change(ctx, Status.REJECTED)
 
     @asynccontextmanager
     async def member_lock(self, member_id: int):
         lock_info = self.member_lock_map.setdefault(
-            member_id, {"lock": asyncio.Lock(), "last_used": datetime.now()}
+            member_id, {"lock": asyncio.Lock(), "last_used": datetime.now(timezone.utc)}
         )
-        await lock_info["lock"].acquire()
-        lock_info["last_used"] = datetime.now()
-        try:
+        async with lock_info["lock"]:
+            lock_info["last_used"] = datetime.now(timezone.utc)
             yield
-        finally:
-            lock_info["lock"].release()
 
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
-    ) -> str:
+    ) -> Optional[str]:
         if not self.validate_vetting_permissions(ctx):
-            return await self.send_error(
+            await self.send_error(
                 ctx,
                 "You don't have permission to use this command.",
                 log_to_channel=False,
             )
+            return None
 
         thread = await self.bot.fetch_channel(ctx.channel_id)
         if not isinstance(thread, interactions.GuildPublicThread):
@@ -1082,40 +1107,45 @@ class Roles(interactions.Extension):
         member = await guild.fetch_member(thread.owner_id)
 
         if not member:
-            return await self.send_error(ctx, "The member is no longer in the server.")
+            await self.send_error(ctx, "The member is no longer in the server.")
+            return None
 
         async with self.member_lock(member.id):
             try:
                 roles = await self.fetch_required_roles(guild)
                 if not all(roles.values()):
-                    return await self.send_error(ctx, "Required roles not found.")
+                    await self.send_error(ctx, "Required roles not found.")
+                    return None
 
-                current_roles = set(role.id for role in member.roles)
+                current_roles = {role.id for role in member.roles}
                 thread_approvals = self.get_thread_approvals(thread.id)
 
                 if ctx.author.id in thread_approvals.reviewers:
-                    return await self.send_error(
+                    await self.send_error(
                         ctx,
                         "You have already voted on this thread.",
                         log_to_channel=False,
                     )
+                    return None
 
                 if status == Status.APPROVED:
-                    return await self.process_approval(
+                    response = await self.process_approval(
                         ctx, member, roles, current_roles, thread_approvals, thread
                     )
                 elif status == Status.REJECTED:
-                    return await self.process_rejection(
+                    response = await self.process_rejection(
                         ctx, member, roles, current_roles, thread_approvals, thread
                     )
                 else:
-                    return await self.send_error(ctx, "Invalid status provided.")
+                    await self.send_error(ctx, "Invalid status provided.")
+                    return None
+
+                return response
 
             except Exception as e:
-                logger.error(f"Error updating member status: {str(e)}")
-                return await self.send_error(
-                    ctx, "An error occurred. Please try again later."
-                )
+                logger.exception(f"Error updating member status: {e}")
+                await self.send_error(ctx, "An error occurred. Please try again later.")
+                return None
             finally:
                 await self.update_review_components(ctx, thread)
 
@@ -1133,11 +1163,11 @@ class Roles(interactions.Extension):
         ctx: interactions.ComponentContext,
         status: Status,
         member: interactions.Member,
-        roles: dict,
-        current_roles: set,
+        roles: Dict[str, interactions.Role],
+        current_roles: Set[int],
         thread_approvals: ApprovalInfo,
         thread: interactions.GuildPublicThread,
-    ) -> str:
+    ) -> Optional[str]:
         if status == Status.APPROVED:
             return await self.process_approval(
                 ctx, member, roles, current_roles, thread_approvals, thread
@@ -1146,20 +1176,22 @@ class Roles(interactions.Extension):
             return await self.process_rejection(
                 ctx, member, roles, current_roles, thread_approvals, thread
             )
+        return None
 
     async def process_approval(
         self,
         ctx: interactions.ComponentContext,
         member: interactions.Member,
-        roles: dict,
-        current_roles: set,
+        roles: Dict[str, interactions.Role],
+        current_roles: Set[int],
         thread_approvals: ApprovalInfo,
         thread: interactions.GuildPublicThread,
     ) -> str:
         if roles["electoral"].id in current_roles:
-            return await self.send_error(
+            await self.send_error(
                 ctx, "This member has already been approved.", log_to_channel=False
             )
+            return "Approval aborted: Member already approved."
 
         thread_approvals.approval_count += 1
         thread_approvals.reviewers.add(ctx.author.id)
@@ -1169,40 +1201,43 @@ class Roles(interactions.Extension):
             await self.update_member_roles(
                 member, roles["electoral"], roles["approved"], current_roles
             )
-            thread_approvals.approval_count = self.config.REQUIRED_APPROVALS  # Cap
-            thread_approvals.last_approval_time = datetime.now()
+            thread_approvals.approval_count = self.config.REQUIRED_APPROVALS
+            thread_approvals.last_approval_time = datetime.now(timezone.utc)
             await self.send_approval_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Approved {member.mention} and updated roles"
         else:
-            return await self.send_success(
+            await self.send_success(
                 ctx,
                 f"Approval registered. Current approvals: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
                 log_to_channel=False,
             )
+            return "Approval registered successfully."
 
     async def process_rejection(
         self,
         ctx: interactions.ComponentContext,
         member: interactions.Member,
-        roles: dict,
-        current_roles: set,
+        roles: Dict[str, interactions.Role],
+        current_roles: Set[int],
         thread_approvals: ApprovalInfo,
         thread: interactions.GuildPublicThread,
     ) -> str:
         if roles["electoral"].id not in current_roles:
-            return await self.send_error(
+            await self.send_error(
                 ctx, "This member is not currently approved.", log_to_channel=False
             )
+            return "Rejection aborted: Member not approved."
 
         if thread_approvals.last_approval_time and self.is_rejection_window_closed(
             thread_approvals
         ):
-            return await self.send_error(
+            await self.send_error(
                 ctx,
                 f"The {self.config.REJECTION_WINDOW_DAYS}-day window for rejection has passed.",
                 log_to_channel=False,
             )
+            return "Rejection aborted: Window closed."
 
         thread_approvals.rejection_count += 1
         thread_approvals.reviewers.add(ctx.author.id)
@@ -1217,22 +1252,25 @@ class Roles(interactions.Extension):
             self.cleanup_approval_data(thread.id)
             return f"Rejected {member.mention} and updated roles"
         else:
-            return await self.send_success(
+            await self.send_success(
                 ctx,
                 f"Rejection registered. Current rejections: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS}",
                 log_to_channel=False,
             )
+            return "Rejection registered successfully."
 
     def is_rejection_window_closed(self, thread_approvals: ApprovalInfo) -> bool:
-        return (datetime.now() - thread_approvals.last_approval_time) > timedelta(
-            days=self.config.REJECTION_WINDOW_DAYS
-        )
+        return (
+            datetime.now(timezone.utc) - thread_approvals.last_approval_time
+        ) > timedelta(days=self.config.REJECTION_WINDOW_DAYS)
 
     def cleanup_approval_data(self, thread_id: int) -> None:
         self.approval_counts.pop(thread_id, None)
         self.processed_thread_ids.discard(thread_id)
 
-    async def fetch_required_roles(self, guild: interactions.Guild) -> dict:
+    async def fetch_required_roles(
+        self, guild: interactions.Guild
+    ) -> Dict[str, Optional[interactions.Role]]:
         return {
             "electoral": await guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
             "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
@@ -1246,7 +1284,7 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         role_to_add: interactions.Role,
         role_to_remove: interactions.Role,
-        current_roles: set[int],
+        current_roles: Set[int],
     ) -> bool:
         tasks = []
         if role_to_add.id not in current_roles:
@@ -1756,7 +1794,7 @@ class Roles(interactions.Extension):
 
     @interactions.Task.create(interactions.IntervalTrigger(days=7))
     async def cleanup_old_locks(self) -> None:
-        current_time: datetime = datetime.now()
+        current_time: datetime = datetime.now(timezone.utc)
         threshold: timedelta = timedelta(days=7)
         keys_to_remove: List[int] = [
             key
@@ -1892,7 +1930,7 @@ class Roles(interactions.Extension):
 
     async def handle_new_thread(self, thread: interactions.GuildPublicThread) -> None:
         try:
-            timestamp = datetime.now().strftime("%y%m%d%H%M")
+            timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M")
             new_title = f"[{timestamp}] {thread.name}"
 
             await asyncio.gather(
