@@ -13,6 +13,7 @@ from enum import Enum, auto
 from functools import lru_cache, partial, wraps
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from turtle import update
 from typing import (
     Any,
     Callable,
@@ -418,18 +419,18 @@ class Roles(interactions.Extension):
         roles_to_add_set: FrozenSet[int] = frozenset(role_ids_to_add)
 
         for category in self.vetting_roles.assigned_roles:
-            category_role_ids = self._get_category_role_ids(category)
-            existing_category_roles = member_current_roles & category_role_ids
-            new_category_roles = roles_to_add_set & category_role_ids
+            category_role_id_set = self._get_category_role_ids(category)
+            existing_roles = member_current_roles & category_role_id_set
+            adding_roles = roles_to_add_set & category_role_id_set
 
-            if existing_category_roles and new_category_roles:
-                total_category_roles = existing_category_roles | new_category_roles
-                if len(total_category_roles) > 1:
+            if existing_roles and adding_roles:
+                total_roles = existing_roles | adding_roles
+                if len(total_roles) > 1:
                     await self.send_error(
                         ctx,
                         f"Conflicting roles detected in the {category} category. "
-                        f"Member already has {len(existing_category_roles)} role(s) "
-                        f"and is attempting to add {len(new_category_roles)} role(s).",
+                        f"Member already has {len(existing_roles)} role(s) "
+                        f"and is attempting to add {len(adding_roles)} role(s).",
                     )
                     return True
 
@@ -1394,11 +1395,13 @@ class Roles(interactions.Extension):
             len(sorted_roles),
         )
 
-        return tuple(
+        filtered_roles = [
             role
             for role in sorted_roles[:bot_role_index]
             if not role.name.startswith(("——", "══")) and not role.bot_managed
-        )
+        ]
+
+        return tuple(filtered_roles)
 
     @staticmethod
     @lru_cache(maxsize=128)
@@ -1464,9 +1467,9 @@ class Roles(interactions.Extension):
                 "Invalid duration format. Use combinations of `d` (days), `h` (hours), and `m` (minutes)."
             )
 
+        unit_to_seconds = {"d": 86400, "h": 3600, "m": 60}
         total_seconds = sum(
-            int(value) * {"d": 86400, "h": 3600, "m": 60}[unit]
-            for value, unit in matches
+            int(value) * unit_to_seconds.get(unit, 0) for value, unit in matches
         )
 
         if total_seconds <= 0:
@@ -1500,29 +1503,17 @@ class Roles(interactions.Extension):
         self, ctx: interactions.AutocompleteContext
     ) -> None:
         user_input = ctx.input_text.lower()
-        choices = await asyncio.gather(
-            *(
-                self.fetch_member_choice(ctx.guild, member_id, data)
-                for member_id, data in self.incarcerated_members.items()
-            )
-        )
-        valid_choices = [choice for choice in choices if choice is not None]
-        await ctx.send(valid_choices[:25])
+        guild = ctx.guild
 
-    async def fetch_member_choice(
-        self, guild: interactions.Guild, member_id: str, data: Dict[str, Any]
-    ) -> Optional[interactions.SlashCommandChoice]:
-        try:
-            member = await guild.fetch_member(int(member_id))
-            if member and self.ctx.input_text.lower() in member.user.username.lower():
-                return interactions.SlashCommandChoice(
-                    name=member.user.username, value=member_id
-                )
-        except NotFound:
-            logger.warning(f"Member {member_id} not found in guild.")
-        except Exception as e:
-            logger.error(f"Failed to fetch member {member_id}: {e}")
-        return None
+        choices = [
+            interactions.SlashCommandChoice(
+                name=member.user.username, value=str(member.id)
+            )
+            for member in guild.members
+            if user_input in member.user.username.lower()
+        ][:25]
+
+        await ctx.send(choices)
 
     async def manage_penitentiary_status(
         self,
@@ -1828,13 +1819,11 @@ class Roles(interactions.Extension):
             )
         )
 
-        release_tasks: List[Coroutine] = [
+        release_tasks = (
             self.release_prisoner(member_id, data)
             for member_id, data in releasable_prisoners
-        ]
-        release_results: List[Any] = await asyncio.gather(
-            *release_tasks, return_exceptions=True
         )
+        release_results = await asyncio.gather(*release_tasks, return_exceptions=True)
 
         for result in release_results:
             if isinstance(result, Exception):
@@ -1896,14 +1885,16 @@ class Roles(interactions.Extension):
             lambda: defaultdict(list)
         )
         members_to_update: Set[int] = set()
-        log_messages: List[str] = []
 
         for member_id, reason, roles_to_remove, roles_to_add in results:
             if reason:
                 role_updates["remove"][member_id].extend(roles_to_remove)
                 role_updates["add"][member_id].extend(roles_to_add)
                 members_to_update.add(member_id)
-                log_messages.append(f"Updated roles for {member_id}: {reason}")
+                log_messages = [
+                    f"Updated roles for {member_id}: {reason}"
+                    for member_id, reason in update
+                ]
 
         if members_to_update:
 
@@ -1976,7 +1967,8 @@ class Roles(interactions.Extension):
         options = [
             interactions.StringSelectOption(label=role, value=role)
             for role in self.custom_roles.keys()
-        ]
+            if len(self.custom_roles) <= 25
+        ][:25]
 
         if not options:
             await self.send_error(
