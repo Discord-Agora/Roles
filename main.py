@@ -146,9 +146,9 @@ class Servant:
 @dataclass
 class ApprovalInfo:
     approval_count: int = 0
-    reviewer_ids: Set[int] = field(default_factory=set)
-    last_approval_time: Optional[datetime] = None
+    rejection_count: int = 0
     reviewers: Set[int] = field(default_factory=set)
+    last_approval_time: Optional[datetime] = None
 
 
 class Model(Generic[T]):
@@ -602,7 +602,7 @@ class Roles(interactions.Extension):
         )
 
         reviewers_text = (
-            ", ".join(f"<@{reviewer_id}>" for reviewer_id in approval_info.reviewer_ids)
+            ", ".join(f"<@{reviewer_id}>" for reviewer_id in approval_info.reviewers)
             or "Not yet approved"
         )
 
@@ -1100,16 +1100,22 @@ class Roles(interactions.Extension):
                         log_to_channel=False,
                     )
 
-                return await self.process_approval_status(
-                    ctx, status, member, roles, current_roles, thread_approvals, thread
-                )
+                if status == Status.APPROVED:
+                    return await self.process_approval(
+                        ctx, member, roles, current_roles, thread_approvals, thread
+                    )
+                elif status == Status.REJECTED:
+                    return await self.process_rejection(
+                        ctx, member, roles, current_roles, thread_approvals, thread
+                    )
+                else:
+                    return await self.send_error(ctx, "Invalid status provided.")
 
             except Exception as e:
                 logger.error(f"Error updating member status: {str(e)}")
                 return await self.send_error(
                     ctx, "An error occurred. Please try again later."
                 )
-
             finally:
                 await self.update_review_components(ctx, thread)
 
@@ -1156,7 +1162,6 @@ class Roles(interactions.Extension):
             )
 
         thread_approvals.approval_count += 1
-        thread_approvals.reviewer_ids.add(ctx.author.id)
         thread_approvals.reviewers.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
@@ -1164,6 +1169,7 @@ class Roles(interactions.Extension):
             await self.update_member_roles(
                 member, roles["electoral"], roles["approved"], current_roles
             )
+            thread_approvals.approval_count = self.config.REQUIRED_APPROVALS  # Cap
             thread_approvals.last_approval_time = datetime.now()
             await self.send_approval_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
@@ -1198,22 +1204,22 @@ class Roles(interactions.Extension):
                 log_to_channel=False,
             )
 
-        thread_approvals.approval_count -= 1
-        thread_approvals.reviewer_ids.add(ctx.author.id)
+        thread_approvals.rejection_count += 1
         thread_approvals.reviewers.add(ctx.author.id)
         self.approval_counts[thread.id] = thread_approvals
 
-        if abs(thread_approvals.approval_count) >= self.config.REQUIRED_REJECTIONS:
+        if thread_approvals.rejection_count >= self.config.REQUIRED_REJECTIONS:
             await self.update_member_roles(
                 member, roles["approved"], roles["electoral"], current_roles
             )
+            thread_approvals.rejection_count = self.config.REQUIRED_REJECTIONS
             await self.send_rejection_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Rejected {member.mention} and updated roles"
         else:
             return await self.send_success(
                 ctx,
-                f"Rejection registered. Current rejections: {abs(thread_approvals.approval_count)}/{self.config.REQUIRED_REJECTIONS}",
+                f"Rejection registered. Current rejections: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS}",
                 log_to_channel=False,
             )
 
@@ -1238,15 +1244,15 @@ class Roles(interactions.Extension):
     async def update_member_roles(
         self,
         member: interactions.Member,
-        add_role: interactions.Role,
-        remove_role: interactions.Role,
+        role_to_add: interactions.Role,
+        role_to_remove: interactions.Role,
         current_roles: set[int],
     ) -> bool:
         tasks = []
-        if add_role.id not in current_roles:
-            tasks.append(member.add_roles([add_role]))
-        if remove_role.id in current_roles:
-            tasks.append(member.remove_roles([remove_role]))
+        if role_to_add.id not in current_roles:
+            tasks.append(member.add_roles([role_to_add]))
+        if role_to_remove.id in current_roles:
+            tasks.append(member.remove_roles([role_to_remove]))
 
         if tasks:
             await asyncio.gather(*tasks)
@@ -1260,7 +1266,7 @@ class Roles(interactions.Extension):
         thread_approvals: ApprovalInfo,
     ) -> None:
         reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewer_ids
+            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
         )
         await self.send_success(
             thread,
@@ -1275,7 +1281,7 @@ class Roles(interactions.Extension):
         thread_approvals: ApprovalInfo,
     ) -> None:
         reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewer_ids
+            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
         )
         await self.send_success(
             thread,
