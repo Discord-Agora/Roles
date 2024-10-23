@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 import re
 import time
@@ -11,11 +10,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from turtle import update
 from typing import (
     Any,
+    AsyncGenerator,
     Callable,
     Concatenate,
     Coroutine,
@@ -48,26 +47,32 @@ from interactions.api.events import (
 )
 from interactions.client.errors import NotFound
 from interactions.ext.paginators import Paginator
+from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 from yarl import URL
 
-BASE_DIR: Final[str] = os.path.dirname(__file__)
+BASE_DIR: Final[str] = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE: Final[str] = os.path.join(BASE_DIR, "roles.log")
 
-logger: Final[logging.Logger] = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-file_handler: Final[RotatingFileHandler] = RotatingFileHandler(
-    LOG_FILE, maxBytes=1 * 1024 * 1024, backupCount=1
+logger.remove()
+logger.add(
+    sink=LOG_FILE,
+    level="DEBUG",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | {process}:{thread} | {level: <8} | {name}:{function}:{line} | {message}",
+    filter=None,
+    colorize=None,
+    serialize=False,
+    backtrace=True,
+    diagnose=True,
+    enqueue=True,
+    catch=True,
+    rotation="1 MB",
+    compression="zip",
+    encoding="utf-8",
+    mode="a",
+    delay=False,
+    errors="replace",
 )
-file_handler.setLevel(logging.DEBUG)
-
-formatter: Final[logging.Formatter] = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
 
 # Model
 
@@ -145,7 +150,7 @@ class Servant:
 
 
 @dataclass
-class ApprovalInfo:
+class Approval:
     approval_count: int = 0
     rejection_count: int = 0
     reviewers: Set[int] = field(default_factory=set)
@@ -171,7 +176,7 @@ class Model(Generic[T]):
                     except Exception as e:
                         if attempt == max_retries - 1:
                             raise
-                        logging.warning(
+                        logger.warning(
                             f"Attempt {attempt + 1} failed: {e}. Retrying..."
                         )
                         await asyncio.sleep(delay * (2**attempt))
@@ -190,7 +195,7 @@ class Model(Generic[T]):
                 async with aiofiles.open(str(file_path), mode) as file:
                     yield file
             except IOError as e:
-                logging.error(f"IO operation failed for {file_path}: {e}")
+                logger.error(f"IO operation failed for {file_path}: {e}")
                 raise
 
     @async_retry(max_retries=3, delay=1.0)
@@ -206,7 +211,7 @@ class Model(Generic[T]):
                     self._executor, orjson.loads, content
                 )
             except orjson.JSONDecodeError:
-                logging.warning(
+                logger.warning(
                     f"`orjson` failed to parse {file_name}, falling back to `cysimdjson`"
                 )
                 json_parsed = await loop.run_in_executor(
@@ -221,7 +226,7 @@ class Model(Generic[T]):
                         self._executor, model.model_validate, json_parsed
                     )
                 except ValidationError as ve:
-                    logging.error(f"Validation error for {file_name}: {ve}")
+                    logger.error(f"Validation error for {file_name}: {ve}")
                     raise
             elif model == Counter:
                 instance = Counter(json_parsed)
@@ -229,10 +234,10 @@ class Model(Generic[T]):
                 instance = json_parsed
 
             self._data_cache[file_name] = instance
-            logging.info(f"Successfully loaded data from {file_name}")
+            logger.info(f"Successfully loaded data from {file_name}")
             return instance
         except FileNotFoundError:
-            logging.info(f"{file_name} not found. Creating a new one.")
+            logger.info(f"{file_name} not found. Creating a new one.")
             if issubclass(model, BaseModel):
                 instance = model()
             elif model == Counter:
@@ -244,7 +249,7 @@ class Model(Generic[T]):
             return instance
         except Exception as e:
             error_msg = f"Unexpected error loading {file_name}: {e}"
-            logging.error(error_msg)
+            logger.error(error_msg)
             raise ValueError(error_msg)
 
     @async_retry(max_retries=3, delay=1.0)
@@ -265,9 +270,9 @@ class Model(Generic[T]):
                 await file.write(json_data)
 
             self._data_cache[file_name] = data
-            logging.info(f"Successfully saved data to {file_name}")
+            logger.info(f"Successfully saved data to {file_name}")
         except Exception as e:
-            logging.error(f"Error saving {file_name}: {e}")
+            logger.error(f"Error saving {file_name}: {e}")
             raise
 
     def __del__(self):
@@ -286,7 +291,7 @@ class Roles(interactions.Extension):
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
         self.stats: Final[Counter[str]] = Counter()
         self.processed_thread_ids: Set[int] = set()
-        self.approval_counts: Dict[int, ApprovalInfo] = {}
+        self.approval_counts: Dict[int, Approval] = {}
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
         self._stats_lock: Final[asyncio.Lock] = asyncio.Lock()
         self._save_stats_task: asyncio.Task | None = None
@@ -606,45 +611,50 @@ class Roles(interactions.Extension):
         )
 
     async def create_review_components(
-        self, thread: interactions.GuildPublicThread
+        self,
+        thread: interactions.GuildPublicThread,
     ) -> Tuple[interactions.Embed, List[interactions.Button]]:
-        approval_info: ApprovalInfo = self.approval_counts.get(
-            thread.id, ApprovalInfo()
-        )
-        approval_count: int = approval_info.approval_count
-        required_count: int = (
+        approval_info: Approval = self.approval_counts.get(thread.id) or Approval()
+        approval_count: Final[int] = approval_info.approval_count
+
+        required_count: Final[int] = (
             self.config.REQUIRED_APPROVALS
             if approval_count < self.config.REQUIRED_APPROVALS
             else self.config.REQUIRED_REJECTIONS
         )
 
-        reviewers_text: str = (
+        reviewers_text: Final[str] = (
             ", ".join(
-                f"<@{reviewer_id}>" for reviewer_id in sorted(approval_info.reviewers)
+                map(
+                    lambda reviewer_id: f"<@{reviewer_id}>",
+                    sorted(approval_info.reviewers, key=int),
+                )
             )
             or "No approvals yet."
         )
 
         embed: interactions.Embed = await self.create_embed(
             title="Voter Identity Approval",
-            description=(
-                f"**Approvals:** {approval_count}/{self.config.REQUIRED_APPROVALS}\n"
-                f"**Reviewers:** {reviewers_text}"
+            description="\n".join(
+                [
+                    f"**Approvals:** {approval_count}/{self.config.REQUIRED_APPROVALS}",
+                    f"**Reviewers:** {reviewers_text}",
+                ]
             ),
             color=EmbedColor.INFO,
         )
 
-        buttons: List[interactions.Button] = [
+        buttons: Final[List[interactions.Button]] = [
             interactions.Button(
                 style=interactions.ButtonStyle.SUCCESS,
                 label="Approve",
-                custom_id=f"approve",
+                custom_id="approve",
                 disabled=False,
             ),
             interactions.Button(
                 style=interactions.ButtonStyle.DANGER,
                 label="Reject",
-                custom_id=f"reject",
+                custom_id="reject",
                 disabled=False,
             ),
         ]
@@ -1081,74 +1091,93 @@ class Roles(interactions.Extension):
         return await self.process_approval_status_change(ctx, Status.REJECTED)
 
     @asynccontextmanager
-    async def member_lock(self, member_id: int):
+    async def member_lock(self, member_id: int) -> AsyncGenerator[None, None]:
         lock_info = self.member_lock_map.setdefault(
             member_id, {"lock": asyncio.Lock(), "last_used": datetime.now(timezone.utc)}
         )
-        async with lock_info["lock"]:
-            lock_info["last_used"] = datetime.now(timezone.utc)
-            yield
+        try:
+            async with lock_info["lock"]:
+                lock_info["last_used"] = datetime.now(timezone.utc)
+                yield
+        finally:
+            current_time = datetime.now(timezone.utc)
+            stale_members = [
+                mid
+                for mid, info in self.member_lock_map.items()
+                if (current_time - info["last_used"]).total_seconds() > 3600
+            ]
+            for mid in stale_members:
+                del self.member_lock_map[mid]
 
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
     ) -> Optional[str]:
-        if not self.validate_vetting_permissions(ctx):
-            await self.send_error(
-                ctx,
-                "You don't have permission to use this command.",
-                log_to_channel=False,
-            )
+        if not await self.validate_context(ctx):
             return None
 
         thread = await self.bot.fetch_channel(ctx.channel_id)
         if not isinstance(thread, interactions.GuildPublicThread):
-            raise ValueError("This callback should only be used in threads.")
+            raise ValueError("Invalid context: Must be used in threads")
 
         guild = await self.bot.fetch_guild(thread.guild.id)
         member = await guild.fetch_member(thread.owner_id)
 
         if not member:
-            await self.send_error(ctx, "The member is no longer in the server.")
+            await self.send_error(ctx, "Member not found in server")
             return None
 
         async with self.member_lock(member.id):
             try:
                 roles = await self.fetch_required_roles(guild)
-                if not all(roles.values()):
-                    await self.send_error(ctx, "Required roles not found.")
+                if not self.validate_roles(roles):
+                    await self.send_error(ctx, "Required roles configuration invalid")
                     return None
 
-                current_roles = {role.id for role in member.roles}
+                current_roles = frozenset(role.id for role in member.roles)
                 thread_approvals = self.get_thread_approvals(thread.id)
 
-                if ctx.author.id in thread_approvals.reviewers:
-                    await self.send_error(
-                        ctx,
-                        "You have already voted on this thread.",
-                        log_to_channel=False,
-                    )
+                if not await self.validate_reviewer(ctx, thread_approvals):
                     return None
 
-                if status == Status.APPROVED:
-                    response = await self.process_approval(
-                        ctx, member, roles, current_roles, thread_approvals, thread
-                    )
-                elif status == Status.REJECTED:
-                    response = await self.process_rejection(
-                        ctx, member, roles, current_roles, thread_approvals, thread
-                    )
-                else:
-                    await self.send_error(ctx, "Invalid status provided.")
-                    return None
+                match status:
+                    case Status.APPROVED:
+                        response = await self.process_approval(
+                            ctx, member, roles, current_roles, thread_approvals, thread
+                        )
+                    case Status.REJECTED:
+                        response = await self.process_rejection(
+                            ctx, member, roles, current_roles, thread_approvals, thread
+                        )
+                    case _:
+                        await self.send_error(ctx, "Invalid status")
+                        return None
 
                 return response
 
             except Exception as e:
-                logger.exception(f"Error updating member status: {e}")
-                await self.send_error(ctx, "An error occurred. Please try again later.")
+                logger.exception(f"Status change failed: {e}")
+                await self.send_error(ctx, "Processing error occurred")
                 return None
             finally:
                 await self.update_review_components(ctx, thread)
+
+    async def validate_context(self, ctx: interactions.ComponentContext) -> bool:
+        if not self.validate_vetting_permissions(ctx):
+            await self.send_error(ctx, "Insufficient permissions", log_to_channel=False)
+            return False
+        return True
+
+    async def validate_reviewer(
+        self, ctx: interactions.ComponentContext, thread_approvals: Approval
+    ) -> bool:
+        if ctx.author.id in thread_approvals.reviewers:
+            await self.send_error(ctx, "Duplicate vote detected", log_to_channel=False)
+            return False
+        return True
+
+    @staticmethod
+    def validate_roles(roles: Dict[str, Optional[interactions.Role]]) -> bool:
+        return all(roles.values())
 
     async def update_review_components(
         self, ctx: interactions.ComponentContext, thread: interactions.GuildPublicThread
@@ -1159,40 +1188,26 @@ class Roles(interactions.Extension):
         except Exception as e:
             logger.error(f"Failed to update message: {str(e)}")
 
-    async def process_approval_status(
-        self,
-        ctx: interactions.ComponentContext,
-        status: Status,
-        member: interactions.Member,
-        roles: Dict[str, interactions.Role],
-        current_roles: Set[int],
-        thread_approvals: ApprovalInfo,
-        thread: interactions.GuildPublicThread,
-    ) -> Optional[str]:
-        if status == Status.APPROVED:
-            return await self.process_approval(
-                ctx, member, roles, current_roles, thread_approvals, thread
-            )
-        elif status == Status.REJECTED:
-            return await self.process_rejection(
-                ctx, member, roles, current_roles, thread_approvals, thread
-            )
-        return None
-
     async def process_approval(
         self,
         ctx: interactions.ComponentContext,
         member: interactions.Member,
         roles: Dict[str, interactions.Role],
-        current_roles: Set[int],
-        thread_approvals: ApprovalInfo,
+        current_roles: FrozenSet[int],
+        thread_approvals: Approval,
         thread: interactions.GuildPublicThread,
     ) -> str:
+        logger.info(f"Starting approval process for member {member.id}")
+        logger.info(f"Current roles: {current_roles}")
+
         if roles["electoral"].id in current_roles:
+            logger.info(f"Member {member.id} already has electoral role")
             await self.send_error(
-                ctx, "This member has already been approved.", log_to_channel=False
+                ctx,
+                "This member has already been approved.",
+                log_to_channel=False,
             )
-            return "Approval aborted: Member already approved."
+            return "Approval aborted: Already approved"
 
         thread_approvals.approval_count += 1
         thread_approvals.reviewers.add(ctx.author.id)
@@ -1206,39 +1221,37 @@ class Roles(interactions.Extension):
             thread_approvals.last_approval_time = datetime.now(timezone.utc)
             await self.send_approval_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
-            return f"Approved {member.mention} and updated roles"
-        else:
-            await self.send_success(
-                ctx,
-                f"Approval registered. Current approvals: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
-                log_to_channel=False,
-            )
-            return "Approval registered successfully."
+            return f"Approved {member.mention} with role updates"
+
+        await self.send_success(
+            ctx,
+            f"Approval {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
+            log_to_channel=False,
+        )
+        return "Approval registered"
 
     async def process_rejection(
         self,
         ctx: interactions.ComponentContext,
         member: interactions.Member,
         roles: Dict[str, interactions.Role],
-        current_roles: Set[int],
-        thread_approvals: ApprovalInfo,
+        current_roles: FrozenSet[int],
+        thread_approvals: Approval,
         thread: interactions.GuildPublicThread,
     ) -> str:
         if roles["electoral"].id not in current_roles:
-            await self.send_error(
-                ctx, "This member is not currently approved.", log_to_channel=False
-            )
-            return "Rejection aborted: Member not approved."
+            await self.send_error(ctx, "Member not approved", log_to_channel=False)
+            return "Rejection aborted: Not approved"
 
         if thread_approvals.last_approval_time and self.is_rejection_window_closed(
             thread_approvals
         ):
             await self.send_error(
                 ctx,
-                f"The {self.config.REJECTION_WINDOW_DAYS}-day window for rejection has passed.",
+                f"Rejection window ({self.config.REJECTION_WINDOW_DAYS} days) expired",
                 log_to_channel=False,
             )
-            return "Rejection aborted: Window closed."
+            return "Rejection aborted: Window closed"
 
         thread_approvals.rejection_count += 1
         thread_approvals.reviewers.add(ctx.author.id)
@@ -1251,16 +1264,16 @@ class Roles(interactions.Extension):
             thread_approvals.rejection_count = self.config.REQUIRED_REJECTIONS
             await self.send_rejection_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
-            return f"Rejected {member.mention} and updated roles"
-        else:
-            await self.send_success(
-                ctx,
-                f"Rejection registered. Current rejections: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS}",
-                log_to_channel=False,
-            )
-            return "Rejection registered successfully."
+            return f"Rejected {member.mention} with role updates"
 
-    def is_rejection_window_closed(self, thread_approvals: ApprovalInfo) -> bool:
+        await self.send_success(
+            ctx,
+            f"Rejection {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS}",
+            log_to_channel=False,
+        )
+        return "Rejection registered"
+
+    def is_rejection_window_closed(self, thread_approvals: Approval) -> bool:
         return (
             datetime.now(timezone.utc) - thread_approvals.last_approval_time
         ) > timedelta(days=self.config.REJECTION_WINDOW_DAYS)
@@ -1277,54 +1290,110 @@ class Roles(interactions.Extension):
             "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
         }
 
-    def get_thread_approvals(self, thread_id: int) -> ApprovalInfo:
-        return self.approval_counts.get(thread_id, ApprovalInfo())
+    def get_thread_approvals(self, thread_id: int) -> Approval:
+        return self.approval_counts.get(thread_id, Approval())
 
     async def update_member_roles(
         self,
         member: interactions.Member,
         role_to_add: interactions.Role,
         role_to_remove: interactions.Role,
-        current_roles: Set[int],
+        current_roles: FrozenSet[int],
     ) -> bool:
-        tasks = []
-        if role_to_add.id not in current_roles:
-            tasks.append(member.add_roles([role_to_add]))
-        if role_to_remove.id in current_roles:
-            tasks.append(member.remove_roles([role_to_remove]))
+        async def verify_roles(member_to_check: interactions.Member) -> set[int]:
+            refreshed = await member_to_check.guild.fetch_member(member_to_check.id)
+            return {role.id for role in refreshed.roles}
 
-        if tasks:
-            await asyncio.gather(*tasks)
-            return True
-        return False
+        async def execute_role_updates(
+            target: interactions.Member,
+            to_add: interactions.Role | None = None,
+            to_remove: interactions.Role | None = None,
+        ) -> None:
+            if to_remove:
+                logger.info(f"Removing role {to_remove.id} from member {target.id}")
+                await target.remove_roles([to_remove])
+            if to_add:
+                logger.info(f"Adding role {to_add.id} to member {target.id}")
+                await target.add_roles([to_add])
+
+        logger.info(
+            f"Initiating role update for member {member.id}.Current roles: {current_roles}. Role to add: {role_to_add.id}, Role to remove: {role_to_remove.id}"
+        )
+
+        try:
+            updates_needed = []
+            if role_to_remove.id in current_roles:
+                updates_needed.append(("remove", role_to_remove))
+            if role_to_add.id not in current_roles:
+                updates_needed.append(("add", role_to_add))
+
+            for action, role in updates_needed:
+                await execute_role_updates(
+                    member,
+                    to_add=role if action == "add" else None,
+                    to_remove=role if action == "remove" else None,
+                )
+
+            MAX_RETRIES = 3
+            for attempt in range(MAX_RETRIES):
+                final_roles = await verify_roles(member)
+                logger.info(
+                    f"Verification attempt {attempt + 1} - Current roles: {final_roles}"
+                )
+
+                if (
+                    role_to_add.id in final_roles
+                    and role_to_remove.id not in final_roles
+                ):
+                    logger.info("Role update successful and verified")
+                    return True
+
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        f"Role verification failed on attempt {attempt + 1}, retrying. Expected: +{role_to_add.id}, -{role_to_remove.id}. Current: {final_roles}"
+                    )
+                    await execute_role_updates(
+                        member,
+                        to_add=(
+                            role_to_add if role_to_add.id not in final_roles else None
+                        ),
+                        to_remove=(
+                            role_to_remove if role_to_remove.id in final_roles else None
+                        ),
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+            logger.error("Role update failed after all retry attempts")
+            return False
+
+        except Exception as e:
+            logger.error(
+                f"Critical error during role update for member {member.id}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            return False
 
     async def send_approval_notification(
         self,
         thread: interactions.GuildPublicThread,
         member: interactions.Member,
-        thread_approvals: ApprovalInfo,
+        thread_approvals: Approval,
     ) -> None:
-        reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
-        )
+        reviewer_mentions = ", ".join(f"<@{rid}>" for rid in thread_approvals.reviewers)
         await self.send_success(
-            thread,
-            f"{member.mention} has been approved by {reviewer_mentions}.",
-            EmbedColor.INFO,
+            thread, f"{member.mention} approved by {reviewer_mentions}", EmbedColor.INFO
         )
 
     async def send_rejection_notification(
         self,
         thread: interactions.GuildPublicThread,
         member: interactions.Member,
-        thread_approvals: ApprovalInfo,
+        thread_approvals: Approval,
     ) -> None:
-        reviewer_mentions = ", ".join(
-            f"<@{reviewer_id}>" for reviewer_id in thread_approvals.reviewers
-        )
+        reviewer_mentions = ", ".join(f"<@{rid}>" for rid in thread_approvals.reviewers)
         await self.send_success(
             thread,
-            f"{member.mention} has been rejected by {reviewer_mentions}.",
+            f"{member.mention} rejected by {reviewer_mentions}",
             EmbedColor.ERROR,
         )
 
@@ -1743,14 +1812,14 @@ class Roles(interactions.Extension):
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
         # self.update_roles_based_on_activity.start()
-        self.cleanup_old_locks.start()
+        # self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
         tasks_to_stop: Final[tuple] = (
             # self.update_roles_based_on_activity,
-            self.cleanup_old_locks,
+            # self.cleanup_old_locks,
             self.check_incarcerated_members,
         )
         for task in tasks_to_stop:
@@ -1855,6 +1924,7 @@ class Roles(interactions.Extension):
                 if (
                     roles["temporary"].id in member_role_ids
                     and roles["approved"].id not in member_role_ids
+                    and roles["electoral"].id not in member_role_ids
                 ):
                     reason: str = (
                         f"Sent {message_count} messages, upgraded from {self.config.TEMPORARY_ROLE_ID} to {self.config.APPROVED_ROLE_ID}."
