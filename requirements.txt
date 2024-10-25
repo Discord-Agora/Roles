@@ -6,3 +6,4 @@ pydantic
 yarl
 orjson
 loguru
+numpy
