@@ -1,8 +1,11 @@
 import asyncio
+import functools
+import math
 import os
 import re
 import time
 import traceback
+import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
@@ -10,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
+from multiprocessing import cpu_count
 from pathlib import Path
 from turtle import update
 from typing import (
@@ -37,6 +41,7 @@ from typing import (
 import aiofiles
 import cysimdjson
 import interactions
+import numpy as np
 import orjson
 from cachetools import TTLCache
 from interactions.api.events import (
@@ -279,6 +284,104 @@ class Model(Generic[T]):
         self._executor.shutdown(wait=True)
 
 
+@dataclass(frozen=True, slots=True)
+class Message:
+    message: str
+    user_stats: Dict[str, Any]
+    config: Dict[str, float]
+    _message_length: int = field(init=False, repr=False)
+    _char_frequencies: Counter = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_message_length", len(self.message) if self.message else 0
+        )
+        object.__setattr__(self, "_char_frequencies", Counter(self.message))
+
+    def analyze(self) -> frozenset[str]:
+        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+            violation_checks: Dict[str, asyncio.Future[bool]] = {
+                "message_repetition": executor.submit(self._check_repetition),
+                "non_ascii_characters": executor.submit(self._check_non_ascii),
+                "excessive_digits": executor.submit(self._check_digit_ratio),
+                "low_entropy": executor.submit(self._check_entropy),
+            }
+
+            return frozenset(
+                violation_type
+                for violation_type, future in violation_checks.items()
+                if future.result()
+            )
+
+    def _check_repetition(self) -> bool:
+        last_message: str = self.user_stats.get("last_message", "")
+        if self.message == last_message:
+            repetition_count: int = self.user_stats.get("repetition_count", 0) + 1
+            self.user_stats["repetition_count"] = repetition_count
+            return repetition_count >= self.config["MAX_REPETITIONS"]
+
+        self.user_stats.update({"repetition_count": 0, "last_message": self.message})
+        return False
+
+    def _check_non_ascii(self) -> bool:
+        if not self._message_length:
+            return False
+
+        @lru_cache(maxsize=1024)
+        def is_invalid_char(c: str) -> bool:
+            code: int = ord(c)
+            return not any(
+                (
+                    0x4E00 <= code <= 0x9FFF,
+                    0x3400 <= code <= 0x4DBF,
+                    0x20000 <= code <= 0x2A6DF,
+                    0x2A700 <= code <= 0x2B73F,
+                    0x2B740 <= code <= 0x2B81F,
+                    0x2B820 <= code <= 0x2CEAF,
+                    0x3000 <= code <= 0x303F,
+                    0xFF00 <= code <= 0xFFEF,
+                    code <= 127,  # ASCII
+                )
+            )
+
+        suspicious_chars: int = sum(
+            1 for c in self._char_frequencies if is_invalid_char(c)
+        )
+        return (suspicious_chars / self._message_length) > self.config[
+            "NON_ASCII_THRESHOLD"
+        ]
+
+    def _check_digit_ratio(self) -> bool:
+        if not self._message_length:
+            return False
+
+        digit_count: int = sum(
+            freq for char, freq in self._char_frequencies.items() if char.isdigit()
+        )
+        return (digit_count / self._message_length) > self.config["DIGIT_THRESHOLD"]
+
+    def _check_entropy(self) -> bool:
+        if not self._message_length:
+            return False
+
+        if self._message_length > 1000:
+            frequencies = np.array(list(self._char_frequencies.values()))
+            probabilities = frequencies / self._message_length
+            entropy = -np.sum(probabilities * np.log2(probabilities))
+        else:
+            entropy = -sum(
+                (count / self._message_length) * math.log2(count / self._message_length)
+                for count in self._char_frequencies.values()
+            )
+
+        dynamic_threshold: float = max(
+            self.config["MIN_ENTROPY_THRESHOLD"],
+            2.0 - math.log2(max(self._message_length, 2)) / 10,
+        )
+
+        return entropy < dynamic_threshold
+
+
 # Controller
 
 
@@ -289,12 +392,20 @@ class Roles(interactions.Extension):
         self.vetting_roles: Data = Data()
         self.custom_roles: Dict[str, Set[int]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
-        self.stats: Final[Counter[str]] = Counter()
+        self.stats: Counter[str] = Counter()
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, Approval] = {}
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
         self._stats_lock: Final[asyncio.Lock] = asyncio.Lock()
         self._save_stats_task: asyncio.Task | None = None
+
+        self.dynamic_config: Dict[str, Union[float, int]] = {
+            "MESSAGE_RATE_WINDOW": 60.0,
+            "MAX_REPETITIONS": 3,
+            "NON_ASCII_THRESHOLD": 0.9,
+            "DIGIT_THRESHOLD": 0.5,
+            "MIN_ENTROPY_THRESHOLD": 1.5,
+        }
 
         self.cache = TTLCache(maxsize=100, ttl=300)
 
@@ -1784,13 +1895,117 @@ class Roles(interactions.Extension):
 
     # Events
 
-    # @interactions.listen(MessageCreate)
-    # async def on_message_create(self, event: MessageCreate) -> None:
-    #     if not event.message.author.bot:
-    #         author_id: Final[str] = str(event.message.author.id)
-    #      async with self._stats_lock:
-    #             self.stats[author_id] += 1
-    #         await self._debounce_save_stats()
+    @interactions.listen(MessageCreate)
+    async def on_message_create(self, event: MessageCreate) -> None:
+        if event.message.author.bot:
+            return
+
+        member = await event.message.guild.fetch_member(event.message.author.id)
+        if not any(role.id == self.config.TEMPORARY_ROLE_ID for role in member.roles):
+            return
+
+        author_id: str = str(event.message.author.id)
+        message_content: str = event.message.content.strip()
+        current_time: float = time.time()
+
+        async with self._stats_lock:
+            user_stats = await self._process_user_stats(
+                author_id, message_content, current_time
+            )
+            await self._debounce_save_stats()
+
+    async def _process_user_stats(
+        self, author_id: str, message_content: str, current_time: float
+    ) -> Dict[str, Any]:
+        user_stats = self.stats.setdefault(
+            author_id,
+            {
+                "message_timestamps": [],
+                "last_message": "",
+                "repetition_count": 0,
+                "invalid_message_count": 0,
+                "feedback_score": 0,
+            },
+        )
+
+        message_rate_window = self.dynamic_config["MESSAGE_RATE_WINDOW"]
+        user_stats["message_timestamps"] = [
+            ts
+            for ts in user_stats["message_timestamps"]
+            if current_time - ts <= message_rate_window
+        ] + [current_time]
+
+        classification = await self._classify_message_advanced(
+            message_content.lower(), user_stats
+        )
+
+        if classification["is_invalid"]:
+            user_stats["invalid_message_count"] += 1
+            logger.warning(
+                f"Message violation detected for user {author_id}: "
+                f"{', '.join(classification['reasons'])}",
+                extra={
+                    "user_id": author_id,
+                    "violations": classification["reasons"],
+                    "message_stats": user_stats,
+                },
+            )
+            await self._adjust_thresholds_dynamic(user_stats)
+        else:
+            user_stats["invalid_message_count"] = max(
+                user_stats["invalid_message_count"] - 1, 0
+            )
+
+        return user_stats
+
+    async def _classify_message_advanced(
+        self, message: str, user_stats: Dict[str, Any]
+    ) -> Dict[str, Union[bool, List[str]]]:
+        violations = Message(message, user_stats, self.dynamic_config).analyze()
+
+        return {"is_invalid": bool(violations), "reasons": violations}
+
+    async def _adjust_thresholds_dynamic(self, user_stats: Dict[str, Any]) -> None:
+        feedback: int = user_stats.get("feedback_score", 0)
+        adjustment_factor: float = self._calculate_adaptive_adjustment(feedback)
+
+        thresholds = {
+            "NON_ASCII_THRESHOLD": (0.5, 1.0),
+            "DIGIT_THRESHOLD": (0.1, 1.0),
+            "MIN_ENTROPY_THRESHOLD": (0.0, 4.0),
+        }
+
+        for threshold_name, (min_val, max_val) in thresholds.items():
+            current_val = self.dynamic_config[threshold_name]
+            new_val = min(max(current_val + adjustment_factor, min_val), max_val)
+            self.dynamic_config[threshold_name] = new_val
+
+    def _calculate_adaptive_adjustment(self, feedback: int) -> float:
+        base_factor = 0.01
+        scaling_factor = math.tanh(abs(feedback) / 10)
+        return base_factor * feedback * scaling_factor
+
+    def contains_profanity(self, message: str) -> bool:
+        normalized_message = unicodedata.normalize("NFKD", message.lower())
+        return any(
+            profane_word in normalized_message
+            for profane_word in self._get_profanity_patterns()
+        )
+
+    def contains_spam_keywords(self, message: str) -> bool:
+        normalized_message = unicodedata.normalize("NFKD", message.lower())
+        return any(
+            re.search(pattern, normalized_message, re.IGNORECASE)
+            for pattern in self._get_spam_patterns()
+        )
+
+    @functools.lru_cache(maxsize=1)
+    def _get_profanity_patterns(self) -> FrozenSet[str]:
+        return frozenset({"click here", "subscribe now"})
+
+    @functools.lru_cache(maxsize=1)
+    def _get_spam_patterns(self) -> FrozenSet[str]:
+        return frozenset({"click here", "subscribe now"})
 
     async def _debounce_save_stats(self) -> None:
         if self._save_stats_task is not None:
@@ -1811,15 +2026,15 @@ class Roles(interactions.Extension):
 
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
-        # self.update_roles_based_on_activity.start()
-        # self.cleanup_old_locks.start()
+        self.update_roles_based_on_activity.start()
+        self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
         tasks_to_stop: Final[tuple] = (
-            # self.update_roles_based_on_activity,
-            # self.cleanup_old_locks,
+            self.update_roles_based_on_activity,
+            self.cleanup_old_locks,
             self.check_incarcerated_members,
         )
         for task in tasks_to_stop:
@@ -1903,89 +2118,141 @@ class Roles(interactions.Extension):
         else:
             logger.info("No prisoners to release at this time")
 
-    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
+    @interactions.Task.create(interactions.IntervalTrigger(seconds=10))
     async def update_roles_based_on_activity(self) -> None:
-        guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-        roles: Dict[str, interactions.Role] = {
-            "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
-            "temporary": await guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
-        }
+        try:
+            guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            roles: Dict[str, interactions.Role] = {
+                role_name: await guild.fetch_role(role_id)
+                for role_name, role_id in {
+                    "approved": self.config.APPROVED_ROLE_ID,
+                    "temporary": self.config.TEMPORARY_ROLE_ID,
+                    "electoral": self.config.ELECTORAL_ROLE_ID,
+                }.items()
+            }
 
-        async def process_member(
-            member_id: str, message_count: int
-        ) -> Tuple[int, str, List[interactions.Role], List[interactions.Role]]:
-            if message_count < 50:
-                return int(member_id), "", [], []
-
-            try:
-                member: interactions.Member = await guild.fetch_member(int(member_id))
-                member_role_ids: Set[int] = {role.id for role in member.roles}
-
-                if (
-                    roles["temporary"].id in member_role_ids
-                    and roles["approved"].id not in member_role_ids
-                    and roles["electoral"].id not in member_role_ids
-                ):
-                    reason: str = (
-                        f"Sent {message_count} messages, upgraded from {self.config.TEMPORARY_ROLE_ID} to {self.config.APPROVED_ROLE_ID}."
+            async def process_member(
+                member_id: str, stats: Dict[str, Any]
+            ) -> Tuple[int, str, List[interactions.Role], List[interactions.Role]]:
+                try:
+                    message_timestamps = stats.get("message_timestamps", [])
+                    valid_messages = len(message_timestamps) - stats.get(
+                        "invalid_message_count", 0
                     )
-                    return (
-                        int(member_id),
-                        reason,
-                        [roles["temporary"]],
-                        [roles["approved"]],
+
+                    if valid_messages < 5:
+                        return int(member_id), "", [], []
+
+                    member: Optional[interactions.Member] = await guild.fetch_member(
+                        int(member_id)
                     )
-            except Exception as e:
-                logger.error(
-                    f"Error processing member {member_id}: {str(e)}\n{traceback.format_exc()}"
-                )
+                    if not member:
+                        logger.warning(
+                            f"Member {member_id} not found during processing"
+                        )
+                        return int(member_id), "", [], []
 
-            return int(member_id), "", [], []
+                    member_role_ids: Set[int] = {role.id for role in member.roles}
 
-        results: List[
-            Tuple[int, str, List[interactions.Role], List[interactions.Role]]
-        ] = await asyncio.gather(
-            *(
-                process_member(member_id, count)
-                for member_id, count in self.stats.items()
+                    if all(
+                        [
+                            roles["temporary"].id in member_role_ids,
+                            roles["approved"].id not in member_role_ids,
+                            roles["electoral"].id not in member_role_ids,
+                            valid_messages >= 5,
+                        ]
+                    ):
+                        reason: str = (
+                            f"Sent {valid_messages} valid messages, "
+                            f"upgraded from {roles['temporary'].name} to {roles['approved'].name}."
+                        )
+                        return (
+                            int(member_id),
+                            reason,
+                            [roles["temporary"]],
+                            [roles["approved"]],
+                        )
+
+                    return int(member_id), "", [], []
+
+                except Exception as e:
+                    logger.error(
+                        f"Error processing member {member_id}: {str(e)}\n{traceback.format_exc()}"
+                    )
+                    return int(member_id), "", [], []
+
+            results: List[
+                Tuple[int, str, List[interactions.Role], List[interactions.Role]]
+            ] = await asyncio.gather(
+                *(
+                    process_member(member_id, stats)
+                    for member_id, stats in self.stats.items()
+                ),
+                return_exceptions=True,
             )
-        )
 
-        role_updates: Dict[str, Dict[int, List[interactions.Role]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        members_to_update: Set[int] = set()
+            role_updates: Dict[str, Dict[int, List[interactions.Role]]] = {
+                "remove": defaultdict(list),
+                "add": defaultdict(list),
+            }
+            members_to_update: Set[int] = set()
+            log_messages: List[str] = []
 
-        for member_id, reason, roles_to_remove, roles_to_add in results:
-            if reason:
-                role_updates["remove"][member_id].extend(roles_to_remove)
-                role_updates["add"][member_id].extend(roles_to_add)
-                members_to_update.add(member_id)
-                log_messages = [
-                    f"Updated roles for {member_id}: {reason}"
-                    for member_id, reason in update
-                ]
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to process member: {result}")
+                    continue
 
-        if members_to_update:
+                member_id, reason, roles_to_remove, roles_to_add = result
+                if reason:
+                    role_updates["remove"][member_id].extend(roles_to_remove)
+                    role_updates["add"][member_id].extend(roles_to_add)
+                    members_to_update.add(member_id)
+                    log_messages.append(f"Updated roles for {member_id}: {reason}")
 
-            async def update_member_roles(member_id: int) -> None:
-                member = await guild.fetch_member(member_id)
+            if members_to_update:
+
+                async def update_member_roles(member_id: int) -> None:
+                    try:
+                        member = await guild.fetch_member(member_id)
+                        if not member:
+                            logger.error(
+                                f"Member {member_id} not found during role update"
+                            )
+                            return
+
+                        if role_updates["remove"][member_id]:
+                            await member.remove_roles(role_updates["remove"][member_id])
+                        if role_updates["add"][member_id]:
+                            await member.add_roles(role_updates["add"][member_id])
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error updating roles for member {member_id}: {str(e)}\n{traceback.format_exc()}"
+                        )
+
                 await asyncio.gather(
-                    member.remove_roles(role_updates["remove"][member_id]),
-                    member.add_roles(role_updates["add"][member_id]),
+                    *(update_member_roles(member_id) for member_id in members_to_update)
                 )
 
-            await asyncio.gather(
-                *(update_member_roles(member_id) for member_id in members_to_update)
+                if log_messages:
+                    await self.send_success(None, "\n".join(log_messages))
+
+            self.stats = {
+                k: v
+                for k, v in self.stats.items()
+                if (
+                    int(k) not in members_to_update
+                    or len(v.get("message_timestamps", [])) < 5
+                )
+            }
+            await self.save_stats_roles()
+
+        except Exception as e:
+            logger.error(
+                f"Critical error in role update task: {str(e)}\n{traceback.format_exc()}"
             )
-
-            log_message = "\n".join(log_messages)
-            await self.send_success(None, log_message)
-
-        self.stats = {
-            k: v for k, v in self.stats.items() if int(k) not in members_to_update
-        }
-        await self.save_stats_roles()
+            raise
 
     # Serve
 
