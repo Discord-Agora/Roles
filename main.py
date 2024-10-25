@@ -2118,7 +2118,7 @@ class Roles(interactions.Extension):
         else:
             logger.info("No prisoners to release at this time")
 
-    @interactions.Task.create(interactions.IntervalTrigger(seconds=10))
+    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
     async def update_roles_based_on_activity(self) -> None:
         try:
             guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
@@ -2140,7 +2140,7 @@ class Roles(interactions.Extension):
                         "invalid_message_count", 0
                     )
 
-                    if valid_messages < 5:
+                    if valid_messages < 50:
                         return int(member_id), "", [], []
 
                     member: Optional[interactions.Member] = await guild.fetch_member(
