@@ -1,28 +1,86 @@
+## 2024-10-25
+
+### Added
+- Implemented message validation with schema verification
+- Added loguru for enhanced logging capabilities
+- Added numpy for numerical computations
+
+### Changed
+- Migrated from stdlib logging to loguru framework for improved formatting
+- Removed log file compression
+- Enhanced debugging with better traceback information
+
+## 2024-10-19
+
+### Changed
+- Replaced explicit loops with list comprehensions and generators
+- Refactored approval/rejection logic for maintainability
+- Implemented builder pattern for embed creation
+- Updated log directory structure
+- Improved memory efficiency for large role sets
+- Separated business logic from presentation layer
+- Added proper error handling and validation
+
+## 2024-10-18
+
+### Added
+- Added `log_to_channel` parameter for configurable notification routing
+
+### Fixed
+- Added proper role hierarchy checks in vetting system
+- Fixed permission inheritance edge cases
+- Resolved `ApprovalInfo` serialization issues
+- Corrected type hints and validation
+
 ## 2024-10-17
-### Major Changes
-- Implemented the MVC pattern.
-- Separated the Model from the Controller in `interactions.Extension`.
-### Refactoring
-- Organized the Controller into distinct sections.
-- Streamlined JSON parsing and error handling in the Model:
-  - Replaced `cysimdjson` with `orjson` for improved performance.
-  - Simplified data extraction into dictionaries for model validation.
-  - Enhanced error handling for file not found and validation errors.
-  - Updated logging messages for better traceability.
-- Optimized role management and improved code structure:
-  - Removed custom roles set conversion to enhance performance.
-  - Simplified vetting permissions validation.
-  - Enhanced error handling and input validation.
-  - Optimized callback registrations for role menus.
-  - Minor code cleanup and formatting improvements.
-### Performance Improvements
-- Replaced unsupported `as_dict()` method with `at_pointer()` for `cysimdjson`.
-- Implemented separate parsing logic for `BaseModel`, `Counter`, and `dict` types.
-### Features
-- Introduced `vetting.json` with updated assignable roles.
-### Fixes
-- Corrected JSON parsing in the `load_data` method of the Model.
-- Resolved issues with `cysimdjson` JSONObject parsing.
-- Fixed minor bugs related to role management and validation.
-### Documentation
-- Updated `README` for version 2024.10.17.
+
+### Added
+- Updated `assignable_roles` in vetting.json with new categories
+- Implemented role hierarchy validation system
+
+### Changed
+- Implemented caching for frequently accessed roles
+- Reduced database queries for role operations
+- Migrated from regex library to standard re module
+- Updated pattern matching implementation
+
+## 2024-10-15
+
+### Added
+- Introduced vetting.json for centralized configuration
+- Added orjson dependency
+
+### Fixed
+- Implemented proper JSON parsing error handling
+- Added validation for required data fields
+- Improved performance with orjson replacement
+- Reduced memory usage in parsing operations
+
+### Changed
+- Removed deprecated configuration files
+- Updated minimum Python version to 3.9
+- Updated package versions for compatibility
+
+## 2024-10-14
+
+### Added
+- Created requirements.txt
+- Added initial documentation
+- Configured development environment
+
+### Changed
+- Implemented MVC architectural pattern
+- Separated data, presentation, and business logic
+- Completed initial project structure setup
+
+## Migration Notes
+
+### Upgrading from pre-2024-10-15
+- Replace regex with standard re module
+- Update JSON parsing to use orjson
+- Review role management configuration
+
+### Upgrading to 2024-10-15
+- Migrate logging to loguru
+- Install numpy and loguru dependencies
+- Update message processing configuration if using custom thresholds
