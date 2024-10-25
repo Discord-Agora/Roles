@@ -72,7 +72,7 @@ logger.add(
     enqueue=True,
     catch=True,
     rotation="1 MB",
-    compression="zip",
+    retention=1,
     encoding="utf-8",
     mode="a",
     delay=False,
