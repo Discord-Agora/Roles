@@ -1,3 +1,14 @@
+## 2024-10-26
+
+### Added
+- Added debug commands for configuration inspection
+
+### Changed
+- Removed non-ASCII character detection system and related thresholds
+- Removed profanity and spam detection methods
+- Changed concurrent role operations to sequential
+- Updated approval/reviewer message formatting
+
 ## 2024-10-25
 
 ### Added
