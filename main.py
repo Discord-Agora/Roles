@@ -302,7 +302,6 @@ class Message:
         with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
             violation_checks: Dict[str, asyncio.Future[bool]] = {
                 "message_repetition": executor.submit(self._check_repetition),
-                "non_ascii_characters": executor.submit(self._check_non_ascii),
                 "excessive_digits": executor.submit(self._check_digit_ratio),
                 "low_entropy": executor.submit(self._check_entropy),
             }
@@ -322,34 +321,6 @@ class Message:
 
         self.user_stats.update({"repetition_count": 0, "last_message": self.message})
         return False
-
-    def _check_non_ascii(self) -> bool:
-        if not self._message_length:
-            return False
-
-        @lru_cache(maxsize=1024)
-        def is_invalid_char(c: str) -> bool:
-            code: int = ord(c)
-            return not any(
-                (
-                    0x4E00 <= code <= 0x9FFF,
-                    0x3400 <= code <= 0x4DBF,
-                    0x20000 <= code <= 0x2A6DF,
-                    0x2A700 <= code <= 0x2B73F,
-                    0x2B740 <= code <= 0x2B81F,
-                    0x2B820 <= code <= 0x2CEAF,
-                    0x3000 <= code <= 0x303F,
-                    0xFF00 <= code <= 0xFFEF,
-                    code <= 127,  # ASCII
-                )
-            )
-
-        suspicious_chars: int = sum(
-            1 for c in self._char_frequencies if is_invalid_char(c)
-        )
-        return (suspicious_chars / self._message_length) > self.config[
-            "NON_ASCII_THRESHOLD"
-        ]
 
     def _check_digit_ratio(self) -> bool:
         if not self._message_length:
@@ -402,7 +373,6 @@ class Roles(interactions.Extension):
         self.dynamic_config: Dict[str, Union[float, int]] = {
             "MESSAGE_RATE_WINDOW": 60.0,
             "MAX_REPETITIONS": 3,
-            "NON_ASCII_THRESHOLD": 0.9,
             "DIGIT_THRESHOLD": 0.5,
             "MIN_ENTROPY_THRESHOLD": 1.5,
         }
@@ -748,8 +718,8 @@ class Roles(interactions.Extension):
             title="Voter Identity Approval",
             description="\n".join(
                 [
-                    f"**Approvals:** {approval_count}/{self.config.REQUIRED_APPROVALS}",
-                    f"**Reviewers:** {reviewers_text}",
+                    f"- Approvals: {approval_count}/{self.config.REQUIRED_APPROVALS}",
+                    f"- Reviewers: {reviewers_text}",
                 ]
             ),
             color=EmbedColor.INFO,
@@ -789,6 +759,214 @@ class Roles(interactions.Extension):
     module_group_penitentiary: interactions.SlashCommand = module_base.group(
         name="penitentiary", description="Penitentiary management"
     )
+    module_group_debug: interactions.SlashCommand = module_base.group(
+        name="debug", description="Debug commands"
+    )
+
+    # Debug commands
+
+    @module_group_debug.subcommand(
+        "view", sub_cmd_description="View configuration files"
+    )
+    @interactions.slash_option(
+        name="config",
+        description="Configuration type to view",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        choices=[
+            interactions.SlashCommandChoice(name="Vetting Roles", value="vetting"),
+            interactions.SlashCommandChoice(name="Custom Roles", value="custom"),
+            interactions.SlashCommandChoice(
+                name="Incarcerated Members", value="incarcerated"
+            ),
+            interactions.SlashCommandChoice(name="Stats", value="stats"),
+            interactions.SlashCommandChoice(name="Config", value="dynamic"),
+        ],
+    )
+    @error_handler
+    async def view_config(self, ctx: interactions.SlashContext, config: str) -> None:
+        await ctx.defer()
+        try:
+            config_data = await self._get_config_data(config)
+            if not config_data:
+                return await self.send_error(
+                    ctx, f"No data found for `{config}` configuration."
+                )
+
+            embeds = await self._generate_embeds(config, config_data)
+            if not embeds:
+                return await self.send_error(
+                    ctx, f"No displayable data found for `{config}` configuration."
+                )
+
+            paginator = Paginator.create_from_embeds(self.bot, *embeds, timeout=300)
+            await paginator.send(ctx)
+
+        except Exception as e:
+            logger.error(f"Error in view_config: {e}\n{traceback.format_exc()}")
+            await self.send_error(
+                ctx, f"An error occurred while viewing the configuration: {str(e)}"
+            )
+
+    async def _get_config_data(self, config: str) -> Optional[Any]:
+        if config == "dynamic":
+            return self.dynamic_config
+
+        config_file_map: Dict[str, Tuple[str, Type]] = {
+            "vetting": ("vetting.json", Data),
+            "custom": ("custom.json", dict),
+            "incarcerated": ("incarcerated_members.json", dict),
+            "stats": ("stats.json", Counter),
+        }
+
+        filename, model_type = config_file_map.get(config, (None, None))
+        if filename and model_type:
+            return await self.model.load_data(filename, model_type)
+        return None
+
+    async def _generate_embeds(
+        self, config: str, config_data: Any
+    ) -> List[interactions.Embed]:
+        embeds: List[interactions.Embed] = []
+        current_embed = await self.create_embed(
+            title=f"{config.title()} Configuration",
+            description="",
+            color=EmbedColor.INFO,
+        )
+        field_count = 0
+        max_fields = 25
+
+        async def add_field(name: str, value: str, inline: bool = False) -> None:
+            nonlocal current_embed, field_count
+            current_embed.add_field(
+                name=name, value=value or "*No data available*", inline=inline
+            )
+            field_count += 1
+            if field_count >= max_fields:
+                embeds.append(current_embed)
+                current_embed = await self.create_embed(
+                    title=f"{config.title()} Configuration (continued)",
+                    description="",
+                    color=EmbedColor.INFO,
+                )
+                field_count = 0
+
+        if config == "vetting":
+            overview = []
+            for category in ["ideology", "domicile", "status"]:
+                if category in config_data.assigned_roles:
+                    role_count = len(config_data.assigned_roles[category])
+                    overview.append(f"**{category.title()}**: {role_count} roles")
+
+            await add_field(
+                name="Overview",
+                value="\n".join(overview) or "*No roles configured*",
+                inline=True,
+            )
+
+            for category, roles in config_data.assigned_roles.items():
+                roles_str = "\n".join(
+                    f"- <@&{role_id}>" for role, role_id in sorted(roles.items())
+                )
+
+                await add_field(
+                    name=f"{category.title()} Roles",
+                    value=roles_str or "*No roles configured*",
+                    inline=True,
+                )
+
+            for category, assignable_roles in config_data.assignable_roles.items():
+                roles_str = "\n".join(
+                    f"- `{role}`" for role in sorted(assignable_roles)
+                )
+                await add_field(
+                    name=f"Assignable {category.title()} Roles",
+                    value=roles_str or "*No assignable roles*",
+                    inline=True,
+                )
+        elif config == "custom":
+            for role_name, members in config_data.items():
+                member_list = "\n".join(f"- <@{member_id}>" for member_id in members)
+                await add_field(
+                    name=f"Role: {role_name}", value=member_list, inline=True
+                )
+
+        elif config == "incarcerated":
+            for member_id, info in config_data.items():
+                try:
+                    release_time = int(float(info["release_time"]))
+                    original_roles = info.get("original_roles", [])
+
+                    roles_str = ", ".join(
+                        f"<@&{role_id}>" for role_id in original_roles
+                    )
+                    if not roles_str:
+                        roles_str = "*No roles*"
+
+                    value = (
+                        f"- Release Time: <t:{release_time}:F>\n"
+                        f"- Original Roles: {roles_str}"
+                    )
+
+                    member_name = f"<@{member_id}>"
+                    await add_field(
+                        name=f"Incarcerated Member: {member_name}",
+                        value=value,
+                        inline=True,
+                    )
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Error processing member {member_id}: {str(e)}")
+                    continue
+
+        elif config == "stats":
+            for member_id, stats in config_data.items():
+                member_name = f"<@{member_id}>"
+
+                formatted_stats = []
+                for key, value in stats.items():
+                    if key == "message_timestamps":
+                        msg_count = len(value)
+                        formatted_stats.append(f"- Messages: {msg_count}")
+                    elif key == "last_message":
+                        if isinstance(value, (int, float)) or (
+                            isinstance(value, str) and value.isdigit()
+                        ):
+                            try:
+                                timestamp = int(float(value))
+                                formatted_stats.append(
+                                    f"- Last Message: <t:{timestamp}:R>"
+                                )
+                            except (ValueError, TypeError):
+                                formatted_stats.append(
+                                    f"- Last Message: {value[:10]}..."
+                                )
+                        else:
+                            formatted_stats.append(
+                                f"- Last Message: {str(value)[:10]}..."
+                            )
+                    else:
+                        pretty_key = key.replace("_", " ").title()
+                        formatted_stats.append(f"- {pretty_key}: {value}")
+
+                stats_str = "\n".join(formatted_stats)
+                if not stats_str:
+                    stats_str = "*No statistics available*"
+
+                await add_field(
+                    name=f"Member Stats: {member_name}", value=stats_str, inline=True
+                )
+
+        elif config == "dynamic":
+            for config_name, value in config_data.items():
+                formatted_value = f"```py\n{value}```"
+                await add_field(
+                    name=f"{config_name}", value=formatted_value, inline=True
+                )
+
+        if field_count > 0:
+            embeds.append(current_embed)
+
+        return embeds
 
     # Custom roles commands
 
@@ -1770,22 +1948,17 @@ class Roles(interactions.Extension):
                 )
             ]
 
-            await asyncio.gather(
-                (
-                    member.remove_roles(roles_to_remove)
-                    if roles_to_remove
-                    else asyncio.sleep(0)
-                ),
-                (
-                    member.add_roles([incarcerated_role])
-                    if incarcerated_role
-                    else asyncio.sleep(0)
-                ),
-            )
+            if roles_to_remove:
+                await member.remove_roles(roles_to_remove)
+                logger.info(
+                    f"Removed roles {[r.id for r in roles_to_remove]} from {member}"
+                )
 
-            logger.info(
-                f"Roles updated for {member}: removed {[r.id for r in roles_to_remove]}, added {incarcerated_role.id if incarcerated_role else 'None'}"
-            )
+            if incarcerated_role:
+                await member.add_roles([incarcerated_role])
+                logger.info(
+                    f"Added incarcerated role {incarcerated_role.id} to {member}"
+                )
 
         except Exception as e:
             logger.error(f"Error assigning roles during incarceration: {e}")
@@ -1822,18 +1995,13 @@ class Roles(interactions.Extension):
             if role.id in original_roles and role not in member.roles
         ]
 
-        await asyncio.gather(
-            (
-                member.remove_roles([incarcerated_role])
-                if incarcerated_role and incarcerated_role in member.roles
-                else asyncio.sleep(0)
-            ),
-            member.add_roles(roles_to_add) if roles_to_add else asyncio.sleep(0),
-        )
+        if incarcerated_role and incarcerated_role in member.roles:
+            await member.remove_roles([incarcerated_role])
+            logger.info(f"Removed incarcerated role from {member}")
 
-        logger.info(
-            f"Released {member}: removed incarcerated role, restored {[r.id for r in roles_to_add]}"
-        )
+        if roles_to_add:
+            await member.add_roles(roles_to_add)
+            logger.info(f"Restored roles {[r.id for r in roles_to_add]} to {member}")
 
         self.incarcerated_members.pop(str(member.id), None)
         await self.save_incarcerated_members()
@@ -1970,7 +2138,6 @@ class Roles(interactions.Extension):
         adjustment_factor: float = self._calculate_adaptive_adjustment(feedback)
 
         thresholds = {
-            "NON_ASCII_THRESHOLD": (0.5, 1.0),
             "DIGIT_THRESHOLD": (0.1, 1.0),
             "MIN_ENTROPY_THRESHOLD": (0.0, 4.0),
         }
@@ -1984,28 +2151,6 @@ class Roles(interactions.Extension):
         base_factor = 0.01
         scaling_factor = math.tanh(abs(feedback) / 10)
         return base_factor * feedback * scaling_factor
-
-    def contains_profanity(self, message: str) -> bool:
-        normalized_message = unicodedata.normalize("NFKD", message.lower())
-        return any(
-            profane_word in normalized_message
-            for profane_word in self._get_profanity_patterns()
-        )
-
-    def contains_spam_keywords(self, message: str) -> bool:
-        normalized_message = unicodedata.normalize("NFKD", message.lower())
-        return any(
-            re.search(pattern, normalized_message, re.IGNORECASE)
-            for pattern in self._get_spam_patterns()
-        )
-
-    @functools.lru_cache(maxsize=1)
-    def _get_profanity_patterns(self) -> FrozenSet[str]:
-        return frozenset({"click here", "subscribe now"})
-
-    @functools.lru_cache(maxsize=1)
-    def _get_spam_patterns(self) -> FrozenSet[str]:
-        return frozenset({"click here", "subscribe now"})
 
     async def _debounce_save_stats(self) -> None:
         if self._save_stats_task is not None:
@@ -2223,6 +2368,7 @@ class Roles(interactions.Extension):
 
                         if role_updates["remove"][member_id]:
                             await member.remove_roles(role_updates["remove"][member_id])
+
                         if role_updates["add"][member_id]:
                             await member.add_roles(role_updates["add"][member_id])
 
@@ -2231,9 +2377,8 @@ class Roles(interactions.Extension):
                             f"Error updating roles for member {member_id}: {str(e)}\n{traceback.format_exc()}"
                         )
 
-                await asyncio.gather(
-                    *(update_member_roles(member_id) for member_id in members_to_update)
-                )
+                for member_id in members_to_update:
+                    await update_member_roles(member_id)
 
                 if log_messages:
                     await self.send_success(None, "\n".join(log_messages))
