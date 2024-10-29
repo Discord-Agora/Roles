@@ -1,29 +1,29 @@
 import asyncio
-import functools
+import itertools
 import math
 import os
 import re
 import time
 import traceback
-import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
+from itertools import filterfalse, islice
 from multiprocessing import cpu_count
+from operator import attrgetter, sub
 from pathlib import Path
-from turtle import update
 from typing import (
     Any,
     AsyncGenerator,
     Callable,
     Concatenate,
     Coroutine,
+    DefaultDict,
     Dict,
-    Final,
     FrozenSet,
     Generic,
     Iterable,
@@ -36,6 +36,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    cast,
 )
 
 import aiofiles
@@ -53,30 +54,38 @@ from interactions.api.events import (
 from interactions.client.errors import NotFound
 from interactions.ext.paginators import Paginator
 from loguru import logger
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from yarl import URL
 
-BASE_DIR: Final[str] = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE: Final[str] = os.path.join(BASE_DIR, "roles.log")
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE: str = os.path.join(BASE_DIR, "roles.log")
 
 logger.remove()
 logger.add(
     sink=LOG_FILE,
     level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | {process}:{thread} | {level: <8} | {name}:{function}:{line} | {message}",
-    filter=None,
+    format=(
+        "{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | "
+        "{process}:{thread} | "
+        "{level: <8} | "
+        "{name}:{function}:{line} - "
+        "{message}"
+    ),
+    filter=lambda record: (
+        record["name"].startswith("extensions.github_d_com__kazuki388_s_Roles.main")
+    ),
     colorize=None,
     serialize=False,
     backtrace=True,
     diagnose=True,
-    enqueue=True,
+    context=None,
+    enqueue=False,
     catch=True,
     rotation="1 MB",
     retention=1,
+    compression="gz",
     encoding="utf-8",
     mode="a",
-    delay=False,
-    errors="replace",
 )
 
 # Model
@@ -122,29 +131,27 @@ class Data(BaseModel):
         }
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    VETTING_FORUM_ID: Final[int] = 1164834982737489930
-    VETTING_ROLE_IDS: Final[List[int]] = field(
-        default_factory=lambda: [1200066469300551782]
-    )
-    ELECTORAL_ROLE_ID: Final[int] = 1200043628899356702
-    APPROVED_ROLE_ID: Final[int] = 1282944839679344721
-    TEMPORARY_ROLE_ID: Final[int] = 1164761892015833129
-    INCARCERATED_ROLE_ID: Final[int] = 1247284720044085370
-    AUTHORIZED_CUSTOM_ROLE_IDS: Final[List[int]] = field(
+    VETTING_FORUM_ID: int = 1164834982737489930
+    VETTING_ROLE_IDS: List[int] = field(default_factory=lambda: [1200066469300551782])
+    ELECTORAL_ROLE_ID: int = 1200043628899356702
+    APPROVED_ROLE_ID: int = 1282944839679344721
+    TEMPORARY_ROLE_ID: int = 1164761892015833129
+    INCARCERATED_ROLE_ID: int = 1247284720044085370
+    AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
         default_factory=lambda: [1213490790341279754]
     )
-    AUTHORIZED_PENITENTIARY_ROLE_IDS: Final[List[int]] = field(
+    AUTHORIZED_PENITENTIARY_ROLE_IDS: List[int] = field(
         default_factory=lambda: [1200097748259717193, 1247144717083476051]
     )
-    REQUIRED_APPROVALS: Final[int] = 3
-    REQUIRED_REJECTIONS: Final[int] = 3
-    REJECTION_WINDOW_DAYS: Final[int] = 7
-    LOG_CHANNEL_ID: Final[int] = 1166627731916734504
-    LOG_FORUM_ID: Final[int] = 1159097493875871784
-    LOG_POST_ID: Final[int] = 1279118293936111707
-    GUILD_ID: Final[int] = 1150630510696075404
+    REQUIRED_APPROVALS: int = 3
+    REQUIRED_REJECTIONS: int = 3
+    REJECTION_WINDOW_DAYS: int = 7
+    LOG_CHANNEL_ID: int = 1166627731916734504
+    LOG_FORUM_ID: int = 1159097493875871784
+    LOG_POST_ID: int = 1279118293936111707
+    GUILD_ID: int = 1150630510696075404
 
 
 @dataclass
@@ -164,11 +171,13 @@ class Approval:
 
 class Model(Generic[T]):
     def __init__(self):
-        self.base_path: Final[URL] = URL(str(Path(__file__).parent))
+        self.base_path: URL = URL(str(Path(__file__).parent))
         self._data_cache: Dict[str, Any] = {}
-        self.parser: Final[cysimdjson.JSONParser] = cysimdjson.JSONParser()
+        self.parser: cysimdjson.JSONParser = cysimdjson.JSONParser()
         self._file_locks: Dict[str, asyncio.Lock] = {}
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=min(cpu_count(), 4)
+        )
 
     @staticmethod
     def async_retry(max_retries: int = 3, delay: float = 1.0) -> Callable:
@@ -195,9 +204,10 @@ class Model(Generic[T]):
 
     @asynccontextmanager
     async def _file_operation(self, file_path: Path, mode: str):
-        async with await self._get_file_lock(str(file_path)):
+        lock = await self._get_file_lock(str(file_path))
+        async with lock:
             try:
-                async with aiofiles.open(str(file_path), mode) as file:
+                async with aiofiles.open(str(file_path), mode=mode) as file:
                     yield file
             except IOError as e:
                 logger.error(f"IO operation failed for {file_path}: {e}")
@@ -213,49 +223,50 @@ class Model(Generic[T]):
             loop = asyncio.get_running_loop()
             try:
                 json_parsed = await loop.run_in_executor(
-                    self._executor, orjson.loads, content
+                    self._executor, lambda: orjson.loads(content)
                 )
             except orjson.JSONDecodeError:
                 logger.warning(
-                    f"`orjson` failed to parse {file_name}, falling back to `cysimdjson`"
+                    f"`orjson` failed to parse {file_name}, using `cysimdjson`"
                 )
                 json_parsed = await loop.run_in_executor(
-                    self._executor, self.parser.parse, content
+                    self._executor, lambda: self.parser.parse(content)
                 )
 
             if file_name == "custom.json":
-                instance = {role: set(members) for role, members in json_parsed.items()}
+                instance = {
+                    role: frozenset(members) for role, members in json_parsed.items()
+                }
             elif issubclass(model, BaseModel):
-                try:
-                    instance = await loop.run_in_executor(
-                        self._executor, model.model_validate, json_parsed
-                    )
-                except ValidationError as ve:
-                    logger.error(f"Validation error for {file_name}: {ve}")
-                    raise
+                instance = await loop.run_in_executor(
+                    self._executor, lambda: model.model_validate(json_parsed)
+                )
             elif model == Counter:
-                instance = Counter(json_parsed)
+                instance = dict(Counter(json_parsed))
             else:
                 instance = json_parsed
 
             self._data_cache[file_name] = instance
             logger.info(f"Successfully loaded data from {file_name}")
-            return instance
-        except FileNotFoundError:
-            logger.info(f"{file_name} not found. Creating a new one.")
-            if issubclass(model, BaseModel):
-                instance = model()
-            elif model == Counter:
-                instance = Counter()
-            else:
-                instance = {}
+            return cast(T, instance if isinstance(instance, model) else model(instance))
 
+        except FileNotFoundError:
+            logger.info(f"{file_name} not found. Creating new.")
+            if file_name == "custom.json":
+                instance = {}
+            else:
+                instance = (
+                    model()
+                    if issubclass(model, BaseModel)
+                    else Counter() if model == Counter else {}
+                )
             await self.save_data(file_name, instance)
-            return instance
+            return instance if isinstance(instance, model) else model(instance)
+
         except Exception as e:
             error_msg = f"Unexpected error loading {file_name}: {e}"
             logger.error(error_msg)
-            raise ValueError(error_msg)
+            raise ValueError(error_msg) from e
 
     @async_retry(max_retries=3, delay=1.0)
     async def save_data(self, file_name: str, data: T) -> None:
@@ -264,10 +275,11 @@ class Model(Generic[T]):
             loop = asyncio.get_running_loop()
             json_data = await loop.run_in_executor(
                 self._executor,
-                partial(
-                    orjson.dumps,
+                lambda: orjson.dumps(
                     data.dict() if hasattr(data, "dict") else data,
-                    option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY,
+                    option=orjson.OPT_INDENT_2
+                    | orjson.OPT_SERIALIZE_NUMPY
+                    | orjson.OPT_NON_STR_KEYS,
                 ),
             )
 
@@ -276,81 +288,88 @@ class Model(Generic[T]):
 
             self._data_cache[file_name] = data
             logger.info(f"Successfully saved data to {file_name}")
+
         except Exception as e:
             logger.error(f"Error saving {file_name}: {e}")
             raise
 
     def __del__(self):
-        self._executor.shutdown(wait=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class Message:
     message: str
     user_stats: Dict[str, Any]
     config: Dict[str, float]
     _message_length: int = field(init=False, repr=False)
     _char_frequencies: Counter = field(init=False, repr=False)
+    _is_chinese: bool = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        msg = self.message or ""
+        object.__setattr__(self, "_message_length", len(msg))
+        object.__setattr__(self, "_char_frequencies", Counter(msg))
         object.__setattr__(
-            self, "_message_length", len(self.message) if self.message else 0
+            self,
+            "_is_chinese",
+            any(
+                map(
+                    lambda c: "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf",
+                    msg,
+                )
+            ),
         )
-        object.__setattr__(self, "_char_frequencies", Counter(self.message))
 
     def analyze(self) -> frozenset[str]:
-        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-            violation_checks: Dict[str, asyncio.Future[bool]] = {
+        violations: set[str] = set()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
                 "message_repetition": executor.submit(self._check_repetition),
                 "excessive_digits": executor.submit(self._check_digit_ratio),
                 "low_entropy": executor.submit(self._check_entropy),
             }
+            violations.update(k for k, f in futures.items() if f.result())
 
-            return frozenset(
-                violation_type
-                for violation_type, future in violation_checks.items()
-                if future.result()
-            )
+        self.user_stats["feedback_score"] = max(
+            -5, min(5, self.user_stats.get("feedback_score", 0) - len(violations))
+        )
+        return frozenset(violations)
 
     def _check_repetition(self) -> bool:
-        last_message: str = self.user_stats.get("last_message", "")
-        if self.message == last_message:
-            repetition_count: int = self.user_stats.get("repetition_count", 0) + 1
-            self.user_stats["repetition_count"] = repetition_count
-            return repetition_count >= self.config["MAX_REPETITIONS"]
-
+        last_msg = self.user_stats.get("last_message", "")
+        if self.message == last_msg:
+            rep_count = self.user_stats.get("repetition_count", 0) + 1
+            self.user_stats["repetition_count"] = rep_count
+            return rep_count >= self.config["MAX_REPETITIONS"]
         self.user_stats.update({"repetition_count": 0, "last_message": self.message})
         return False
 
     def _check_digit_ratio(self) -> bool:
         if not self._message_length:
             return False
-
-        digit_count: int = sum(
+        threshold = self.config["DIGIT_THRESHOLD"] * (1.5 if self._is_chinese else 1.0)
+        digit_count = sum(
             freq for char, freq in self._char_frequencies.items() if char.isdigit()
         )
-        return (digit_count / self._message_length) > self.config["DIGIT_THRESHOLD"]
+        return (digit_count / self._message_length) > threshold
 
     def _check_entropy(self) -> bool:
         if not self._message_length:
             return False
 
-        if self._message_length > 1000:
-            frequencies = np.array(list(self._char_frequencies.values()))
-            probabilities = frequencies / self._message_length
-            entropy = -np.sum(probabilities * np.log2(probabilities))
-        else:
-            entropy = -sum(
-                (count / self._message_length) * math.log2(count / self._message_length)
-                for count in self._char_frequencies.values()
-            )
+        freqs = np.fromiter(self._char_frequencies.values(), dtype=np.float64)
+        probs = freqs / self._message_length
+        entropy = -np.sum(probs * np.log2(probs))
 
-        dynamic_threshold: float = max(
-            self.config["MIN_ENTROPY_THRESHOLD"],
-            2.0 - math.log2(max(self._message_length, 2)) / 10,
+        base_threshold = self.config["MIN_ENTROPY_THRESHOLD"] * (
+            0.7 if self._is_chinese else 1.0
+        )
+        length_adjustment = (np.log2(max(self._message_length, 2)) / 10) * (
+            0.8 if self._is_chinese else 1.0
         )
 
-        return entropy < dynamic_threshold
+        return entropy < max(base_threshold, 2.0 - length_adjustment)
 
 
 # Controller
@@ -358,8 +377,8 @@ class Message:
 
 class Roles(interactions.Extension):
     def __init__(self, bot: interactions.Client):
-        self.bot: Final[interactions.Client] = bot
-        self.config: Final[Config] = Config()
+        self.bot: interactions.Client = bot
+        self.config: Config = Config()
         self.vetting_roles: Data = Data()
         self.custom_roles: Dict[str, Set[int]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
@@ -367,7 +386,7 @@ class Roles(interactions.Extension):
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, Approval] = {}
         self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
-        self._stats_lock: Final[asyncio.Lock] = asyncio.Lock()
+        self._stats_lock: asyncio.Lock = asyncio.Lock()
         self._save_stats_task: asyncio.Task | None = None
 
         self.dynamic_config: Dict[str, Union[float, int]] = {
@@ -379,7 +398,7 @@ class Roles(interactions.Extension):
 
         self.cache = TTLCache(maxsize=100, ttl=300)
 
-        self.base_path: Final[Path] = Path(__file__).parent
+        self.base_path: Path = Path(__file__).parent
         self.model: Model[Any] = Model()
         self.load_tasks: List[Coroutine] = [
             self.model.load_data("vetting.json", Data),
@@ -415,83 +434,88 @@ class Roles(interactions.Extension):
             self, ctx: interactions.ContextType, *args: P.args, **kwargs: P.kwargs
         ) -> T:
             try:
-                result = await asyncio.shield(func(self, ctx, *args, **kwargs))
+                result = await func(self, ctx, *args, **kwargs)
                 logger.info(f"`{func.__name__}` completed successfully: {result}")
                 return result
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as ce:
                 logger.warning(f"{func.__name__} was cancelled")
-                raise
+                raise ce from None
             except Exception as e:
-                error_msg = f"Error in {func.__name__}: {e!r}\n{traceback.format_exc()}"
-                logger.exception(error_msg)
-                with suppress(Exception):
-                    await asyncio.shield(
-                        self.send_error(ctx, f"An error occurred: {e!s}")
-                    )
-                raise
+                logger.exception(
+                    f"Error in {func.__name__}: {e!r}\n{traceback.format_exc()}"
+                )
+                try:
+                    await asyncio.shield(self.send_error(ctx, str(e)))
+                except Exception:
+                    pass
+                raise e from None
 
         return wrapper
 
     # Validators
 
-    @staticmethod
-    def create_role_validator(
-        role_ids_func: Callable[[Any], Set[int]]
-    ) -> Callable[[Any, interactions.ContextType], bool]:
-        return lambda self, ctx: bool(set(ctx.author.roles) & role_ids_func(self))
-
     def get_assignable_role_ids(self) -> frozenset[int]:
         return frozenset(
             role_id
             for roles in self.vetting_roles.assigned_roles.values()
-            for role_id in roles.values()
+            for name, role_id in roles.items()
             if any(
-                name in assignable_roles
-                for assignable_roles in self.vetting_roles.assignable_roles.values()
-                for name in roles.keys()
+                name in a_roles
+                for a_roles in self.vetting_roles.assignable_roles.values()
+            )
+        )
+
+    def _validate_roles(
+        self,
+        ctx: interactions.ContextType,
+        required_role_ids: frozenset[int],
+        role_ids_to_check: frozenset[int] | None = None,
+        check_assignable: bool = False,
+    ) -> bool:
+        has_permission = bool(
+            frozenset(map(attrgetter("id"), ctx.author.roles)) & required_role_ids
+        )
+        return has_permission and (
+            not check_assignable
+            or (
+                role_ids_to_check is not None
+                and role_ids_to_check <= self.get_assignable_role_ids()
             )
         )
 
     def validate_vetting_permissions(self, ctx: interactions.ContextType) -> bool:
-        user_role_ids = set(role.id for role in ctx.author.roles)
-        vetting_role_ids = set(self.config.VETTING_ROLE_IDS)
-        common_roles = user_role_ids & vetting_role_ids
-
-        result = bool(common_roles)
-
-        return result
+        return self._validate_roles(ctx, frozenset(self.config.VETTING_ROLE_IDS))
 
     def validate_vetting_permissions_with_roles(
         self, ctx: interactions.ContextType, role_ids_to_add: Iterable[int]
     ) -> bool:
-        has_vetting_permission = self.validate_vetting_permissions(ctx)
-        assignable_roles = self.get_assignable_role_ids()
-        roles_are_assignable = frozenset(role_ids_to_add).issubset(assignable_roles)
+        return self._validate_roles(
+            ctx,
+            frozenset(self.config.VETTING_ROLE_IDS),
+            frozenset(role_ids_to_add),
+            check_assignable=True,
+        )
 
-        return has_vetting_permission and roles_are_assignable
+    def validate_custom_permissions(self, ctx: interactions.ContextType) -> bool:
+        return self._validate_roles(
+            ctx, frozenset(self.config.AUTHORIZED_CUSTOM_ROLE_IDS)
+        )
 
-    get_custom_role_ids: Callable[[], frozenset[int]] = lambda self: frozenset(
-        self.config.AUTHORIZED_CUSTOM_ROLE_IDS
-    )
-
-    validate_custom_permissions: Callable[[Any, interactions.ContextType], bool] = (
-        create_role_validator(get_custom_role_ids)
-    )
-
-    validate_penitentiary_permissions: Callable[
-        [Any, interactions.ContextType], bool
-    ] = create_role_validator(
-        lambda self: frozenset(self.config.AUTHORIZED_PENITENTIARY_ROLE_IDS)
-    )
+    def validate_penitentiary_permissions(self, ctx: interactions.ContextType) -> bool:
+        return self._validate_roles(
+            ctx, frozenset(self.config.AUTHORIZED_PENITENTIARY_ROLE_IDS)
+        )
 
     @lru_cache(maxsize=128)
-    def _get_category_role_ids(self, category: str) -> FrozenSet[int]:
-        cache_key = f"category_role_ids_{category}"
-        if cache_key not in self.cache:
-            self.cache[cache_key] = frozenset(
+    def _get_category_role_ids(
+        self, category: str, *, _cache: dict[str, frozenset[int]] = {}
+    ) -> frozenset[int]:
+        key = f"category_role_ids_{category}"
+        if key not in _cache:
+            _cache[key] = frozenset(
                 self.vetting_roles.assigned_roles.get(category, {}).values()
             )
-        return self.cache[cache_key]
+        return _cache[key]
 
     async def check_role_assignment_conflicts(
         self,
@@ -499,26 +523,32 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         role_ids_to_add: Iterable[int],
     ) -> bool:
-        member_current_roles: FrozenSet[int] = frozenset(
-            role.id for role in member.roles
-        )
-        roles_to_add_set: FrozenSet[int] = frozenset(role_ids_to_add)
+        member_roles = frozenset(map(attrgetter("id"), member.roles))
+        roles_to_add = frozenset(role_ids_to_add)
 
-        for category in self.vetting_roles.assigned_roles:
-            category_role_id_set = self._get_category_role_ids(category)
-            existing_roles = member_current_roles & category_role_id_set
-            adding_roles = roles_to_add_set & category_role_id_set
+        conflicts = [
+            (
+                existing := member_roles & category_roles,
+                adding := roles_to_add & category_roles,
+            )
+            for category, category_roles in (
+                (cat, self._get_category_role_ids(cat))
+                for cat in self.vetting_roles.assigned_roles
+            )
+            if bool(existing := member_roles & category_roles)
+            and bool(adding := roles_to_add & category_roles)
+            and len(existing | adding) > 1
+        ]
 
-            if existing_roles and adding_roles:
-                total_roles = existing_roles | adding_roles
-                if len(total_roles) > 1:
-                    await self.send_error(
-                        ctx,
-                        f"Conflicting roles detected in the {category} category. "
-                        f"Member already has {len(existing_roles)} role(s) "
-                        f"and is attempting to add {len(adding_roles)} role(s).",
-                    )
-                    return True
+        if conflicts:
+            existing, adding = conflicts[0]
+            await self.send_error(
+                ctx,
+                f"Conflicting roles detected in the category. "
+                f"Member already has {len(existing)} role(s) "
+                f"and is attempting to add {len(adding)} role(s).",
+            )
+            return True
 
         return False
 
@@ -527,19 +557,12 @@ class Roles(interactions.Extension):
     async def create_embed(
         self, title: str, description: str = "", color: EmbedColor = EmbedColor.INFO
     ) -> interactions.Embed:
-        embed = interactions.Embed(
-            title=title, description=description, color=color.value
-        )
-        guild: Optional[interactions.Guild] = await self.bot.fetch_guild(
-            self.config.GUILD_ID
-        )
-        if guild and guild.icon:
-            embed.set_footer(
-                text=guild.name, icon_url=guild.icon.url if guild.icon else None
-            )
-        embed.timestamp = datetime.now(timezone.utc)
-        embed.set_footer(text="鍵政大舞台")
-        return embed
+        return interactions.Embed(
+            title=title,
+            description=description,
+            color=color.value,
+            timestamp=datetime.now(timezone.utc),
+        ).set_footer(text="鍵政大舞台")
 
     async def notify_vetting_reviewers(
         self,
@@ -547,10 +570,10 @@ class Roles(interactions.Extension):
         thread: interactions.GuildPublicThread,
         timestamp: str,
     ) -> None:
-        guild = await self.bot.fetch_guild(thread.guild.id)
-        if guild is None:
-            logger.error(f"Guild with ID {thread.guild.id} could not be fetched.")
-            raise ValueError(f"Guild with ID {thread.guild.id} could not be fetched.")
+        if not (guild := await self.bot.fetch_guild(thread.guild.id)):
+            error_msg = f"Guild with ID {thread.guild.id} could not be fetched."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         embed = await self.create_embed(
             title=f"Voter Identity Approval #{timestamp}",
@@ -560,22 +583,22 @@ class Roles(interactions.Extension):
 
         async def process_role(role_id: int) -> None:
             try:
-                role = await guild.fetch_role(role_id)
-                if role is None:
+                if not (role := await guild.fetch_role(role_id)):
                     logger.error(f"Reviewer role with ID {role_id} not found.")
                     return
 
-                send_tasks = [
-                    self.send_direct_message(member, embed) for member in role.members
-                ]
-                await asyncio.gather(*send_tasks)
+                for member in role.members:
+                    await self.send_direct_message(member, embed)
+
                 logger.info(
                     f"Notifications sent to role ID {role_id} in thread {thread.id}"
                 )
             except Exception as e:
                 logger.error(f"Error processing role {role_id}: {e}")
 
-        await asyncio.gather(*(process_role(role_id) for role_id in reviewer_role_ids))
+        for role_id in reviewer_role_ids:
+            await process_role(role_id)
+
         logger.info(f"All reviewer notifications sent for thread {thread.id}")
 
     async def send_direct_message(
@@ -609,55 +632,59 @@ class Roles(interactions.Extension):
         color: EmbedColor,
         log_to_channel: bool = True,
     ) -> None:
-        embed: Final[interactions.Embed] = await self.create_embed(
-            title, message, color
-        )
-
-        tasks: list[Coroutine] = []
+        embed: interactions.Embed = await self.create_embed(title, message, color)
 
         if ctx:
-            tasks.append(ctx.send(embed=embed, ephemeral=True))
+            await ctx.send(embed=embed, ephemeral=True)
 
         if log_to_channel:
             LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
-            tasks.append(self.send_to_channel(LOG_CHANNEL_ID, embed))
-            tasks.append(self.send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID, embed))
-
-        await asyncio.gather(*tasks, return_exceptions=True)
+            await self.send_to_channel(LOG_CHANNEL_ID, embed)
+            await self.send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID, embed)
 
     async def send_to_channel(self, channel_id: int, embed: interactions.Embed) -> None:
         try:
             channel = await self.bot.fetch_channel(channel_id)
-            if isinstance(channel, interactions.GuildText):
-                await channel.send(embed=embed)
-            else:
+
+            if not isinstance(
+                channel := (
+                    channel if isinstance(channel, interactions.GuildText) else None
+                ),
+                interactions.GuildText,
+            ):
                 logger.error(f"Channel ID {channel_id} is not a valid text channel.")
-        except NotFound:
-            logger.error(f"Channel with ID {channel_id} not found.")
+                return
+
+            await channel.send(embed=embed)
+
+        except NotFound as nf:
+            logger.error(f"Channel with ID {channel_id} not found: {nf!r}")
         except Exception as e:
-            logger.error(f"Error sending message to channel {channel_id}: {e}")
+            logger.error(f"Error sending message to channel {channel_id}: {e!r}")
 
     async def send_to_forum_post(
         self, forum_id: int, post_id: int, embed: interactions.Embed
     ) -> None:
         try:
-            forum = await self.bot.fetch_channel(forum_id)
-            if isinstance(forum, interactions.GuildForum):
-                thread = await forum.fetch_post(post_id)
-                if isinstance(thread, interactions.GuildPublicThread):
-                    await thread.send(embed=embed)
-                else:
-                    logger.error(f"Post with ID {post_id} is not a valid thread.")
-            else:
+            if not isinstance(
+                forum := await self.bot.fetch_channel(forum_id), interactions.GuildForum
+            ):
                 logger.error(f"Channel ID {forum_id} is not a valid forum channel.")
+                return
+
+            if not isinstance(
+                thread := await forum.fetch_post(post_id),
+                interactions.GuildPublicThread,
+            ):
+                logger.error(f"Post with ID {post_id} is not a valid thread.")
+                return
+
+            await thread.send(embed=embed)
+
         except NotFound:
-            logger.error(
-                f"Forum or post not found. Forum ID: {forum_id}, Post ID: {post_id}"
-            )
+            logger.error(f"{forum_id=}, {post_id=} - Forum or post not found")
         except Exception as e:
-            logger.error(
-                f"Error sending message to forum post. Forum ID: {forum_id}, Post ID: {post_id}. Error: {e}"
-            )
+            logger.error(f"Forum post error [{forum_id=}, {post_id=}]: {e!r}")
 
     async def send_error(
         self,
@@ -695,52 +722,33 @@ class Roles(interactions.Extension):
         self,
         thread: interactions.GuildPublicThread,
     ) -> Tuple[interactions.Embed, List[interactions.Button]]:
-        approval_info: Approval = self.approval_counts.get(thread.id) or Approval()
-        approval_count: Final[int] = approval_info.approval_count
-
-        required_count: Final[int] = (
-            self.config.REQUIRED_APPROVALS
-            if approval_count < self.config.REQUIRED_APPROVALS
-            else self.config.REQUIRED_REJECTIONS
+        approval_info: Approval = self.approval_counts.get(thread.id, Approval())
+        approval_count: int = approval_info.approval_count
+        required_count: int = (
+            self.config.REQUIRED_REJECTIONS
+            if approval_count >= self.config.REQUIRED_APPROVALS
+            else self.config.REQUIRED_APPROVALS
         )
 
-        reviewers_text: Final[str] = (
-            ", ".join(
-                map(
-                    lambda reviewer_id: f"<@{reviewer_id}>",
-                    sorted(approval_info.reviewers, key=int),
-                )
-            )
-            or "No approvals yet."
+        reviewers_text: str = (
+            ",".join(f"<@{rid}>" for rid in sorted(approval_info.reviewers, key=int))
+            if approval_info.reviewers
+            else "No approvals yet."
         )
 
         embed: interactions.Embed = await self.create_embed(
             title="Voter Identity Approval",
-            description="\n".join(
-                [
-                    f"- Approvals: {approval_count}/{self.config.REQUIRED_APPROVALS}",
-                    f"- Reviewers: {reviewers_text}",
-                ]
-            ),
+            description=f"- Approvals: {approval_count}/{self.config.REQUIRED_APPROVALS}\n- Reviewers: {reviewers_text}",
             color=EmbedColor.INFO,
         )
 
-        buttons: Final[List[interactions.Button]] = [
-            interactions.Button(
-                style=interactions.ButtonStyle.SUCCESS,
-                label="Approve",
-                custom_id="approve",
-                disabled=False,
-            ),
-            interactions.Button(
-                style=interactions.ButtonStyle.DANGER,
-                label="Reject",
-                custom_id="reject",
-                disabled=False,
-            ),
+        return embed, [
+            interactions.Button(style=s, label=l, custom_id=c, disabled=False)
+            for s, l, c in (
+                (interactions.ButtonStyle.SUCCESS, "Approve", "approve"),
+                (interactions.ButtonStyle.DANGER, "Reject", "reject"),
+            )
         ]
-
-        return embed, buttons
 
     # Command groups
 
@@ -774,63 +782,75 @@ class Roles(interactions.Extension):
         opt_type=interactions.OptionType.STRING,
         required=True,
         choices=[
-            interactions.SlashCommandChoice(name="Vetting Roles", value="vetting"),
-            interactions.SlashCommandChoice(name="Custom Roles", value="custom"),
-            interactions.SlashCommandChoice(
-                name="Incarcerated Members", value="incarcerated"
-            ),
-            interactions.SlashCommandChoice(name="Stats", value="stats"),
-            interactions.SlashCommandChoice(name="Config", value="dynamic"),
+            *(
+                interactions.SlashCommandChoice(name=n, value=v)
+                for n, v in {
+                    "Vetting Roles": "vetting",
+                    "Custom Roles": "custom",
+                    "Incarcerated Members": "incarcerated",
+                    "Stats": "stats",
+                    "Config": "dynamic",
+                }.items()
+            )
         ],
     )
     @error_handler
     async def view_config(self, ctx: interactions.SlashContext, config: str) -> None:
         await ctx.defer()
         try:
-            config_data = await self._get_config_data(config)
-            if not config_data:
+            if not (config_data := await self._get_config_data(config)):
                 return await self.send_error(
-                    ctx, f"No data found for `{config}` configuration."
+                    ctx,
+                    f"Unable to find data for the `{config}` configuration. Please verify that the configuration exists and try again. Try using a different configuration type from the dropdown menu.",
                 )
 
-            embeds = await self._generate_embeds(config, config_data)
-            if not embeds:
+            if not (embeds := await self._generate_embeds(config, config_data)):
                 return await self.send_error(
-                    ctx, f"No displayable data found for `{config}` configuration."
+                    ctx,
+                    f"The `{config}` configuration exists but contains no displayable data. This may indicate an empty or corrupted configuration file.",
                 )
 
-            paginator = Paginator.create_from_embeds(self.bot, *embeds, timeout=300)
-            await paginator.send(ctx)
+            await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
 
         except Exception as e:
             logger.error(f"Error in view_config: {e}\n{traceback.format_exc()}")
             await self.send_error(
-                ctx, f"An error occurred while viewing the configuration: {str(e)}"
+                ctx,
+                f"An unexpected error occurred while viewing the configuration: {str(e)}",
             )
 
     async def _get_config_data(self, config: str) -> Optional[Any]:
-        if config == "dynamic":
-            return self.dynamic_config
-
-        config_file_map: Dict[str, Tuple[str, Type]] = {
-            "vetting": ("vetting.json", Data),
-            "custom": ("custom.json", dict),
-            "incarcerated": ("incarcerated_members.json", dict),
-            "stats": ("stats.json", Counter),
-        }
-
-        filename, model_type = config_file_map.get(config, (None, None))
-        if filename and model_type:
-            return await self.model.load_data(filename, model_type)
-        return None
+        return (
+            self.dynamic_config
+            if config == "dynamic"
+            else (
+                await self.model.load_data(
+                    *next(
+                        (
+                            (f, t)
+                            for c, (f, t) in {
+                                "vetting": ("vetting.json", Data),
+                                "custom": ("custom.json", dict),
+                                "incarcerated": ("incarcerated_members.json", dict),
+                                "stats": ("stats.json", Counter),
+                            }.items()
+                            if c == config
+                        ),
+                        (None, None),
+                    )
+                )
+                if config != "dynamic"
+                else None
+            )
+        )
 
     async def _generate_embeds(
         self, config: str, config_data: Any
     ) -> List[interactions.Embed]:
         embeds: List[interactions.Embed] = []
         current_embed = await self.create_embed(
-            title=f"{config.title()} Configuration",
-            description="",
+            title=f"{config.title()} Configuration Details",
+            description="Below are the detailed settings and configurations.",
             color=EmbedColor.INFO,
         )
         field_count = 0
@@ -839,131 +859,129 @@ class Roles(interactions.Extension):
         async def add_field(name: str, value: str, inline: bool = False) -> None:
             nonlocal current_embed, field_count
             current_embed.add_field(
-                name=name, value=value or "*No data available*", inline=inline
+                name=name,
+                value=value or "*No data is currently available for this field*",
+                inline=inline,
             )
             field_count += 1
             if field_count >= max_fields:
                 embeds.append(current_embed)
                 current_embed = await self.create_embed(
-                    title=f"{config.title()} Configuration (continued)",
-                    description="",
+                    title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
+                    description="Continued configuration details.",
                     color=EmbedColor.INFO,
                 )
                 field_count = 0
 
-        if config == "vetting":
-            overview = []
-            for category in ["ideology", "domicile", "status"]:
-                if category in config_data.assigned_roles:
-                    role_count = len(config_data.assigned_roles[category])
-                    overview.append(f"**{category.title()}**: {role_count} roles")
-
-            await add_field(
-                name="Overview",
-                value="\n".join(overview) or "*No roles configured*",
-                inline=True,
-            )
-
-            for category, roles in config_data.assigned_roles.items():
-                roles_str = "\n".join(
-                    f"- <@&{role_id}>" for role, role_id in sorted(roles.items())
-                )
+        match config:
+            case "vetting":
+                overview = [
+                    f"**{category.title()}**: {len(roles)} configured roles"
+                    for category, roles in config_data.assigned_roles.items()
+                    if category in ("ideology", "domicile", "status")
+                ]
 
                 await add_field(
-                    name=f"{category.title()} Roles",
-                    value=roles_str or "*No roles configured*",
-                    inline=True,
+                    "Configuration Overview",
+                    "\n".join(overview)
+                    or "*No roles have been configured yet. Use the configuration commands to set up roles.*",
+                    True,
                 )
 
-            for category, assignable_roles in config_data.assignable_roles.items():
-                roles_str = "\n".join(
-                    f"- `{role}`" for role in sorted(assignable_roles)
-                )
-                await add_field(
-                    name=f"Assignable {category.title()} Roles",
-                    value=roles_str or "*No assignable roles*",
-                    inline=True,
-                )
-        elif config == "custom":
-            for role_name, members in config_data.items():
-                member_list = "\n".join(f"- <@{member_id}>" for member_id in members)
-                await add_field(
-                    name=f"Role: {role_name}", value=member_list, inline=True
-                )
-
-        elif config == "incarcerated":
-            for member_id, info in config_data.items():
-                try:
-                    release_time = int(float(info["release_time"]))
-                    original_roles = info.get("original_roles", [])
-
-                    roles_str = ", ".join(
-                        f"<@&{role_id}>" for role_id in original_roles
-                    )
-                    if not roles_str:
-                        roles_str = "*No roles*"
-
-                    value = (
-                        f"- Release Time: <t:{release_time}:F>\n"
-                        f"- Original Roles: {roles_str}"
-                    )
-
-                    member_name = f"<@{member_id}>"
+                for category, roles in config_data.assigned_roles.items():
                     await add_field(
-                        name=f"Incarcerated Member: {member_name}",
-                        value=value,
-                        inline=True,
+                        f"{category.title()} Configured Roles",
+                        "\n".join(
+                            f"- <@&{role_id}> (`{role}`)"
+                            for role, role_id in sorted(roles.items())
+                        )
+                        or "*No roles have been configured for this category yet*",
+                        True,
                     )
-                except (ValueError, KeyError) as e:
-                    logger.error(f"Error processing member {member_id}: {str(e)}")
-                    continue
 
-        elif config == "stats":
-            for member_id, stats in config_data.items():
-                member_name = f"<@{member_id}>"
+                for category, assignable_roles in config_data.assignable_roles.items():
+                    await add_field(
+                        f"Available {category.title()} Roles",
+                        "\n".join(
+                            f"- `{role}` (Available for assignment)"
+                            for role in sorted(assignable_roles)
+                        )
+                        or "*No assignable roles configured for this category*",
+                        True,
+                    )
 
-                formatted_stats = []
-                for key, value in stats.items():
-                    if key == "message_timestamps":
-                        msg_count = len(value)
-                        formatted_stats.append(f"- Messages: {msg_count}")
-                    elif key == "last_message":
-                        if isinstance(value, (int, float)) or (
-                            isinstance(value, str) and value.isdigit()
-                        ):
-                            try:
-                                timestamp = int(float(value))
-                                formatted_stats.append(
-                                    f"- Last Message: <t:{timestamp}:R>"
-                                )
-                            except (ValueError, TypeError):
-                                formatted_stats.append(
-                                    f"- Last Message: {value[:10]}..."
-                                )
-                        else:
-                            formatted_stats.append(
-                                f"- Last Message: {str(value)[:10]}..."
+            case "custom":
+                for role_name, members in config_data.items():
+                    await add_field(
+                        f"Custom Role: {role_name}",
+                        "\n".join(f"- <@{member_id}>" for member_id in members)
+                        or "*No members currently have this role*",
+                        True,
+                    )
+
+            case "incarcerated":
+                for member_id, info in config_data.items():
+                    try:
+                        release_time = int(float(info["release_time"]))
+                        roles_str = (
+                            ", ".join(
+                                f"<@&{role_id}>"
+                                for role_id in info.get("original_roles", [])
                             )
-                    else:
-                        pretty_key = key.replace("_", " ").title()
-                        formatted_stats.append(f"- {pretty_key}: {value}")
+                            or "*No previous roles recorded*"
+                        )
+                        await add_field(
+                            f"Restricted Member: <@{member_id}>",
+                            f"- Release Scheduled: <t:{release_time}:F>\n- Previous Roles: {roles_str}",
+                            True,
+                        )
+                    except (ValueError, KeyError) as e:
+                        logger.error(f"Error processing member {member_id}: {str(e)}")
+                        continue
 
-                stats_str = "\n".join(formatted_stats)
-                if not stats_str:
-                    stats_str = "*No statistics available*"
+            case "stats":
+                for member_id, stats in config_data.items():
+                    formatted_stats = []
 
-                await add_field(
-                    name=f"Member Stats: {member_name}", value=stats_str, inline=True
-                )
+                    for key, value in stats.items():
+                        match key:
+                            case "message_timestamps":
+                                formatted_stats.append(
+                                    f"- **Total Messages**: {len(value)}"
+                                )
 
-        elif config == "dynamic":
-            for config_name, value in config_data.items():
-                formatted_value = f"```py\n{value}```"
-                await add_field(
-                    name=f"{config_name}", value=formatted_value, inline=True
-                )
+                            case "last_message":
+                                formatted_stats.append(
+                                    f"- **Last Message Content**: {str(value)[:50]}"
+                                )
 
-        if field_count > 0:
+                            case "last_threshold_adjustment":
+                                formatted_stats.append(
+                                    f"- **Last Threshold Update**: <t:{int(float(value))}:R>"
+                                )
+
+                            case _:
+                                if isinstance(value, (int, float)):
+                                    formatted_stats.append(
+                                        f"- **{key.replace('_', ' ').title()}**: {value:.2f}"
+                                    )
+                                else:
+                                    formatted_stats.append(
+                                        f"- **{key.replace('_', ' ').title()}**: {value}"
+                                    )
+
+                    await add_field(
+                        f"Member Activity: <@{member_id}>",
+                        "\n".join(formatted_stats)
+                        or "*No activity statistics available for this member*",
+                        True,
+                    )
+
+            case "dynamic":
+                for config_name, value in config_data.items():
+                    await add_field(f"{config_name}", f"```py\n{value}```", True)
+
+        if field_count:
             embeds.append(current_embed)
 
         return embeds
@@ -975,13 +993,13 @@ class Roles(interactions.Extension):
     )
     @interactions.slash_option(
         name="roles",
-        description="Roles",
+        description="Enter role names separated by commas",
         opt_type=interactions.OptionType.STRING,
         required=True,
     )
     @interactions.slash_option(
         name="action",
-        description="Action",
+        description="Choose whether to add or remove the specified roles",
         opt_type=interactions.OptionType.STRING,
         required=True,
         choices=[
@@ -993,37 +1011,36 @@ class Roles(interactions.Extension):
     async def configure_custom_roles(
         self, ctx: interactions.SlashContext, roles: str, action: str
     ) -> None:
-        if self.validate_custom_permissions(ctx):
+        if not self.validate_custom_permissions(ctx):
             return await self.send_error(
                 ctx,
-                "You don't have permission to use this command.",
-                log_to_channel=False,
+                "You don't have sufficient permissions to configure custom roles.",
             )
 
-        role_list = [role.strip() for role in roles.split(",")]
-        updated_roles = set()
+        role_set = {role.strip() for role in roles.split(",")}
+        updated_roles = (
+            {role for role in role_set if role not in self.custom_roles}
+            if action == "add"
+            else {role for role in role_set if role in self.custom_roles}
+        )
 
-        for role in role_list:
-            if action == "add":
-                if role not in self.custom_roles:
-                    self.custom_roles[role] = set()
-                    updated_roles.add(role)
-            else:
-                if role in self.custom_roles:
-                    del self.custom_roles[role]
-                    updated_roles.add(role)
+        if action == "add":
+            self.custom_roles.update({role: set() for role in updated_roles})
+        else:
+            for role in updated_roles:
+                self.custom_roles.pop(role, None)
 
         if updated_roles:
             await self.save_custom_roles()
-            action_past = "added" if action == "add" else "removed"
             await self.send_success(
                 ctx,
-                f"The following roles were {action_past}: {', '.join(updated_roles)}",
+                f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}. Use `/custom mention` to mention members with these roles.",
+                log_to_channel=False,
             )
         else:
             await self.send_error(
                 ctx,
-                "No changes made. The specified roles were already in the desired state.",
+                f"No changes were made because the specified roles {'already exist' if action == 'add' else 'don\'t exist'}. Please check the role names and try again.",
             )
 
     @interactions.user_context_menu(name="Custom Roles")
@@ -1034,38 +1051,39 @@ class Roles(interactions.Extension):
         try:
             logger.info(f"Context menu triggered for user: {ctx.target.id}")
 
-            member: interactions.Member = ctx.target
-            if self.validate_custom_permissions(ctx):
+            if not self.validate_custom_permissions(ctx):
                 logger.warning(
                     f"User {ctx.author.id} lacks permission for custom roles menu"
                 )
                 return await self.send_error(
                     ctx,
-                    "You don't have permission to use this command.",
-                    log_to_channel=False,
+                    "You don't have sufficient permissions to manage custom roles.",
                 )
 
-            options = [
-                interactions.StringSelectOption(label="Add", value="add"),
-                interactions.StringSelectOption(label="Remove", value="remove"),
-            ]
-
             components = interactions.StringSelectMenu(
-                custom_id=f"manage_roles_menu_{member.id}",
-                placeholder="Select action",
-                *options,
+                custom_id=f"manage_roles_menu_{(member := ctx.target).id}",
+                placeholder="Select action (Add/Remove roles)",
+                *(
+                    interactions.StringSelectOption(label=label, value=value)
+                    for label, value in (("Add", "add"), ("Remove", "remove"))
+                ),
             )
 
             await ctx.send(
-                f"Choose custom roles for {member.mention}:",
+                f"Please select whether you want to add or remove custom roles for {member.mention}. After selecting an action, you'll be able to choose specific roles.",
                 components=components,
                 ephemeral=True,
             )
             logger.info(f"Context menu response sent for user: {ctx.target.id}")
+
         except Exception as e:
             logger.error(f"Error in custom_roles_context_menu: {str(e)}")
             logger.error(traceback.format_exc())
-            await self.send_error(ctx, f"An error occurred: {str(e)}")
+            await self.send_error(
+                ctx,
+                f"An unexpected error occurred while managing custom roles. Our team has been notified: {str(e)}",
+                log_to_channel=False,
+            )
 
     @module_group_custom.subcommand(
         "mention", sub_cmd_description="Mention custom role members"
@@ -1081,54 +1099,51 @@ class Roles(interactions.Extension):
     async def mention_custom_roles(
         self, ctx: interactions.SlashContext, roles: str
     ) -> None:
-        if self.validate_custom_permissions(ctx):
+        if not self.validate_custom_permissions(ctx):
             return await self.send_error(
                 ctx,
                 "You don't have permission to use this command.",
-                log_to_channel=False,
             )
 
-        role_list = [role.strip() for role in roles.split(",")]
-        mentioned_users: Set[str] = set()
-        found_roles: Set[str] = set()
-        not_found_roles: Set[str] = set()
+        role_set: frozenset[str] = frozenset(map(str.strip, roles.split(",")))
+        custom_roles_set: frozenset[str] = frozenset(self.custom_roles)
 
-        for role in role_list:
-            if role in self.custom_roles:
-                mentioned_users.update(
-                    f"<@{user_id}>" for user_id in self.custom_roles[role]
-                )
-                found_roles.add(role)
-            else:
-                not_found_roles.add(role)
+        found_roles: frozenset[str] = role_set & custom_roles_set
+        not_found_roles: frozenset[str] = role_set - custom_roles_set
+
+        mentioned_users: frozenset[str] = frozenset(
+            f"<@{uid}>" for role in found_roles for uid in self.custom_roles[role]
+        )
 
         if mentioned_users:
-            mention_message = f"Mentioning users with roles {', '.join(found_roles)}:\n{' '.join(mentioned_users)}"
-            await ctx.send(mention_message)
+            await ctx.send(
+                f"Successfully found users with the following roles: {', '.join(found_roles)}. Here are the users: {' '.join(mentioned_users)}"
+            )
+            return
 
         if not_found_roles:
             await self.send_error(
                 ctx,
-                f"The following roles were not found: {', '.join(not_found_roles)}",
+                f"Unable to find the following roles: {', '.join(not_found_roles)}. Please check the role names and try again. You can use the autocomplete feature to see available roles.",
             )
+            return
 
-        if not mentioned_users and not not_found_roles:
-            await self.send_error(
-                ctx,
-                f"No users found with the specified roles: {roles}",
-            )
+        await self.send_error(
+            ctx,
+            f"No users currently have the roles: {roles}. The roles exist, but no users are assigned to them at the moment.",
+        )
 
     @mention_custom_roles.autocomplete("roles")
     async def autocomplete_custom_roles(
         self, ctx: interactions.AutocompleteContext
     ) -> None:
-        user_input = ctx.input_text.lower()
-        choices = [
+        user_input: str = ctx.input_text.lower()
+        choices = (
             interactions.SlashCommandChoice(name=role, value=role)
             for role in self.custom_roles
             if user_input in role.lower()
-        ]
-        await ctx.send(choices[:25])
+        )
+        await ctx.send(tuple(itertools.islice(choices, 25)))
 
     # Vetting commands
 
@@ -1227,39 +1242,46 @@ class Roles(interactions.Extension):
         domicile: Optional[str] = None,
         status: Optional[str] = None,
     ) -> None:
-        kwargs = {"ideology": ideology, "domicile": domicile, "status": status}
+        kwargs = dict(
+            zip(("ideology", "domicile", "status"), (ideology, domicile, status))
+        )
         role_ids = self.get_role_ids_to_assign(
-            {k: v for k, v in kwargs.items() if v is not None}
+            dict(
+                filter(
+                    lambda x: isinstance(x, tuple) and x[1] is not None, kwargs.items()
+                )
+            )
         )
 
+        if not self.validate_vetting_permissions(ctx):
+            await self.send_error(
+                ctx, "You do not have the required permissions to use this command."
+            )
+            return
+
         if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
-            if not self.validate_vetting_permissions(ctx):
-                await self.send_error(
-                    ctx,
-                    "You don't have permission to use this command.",
-                    log_to_channel=False,
-                )
-            else:
-                await self.send_error(
-                    ctx, "Some of the roles you're trying to assign are not assignable."
-                )
+            await self.send_error(
+                ctx,
+                "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
+            )
             return
 
         if not role_ids:
-            await self.send_error(ctx, f"No roles specified for {action.value}.")
+            role_types = tuple(k for k, v in kwargs.items() if v is not None)
+            await self.send_error(
+                ctx,
+                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, or status'}).",
+            )
             return
 
         if action == Action.ADD and await self.check_role_assignment_conflicts(
             ctx, member, role_ids
         ):
             return
-
-        manage_func = (
-            self.assign_roles_to_member
-            if action == Action.ADD
-            else self.remove_roles_from_member
-        )
-        await manage_func(ctx, member, role_ids)
+        if action == Action.ADD:
+            await self.assign_roles_to_member(ctx, member, list(role_ids))
+        else:
+            await self.remove_roles_from_member(ctx, member, role_ids)
 
     @assign_vetting_roles.autocomplete("ideology")
     async def autocomplete_ideology_assign(self, ctx: interactions.AutocompleteContext):
@@ -1288,17 +1310,22 @@ class Roles(interactions.Extension):
     async def autocomplete_vetting_role(
         self, ctx: interactions.AutocompleteContext, role_type: str
     ) -> None:
-        if not self.vetting_roles or role_type not in self.vetting_roles.assigned_roles:
+        if not (roles := getattr(self, "vetting_roles", None)) or role_type not in (
+            assigned := roles.assigned_roles
+        ):
             await ctx.send([])
             return
 
-        user_input = ctx.input_text.lower()
-        choices = [
-            interactions.SlashCommandChoice(name=name, value=name)
-            for name in self.vetting_roles.assigned_roles[role_type].keys()
-            if user_input in name.lower()
-        ]
-        await ctx.send(choices[:25])
+        user_input = ctx.input_text.casefold()
+        await ctx.send(
+            tuple(
+                interactions.SlashCommandChoice(name=name, value=name)
+                for name in itertools.islice(
+                    filter(lambda x: user_input in x.casefold(), assigned[role_type]),
+                    25,
+                )
+            )
+        )
 
     def get_role_ids_to_assign(self, kwargs: Dict[str, str]) -> Set[int]:
         return {
@@ -1314,21 +1341,27 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         role_ids_to_add: List[int],
     ) -> None:
-        roles_to_add: List[interactions.Role] = list(
-            filter(None, map(ctx.guild.get_role, role_ids_to_add))
-        )
+        roles_to_add: List[interactions.Role] = [
+            *filter(None, (ctx.guild.get_role(rid) for rid in role_ids_to_add))
+        ]
+
         if not roles_to_add:
-            return await self.send_error(ctx, "No valid roles found to add.")
+            return await self.send_error(
+                ctx,
+                "No valid roles were found to add. Please check that the role IDs are correct and that the bot has permission to manage these roles.",
+            )
 
         try:
             await member.add_roles(roles_to_add)
-            role_names = ", ".join(map(lambda r: r.name, roles_to_add))
             await self.send_success(
                 ctx,
-                f"Added the following roles to {member.user.mention}: {role_names}.",
+                f"Moderator {ctx.author.mention} added roles to {member.mention}: {', '.join(r.name for r in roles_to_add)}.",
             )
         except Exception as e:
-            await self.send_error(ctx, f"Error adding roles: {str(e)}")
+            await self.send_error(
+                ctx,
+                f"Failed to add roles due to the following error: {e!s}. This may be due to missing permissions or role hierarchy issues. Please ensure the bot's role is higher than the roles being assigned.",
+            )
 
     async def remove_roles_from_member(
         self,
@@ -1336,33 +1369,34 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         role_ids_to_remove: Set[int],
     ) -> None:
-        roles_to_remove = {
+        roles_to_remove: frozenset = frozenset(
             role for role in ctx.guild.roles if role.id in role_ids_to_remove
-        }
+        )
 
         if not roles_to_remove:
-            await self.send_error(ctx, "No valid roles found to remove.")
+            await self.send_error(ctx, "No valid roles were found to remove.")
             return
 
         try:
-            role_names = ", ".join(role.name for role in roles_to_remove)
+            role_names: str = ", ".join(map(lambda r: f"`{r.name}`", roles_to_remove))
 
-            await asyncio.gather(
-                member.remove_roles(list(roles_to_remove)),
-                self.send_success(
-                    ctx,
-                    f"Removed the following roles from {member.mention}: {role_names}.",
-                ),
-                self.send_success(
-                    ctx,
-                    f"Moderator {ctx.author.mention} removed roles from {member.mention}:\n{role_names}",
-                ),
+            await member.remove_roles([*roles_to_remove])
+            await self.send_success(
+                ctx,
+                f"Moderator {ctx.author.mention} removed roles from {member.mention}: {role_names}.",
             )
+
         except Exception as e:
-            error_message = f"Error removing roles: {str(e)}"
-            await self.send_error(ctx, error_message)
+            error_message: str = str(e)
+            await self.send_error(
+                ctx,
+                f"Failed to remove roles due to the following error: {error_message}.",
+            )
             logger.exception(
-                f"Failed to remove roles from {member.id}: {error_message}"
+                "Failed to remove roles from member %d (%s): %s",
+                member.id,
+                member.user.username,
+                error_message,
             )
 
     @interactions.component_callback("approve")
@@ -1381,67 +1415,69 @@ class Roles(interactions.Extension):
 
     @asynccontextmanager
     async def member_lock(self, member_id: int) -> AsyncGenerator[None, None]:
+        now = datetime.now(timezone.utc)
         lock_info = self.member_lock_map.setdefault(
-            member_id, {"lock": asyncio.Lock(), "last_used": datetime.now(timezone.utc)}
+            member_id, {"lock": asyncio.Lock(), "last_used": now}
         )
+        lock_info["last_used"] = now
         try:
-            async with lock_info["lock"]:
-                lock_info["last_used"] = datetime.now(timezone.utc)
+            if isinstance(lock_info["lock"], asyncio.Lock):
+                async with lock_info["lock"]:
+                    yield
+            else:
                 yield
         finally:
-            current_time = datetime.now(timezone.utc)
-            stale_members = [
-                mid
+            now = datetime.now(timezone.utc)
+            self.member_lock_map = {
+                mid: info
                 for mid, info in self.member_lock_map.items()
-                if (current_time - info["last_used"]).total_seconds() > 3600
-            ]
-            for mid in stale_members:
-                del self.member_lock_map[mid]
+                if isinstance(info["last_used"], datetime)
+                if (now - info["last_used"]).total_seconds() <= 3600
+            }
 
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
     ) -> Optional[str]:
-        if not await self.validate_context(ctx):
+        if not (await self.validate_context(ctx)):
             return None
 
-        thread = await self.bot.fetch_channel(ctx.channel_id)
-        if not isinstance(thread, interactions.GuildPublicThread):
+        if not isinstance(
+            thread := await self.bot.fetch_channel(ctx.channel_id),
+            interactions.GuildPublicThread,
+        ):
             raise ValueError("Invalid context: Must be used in threads")
 
         guild = await self.bot.fetch_guild(thread.guild.id)
-        member = await guild.fetch_member(thread.owner_id)
-
-        if not member:
+        if not (member := await guild.fetch_member(thread.owner_id)):
             await self.send_error(ctx, "Member not found in server")
             return None
 
         async with self.member_lock(member.id):
             try:
-                roles = await self.fetch_required_roles(guild)
-                if not self.validate_roles(roles):
+                if not self.validate_roles(
+                    roles := await self.fetch_required_roles(guild)
+                ):
                     await self.send_error(ctx, "Required roles configuration invalid")
                     return None
 
-                current_roles = frozenset(role.id for role in member.roles)
+                current_roles = frozenset(map(lambda r: r.id, member.roles))
                 thread_approvals = self.get_thread_approvals(thread.id)
 
                 if not await self.validate_reviewer(ctx, thread_approvals):
                     return None
 
-                match status:
-                    case Status.APPROVED:
-                        response = await self.process_approval(
-                            ctx, member, roles, current_roles, thread_approvals, thread
-                        )
-                    case Status.REJECTED:
-                        response = await self.process_rejection(
-                            ctx, member, roles, current_roles, thread_approvals, thread
-                        )
-                    case _:
-                        await self.send_error(ctx, "Invalid status")
-                        return None
+                handler = {
+                    Status.APPROVED: self.process_approval,
+                    Status.REJECTED: self.process_rejection,
+                }.get(status)
 
-                return response
+                if not handler:
+                    await self.send_error(ctx, "Invalid status")
+                    return None
+
+                return await handler(
+                    ctx, member, roles, current_roles, thread_approvals, thread
+                )
 
             except Exception as e:
                 logger.exception(f"Status change failed: {e}")
@@ -1475,7 +1511,7 @@ class Roles(interactions.Extension):
             embed, buttons = await self.create_review_components(thread)
             await ctx.message.edit(embed=embed, components=buttons)
         except Exception as e:
-            logger.error(f"Failed to update message: {str(e)}")
+            logger.error(f"Failed to update message: {repr(e)}")
 
     async def process_approval(
         self,
@@ -1486,35 +1522,41 @@ class Roles(interactions.Extension):
         thread_approvals: Approval,
         thread: interactions.GuildPublicThread,
     ) -> str:
-        logger.info(f"Starting approval process for member {member.id}")
-        logger.info(f"Current roles: {current_roles}")
+        logger.info(
+            f"Starting approval process for member {member.id} | Roles: {current_roles}"
+        )
 
-        if roles["electoral"].id in current_roles:
-            logger.info(f"Member {member.id} already has electoral role")
+        electoral_id = roles["electoral"].id
+        if electoral_id in current_roles:
             await self.send_error(
                 ctx,
-                "This member has already been approved.",
-                log_to_channel=False,
+                f"{member.mention} already has the electoral role and cannot be approved again.",
             )
+            logger.info(f"Member {member.id} already has electoral role")
             return "Approval aborted: Already approved"
 
-        thread_approvals.approval_count += 1
-        thread_approvals.reviewers.add(ctx.author.id)
+        thread_approvals = Approval(
+            approval_count=min(
+                thread_approvals.approval_count + 1, self.config.REQUIRED_APPROVALS
+            ),
+            reviewers=thread_approvals.reviewers | {ctx.author.id},
+            last_approval_time=thread_approvals.last_approval_time,
+        )
         self.approval_counts[thread.id] = thread_approvals
 
-        if thread_approvals.approval_count >= self.config.REQUIRED_APPROVALS:
+        if thread_approvals.approval_count == self.config.REQUIRED_APPROVALS:
+            thread_approvals.last_approval_time = datetime.now(timezone.utc)
             await self.update_member_roles(
                 member, roles["electoral"], roles["approved"], current_roles
             )
-            thread_approvals.approval_count = self.config.REQUIRED_APPROVALS
-            thread_approvals.last_approval_time = datetime.now(timezone.utc)
             await self.send_approval_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Approved {member.mention} with role updates"
 
+        remaining = self.config.REQUIRED_APPROVALS - thread_approvals.approval_count
         await self.send_success(
             ctx,
-            f"Approval {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS}",
+            f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS} approvals needed. Waiting for {remaining} more approval(s).",
             log_to_channel=False,
         )
         return "Approval registered"
@@ -1528,8 +1570,12 @@ class Roles(interactions.Extension):
         thread_approvals: Approval,
         thread: interactions.GuildPublicThread,
     ) -> str:
-        if roles["electoral"].id not in current_roles:
-            await self.send_error(ctx, "Member not approved", log_to_channel=False)
+        electoral_id: int = roles["electoral"].id
+        if electoral_id not in current_roles:
+            await self.send_error(
+                ctx,
+                f"Unable to reject {member.mention} as they have not yet been approved. Members must first be approved before they can be rejected.",
+            )
             return "Rejection aborted: Not approved"
 
         if thread_approvals.last_approval_time and self.is_rejection_window_closed(
@@ -1537,35 +1583,43 @@ class Roles(interactions.Extension):
         ):
             await self.send_error(
                 ctx,
-                f"Rejection window ({self.config.REJECTION_WINDOW_DAYS} days) expired",
-                log_to_channel=False,
+                f"The rejection window for {member.mention} has expired. Rejections must be submitted within {self.config.REJECTION_WINDOW_DAYS} days of approval. Please contact an administrator if you believe this is in error.",
             )
             return "Rejection aborted: Window closed"
 
-        thread_approvals.rejection_count += 1
-        thread_approvals.reviewers.add(ctx.author.id)
+        thread_approvals = Approval(
+            approval_count=thread_approvals.approval_count,
+            rejection_count=min(
+                thread_approvals.rejection_count + 1, self.config.REQUIRED_REJECTIONS
+            ),
+            reviewers=thread_approvals.reviewers | {ctx.author.id},
+            last_approval_time=thread_approvals.last_approval_time,
+        )
         self.approval_counts[thread.id] = thread_approvals
 
-        if thread_approvals.rejection_count >= self.config.REQUIRED_REJECTIONS:
+        if thread_approvals.rejection_count == self.config.REQUIRED_REJECTIONS:
             await self.update_member_roles(
                 member, roles["approved"], roles["electoral"], current_roles
             )
-            thread_approvals.rejection_count = self.config.REQUIRED_REJECTIONS
             await self.send_rejection_notification(thread, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Rejected {member.mention} with role updates"
 
+        remaining: int = (
+            self.config.REQUIRED_REJECTIONS - thread_approvals.rejection_count
+        )
         await self.send_success(
             ctx,
-            f"Rejection {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS}",
+            f"Your rejection vote for {member.mention} has been registered. Current status: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
             log_to_channel=False,
         )
         return "Rejection registered"
 
     def is_rejection_window_closed(self, thread_approvals: Approval) -> bool:
-        return (
-            datetime.now(timezone.utc) - thread_approvals.last_approval_time
-        ) > timedelta(days=self.config.REJECTION_WINDOW_DAYS)
+        if not thread_approvals.last_approval_time:
+            return False
+        time_diff = datetime.now(timezone.utc) - thread_approvals.last_approval_time
+        return time_diff.total_seconds() > self.config.REJECTION_WINDOW_DAYS * 86400
 
     def cleanup_approval_data(self, thread_id: int) -> None:
         self.approval_counts.pop(thread_id, None)
@@ -1590,40 +1644,52 @@ class Roles(interactions.Extension):
         current_roles: FrozenSet[int],
     ) -> bool:
         async def verify_roles(member_to_check: interactions.Member) -> set[int]:
-            refreshed = await member_to_check.guild.fetch_member(member_to_check.id)
-            return {role.id for role in refreshed.roles}
+            return {
+                role.id
+                for role in (
+                    await member_to_check.guild.fetch_member(member_to_check.id)
+                ).roles
+            }
 
         async def execute_role_updates(
             target: interactions.Member,
+            *,
             to_add: interactions.Role | None = None,
             to_remove: interactions.Role | None = None,
         ) -> None:
-            if to_remove:
+            if to_remove and to_remove.id in {role.id for role in target.roles}:
                 logger.info(f"Removing role {to_remove.id} from member {target.id}")
                 await target.remove_roles([to_remove])
-            if to_add:
+            if to_add and to_add.id not in {role.id for role in target.roles}:
                 logger.info(f"Adding role {to_add.id} to member {target.id}")
                 await target.add_roles([to_add])
 
         logger.info(
-            f"Initiating role update for member {member.id}.Current roles: {current_roles}. Role to add: {role_to_add.id}, Role to remove: {role_to_remove.id}"
+            f"Initiating role update for member {member.id}. Current roles: {current_roles}. Role to add: {role_to_add.id}, Role to remove: {role_to_remove.id}"
         )
 
         try:
-            updates_needed = []
-            if role_to_remove.id in current_roles:
-                updates_needed.append(("remove", role_to_remove))
-            if role_to_add.id not in current_roles:
-                updates_needed.append(("add", role_to_add))
+            updates = (
+                (
+                    ("remove", role_to_remove)
+                    if role_to_remove.id in current_roles
+                    else None
+                ),
+                ("add", role_to_add) if role_to_add.id not in current_roles else None,
+            )
+            updates_needed = [u for u in updates if u]
 
-            for action, role in updates_needed:
-                await execute_role_updates(
-                    member,
-                    to_add=role if action == "add" else None,
-                    to_remove=role if action == "remove" else None,
-                )
+            if updates_needed:
+                for action, role in updates_needed:
+                    await execute_role_updates(
+                        member,
+                        to_add=role if action == "add" else None,
+                        to_remove=role if action == "remove" else None,
+                    )
 
             MAX_RETRIES = 3
+            backoff = (0.5, 1.0, 2.0)
+
             for attempt in range(MAX_RETRIES):
                 final_roles = await verify_roles(member)
                 logger.info(
@@ -1650,15 +1716,14 @@ class Roles(interactions.Extension):
                             role_to_remove if role_to_remove.id in final_roles else None
                         ),
                     )
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(backoff[attempt])
 
             logger.error("Role update failed after all retry attempts")
             return False
 
         except Exception as e:
             logger.error(
-                f"Critical error during role update for member {member.id}: "
-                f"{type(e).__name__}: {str(e)}"
+                f"Critical error during role update for member {member.id}: {type(e).__name__}: {str(e)}"
             )
             return False
 
@@ -1668,9 +1733,10 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         thread_approvals: Approval,
     ) -> None:
-        reviewer_mentions = ", ".join(f"<@{rid}>" for rid in thread_approvals.reviewers)
         await self.send_success(
-            thread, f"{member.mention} approved by {reviewer_mentions}", EmbedColor.INFO
+            thread,
+            f"{member.mention} approved by {''.join(f'<@{rid}>' + (',' if i < len(thread_approvals.reviewers)-1 else '') for i, rid in enumerate(thread_approvals.reviewers))}. The request has been successfully approved. The member's roles will be updated accordingly.",
+            log_to_channel=False,
         )
 
     async def send_rejection_notification(
@@ -1679,11 +1745,18 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         thread_approvals: Approval,
     ) -> None:
-        reviewer_mentions = ", ".join(f"<@{rid}>" for rid in thread_approvals.reviewers)
+        reviewers_list = sorted(thread_approvals.reviewers)
+        reviewers_text = (
+            f"<@{reviewers_list[0]}>"
+            if len(reviewers_list) == 1
+            else ", ".join(f"<@{rid}>" for rid in reviewers_list[:-1])
+            + f", <@{reviewers_list[-1]}>"
+        )
+
         await self.send_success(
             thread,
-            f"{member.mention} rejected by {reviewer_mentions}",
-            EmbedColor.ERROR,
+            f"{member.mention} rejected by {reviewers_text}",
+            log_to_channel=False,
         )
 
     # Servant commands
@@ -1691,75 +1764,77 @@ class Roles(interactions.Extension):
     @module_group_servant.subcommand("view", sub_cmd_description="Servant Directory")
     async def view_servant_roles(self, ctx: interactions.SlashContext) -> None:
         await ctx.defer()
-        guild = ctx.guild
-        filtered_roles = self.filter_roles(tuple(guild.roles))
+
+        filtered_roles = self.filter_roles(tuple(ctx.guild.roles))
         role_members_list = self.extract_role_members_list(filtered_roles)
-        total_members = sum(
-            role_member.member_count for role_member in role_members_list
-        )
+
+        if not role_members_list:
+            await self.send_error(ctx, "No matching roles found.")
+            return
+
+        total_members = sum(rm.member_count for rm in role_members_list)
+
+        title = f"Servant Directory ({total_members} members)"
 
         embeds = []
         current_embed = await self.create_embed(
-            title=f"Servant Directory ({total_members} members)",
-            description="",
-            color=EmbedColor.INFO,
+            title=title, description="", color=EmbedColor.INFO
         )
         field_count = 0
 
         for role_member in role_members_list:
-            members_str = "\n".join(f"- {member}" for member in role_member.members)
-            if members_str:
-                if field_count >= 25:
-                    embeds.append(current_embed)
-                    current_embed = await self.create_embed(
-                        title=f"Servant Directory ({total_members} members)",
-                        description="",
-                        color=EmbedColor.INFO,
-                    )
-                    field_count = 0
+            members_str = "\n".join([f"- {m}" for m in role_member.members])
 
-                current_embed.add_field(
-                    name=f"{role_member.role_name} ({role_member.member_count} members)",
-                    value=members_str,
-                    inline=True,
+            if not members_str:
+                continue
+
+            if field_count >= 25:
+                embeds.append(current_embed)
+                current_embed = await self.create_embed(
+                    title=title, description="", color=EmbedColor.INFO
                 )
-                field_count += 1
+                field_count = 0
 
-        if field_count > 0:
+            current_embed.add_field(
+                name=f"{role_member.role_name} ({role_member.member_count} members)",
+                value=members_str,
+                inline=True,
+            )
+            field_count += 1
+
+        if field_count:
             embeds.append(current_embed)
 
-        if not embeds:
-            await self.send_error(ctx, "No matching roles found.")
-            return
-
-        paginator = Paginator.create_from_embeds(self.bot, *embeds, timeout=300)
-        await paginator.send(ctx)
+        await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
 
     @staticmethod
-    @lru_cache(maxsize=128)
+    @lru_cache(maxsize=256)
     def filter_roles(
         roles: Tuple[interactions.Role, ...]
     ) -> Tuple[interactions.Role, ...]:
-        if not roles:
-            return ()
-
-        sorted_roles = sorted(roles, key=lambda role: role.position, reverse=True)
-        bot_role_index = next(
-            (
-                i
-                for i, role in enumerate(sorted_roles)
-                if role.name == "═════･[Bot身份组]･═════"
-            ),
-            len(sorted_roles),
+        return (
+            ()
+            if not roles
+            else tuple(
+                itertools.islice(
+                    filter(
+                        lambda r: not r.name.startswith(("——", "══"))
+                        and not r.bot_managed,
+                        sorted(roles, key=attrgetter("position"), reverse=True),
+                    ),
+                    next(
+                        (
+                            i
+                            for i, r in enumerate(
+                                sorted(roles, key=attrgetter("position"), reverse=True)
+                            )
+                            if r.name == "═════･[Bot身份组]･═════"
+                        ),
+                        len(roles),
+                    ),
+                )
+            )
         )
-
-        filtered_roles = [
-            role
-            for role in sorted_roles[:bot_role_index]
-            if not role.name.startswith(("——", "══")) and not role.bot_managed
-        ]
-
-        return tuple(filtered_roles)
 
     @staticmethod
     @lru_cache(maxsize=128)
@@ -1769,7 +1844,7 @@ class Roles(interactions.Extension):
         return [
             Servant(
                 role_name=role.name,
-                members=tuple(member.mention for member in role.members),
+                members=[member.mention for member in role.members],
                 member_count=len(role.members),
             )
             for role in roles
@@ -1800,40 +1875,44 @@ class Roles(interactions.Extension):
         member: interactions.Member,
         duration: str,
     ) -> None:
-        if self.validate_penitentiary_permissions(ctx):
+        if not self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
                 ctx,
                 "You don't have permission to use this command.",
-                log_to_channel=False,
             )
 
         try:
-            incarceration_duration = self.parse_duration(duration)
+            incarceration_duration = await asyncio.to_thread(
+                lambda: self.parse_duration(duration)
+            )
         except ValueError as e:
-            return await self.send_error(ctx, str(e), log_to_channel=False)
+            return await self.send_error(ctx, str(e))
 
-        await self.manage_penitentiary_status(
-            ctx, member, "incarcerate", duration=incarceration_duration
+        return await self.manage_penitentiary_status(
+            ctx=ctx,
+            member=member,
+            action=Action.INCARCERATE,
+            duration=incarceration_duration,
         )
 
     @staticmethod
     def parse_duration(duration: str) -> timedelta:
-        duration_regex = re.compile(r"(\d+)([dhm])")
-        matches = duration_regex.findall(duration.lower())
-        if not matches:
+        _UNIT_MAP: dict[str, int] = {"d": 86400, "h": 3600, "m": 60}
+
+        try:
+            total: int = sum(
+                int(match.group(1)) * _UNIT_MAP[match.group(2).lower()]
+                for match in re.finditer(r"(\d+)([dhm])", duration, re.IGNORECASE)
+            )
+            if total <= 0:
+                raise ValueError
+            return timedelta(seconds=total)
+        except (AttributeError, KeyError):
             raise ValueError(
                 "Invalid duration format. Use combinations of `d` (days), `h` (hours), and `m` (minutes)."
             )
-
-        unit_to_seconds = {"d": 86400, "h": 3600, "m": 60}
-        total_seconds = sum(
-            int(value) * unit_to_seconds.get(unit, 0) for value, unit in matches
-        )
-
-        if total_seconds <= 0:
+        except ValueError:
             raise ValueError("Incarceration time must be greater than zero.")
-
-        return timedelta(seconds=total_seconds)
 
     @module_group_penitentiary.subcommand("release", sub_cmd_description="Release")
     @interactions.slash_option(
@@ -1847,29 +1926,33 @@ class Roles(interactions.Extension):
     async def release_member(
         self, ctx: interactions.SlashContext, member: interactions.Member
     ) -> None:
-        if self.validate_penitentiary_permissions(ctx):
+        if not self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
                 ctx,
                 "You don't have permission to use this command.",
-                log_to_channel=False,
             )
 
-        await self.manage_penitentiary_status(ctx, member, "release")
+        await self.manage_penitentiary_status(ctx, member, Action.RELEASE)
 
     @release_member.autocomplete("member")
     async def autocomplete_incarcerated_member(
         self, ctx: interactions.AutocompleteContext
     ) -> None:
-        user_input = ctx.input_text.lower()
-        guild = ctx.guild
+        user_input: str = ctx.input_text.casefold()
+        guild: interactions.Guild = ctx.guild
 
-        choices = [
-            interactions.SlashCommandChoice(
-                name=member.user.username, value=str(member.id)
+        choices = list(
+            islice(
+                (
+                    interactions.SlashCommandChoice(
+                        name=member.user.username, value=str(member.id)
+                    )
+                    for member in guild.members
+                    if user_input in member.user.username.casefold()
+                ),
+                25,
             )
-            for member in guild.members
-            if user_input in member.user.username.lower()
-        ][:25]
+        )
 
         await ctx.send(choices)
 
@@ -1880,7 +1963,7 @@ class Roles(interactions.Extension):
         action: Action,
         **kwargs: Any,
     ) -> None:
-        guild = ctx.guild if ctx else await self.bot.fetch_guild(self.config.GUILD_ID)
+        guild = await self.bot.fetch_guild(self.config.GUILD_ID)
         roles = await self.fetch_penitentiary_roles(guild)
 
         if not all(roles.values()):
@@ -1893,19 +1976,12 @@ class Roles(interactions.Extension):
                 )
                 return
 
-        action_map: Final[Dict[Literal["incarcerate", "release"], Callable]] = {
-            "incarcerate": partial(self.perform_member_incarceration, **kwargs),
-            "release": self.perform_member_release,
+        action_map: Dict[Action, Callable] = {
+            Action.INCARCERATE: partial(self.perform_member_incarceration, **kwargs),
+            Action.RELEASE: self.perform_member_release,
         }
-
         try:
             await action_map[action](member, roles, ctx)
-            if ctx:
-                action_text = "incarcerated" if action == "incarcerate" else "released"
-                await self.send_success(
-                    ctx,
-                    f"{member.mention} has been {action_text} successfully.",
-                )
         except KeyError:
             error_msg = f"Invalid penitentiary action specified: {action}"
             if ctx:
@@ -1931,22 +2007,26 @@ class Roles(interactions.Extension):
     ) -> None:
         try:
             incarcerated_role = roles["incarcerated"]
-            roles_to_remove: List[interactions.Role] = [
+            role_ids = self._get_role_ids()
+            member_role_ids = {role.id for role in member.roles}
+
+            roles_to_remove = [
                 role
-                for role_key in ("electoral", "approved", "temporary")
-                if (role := roles.get(role_key)) and role in member.roles
+                for role_key, role_id in role_ids.items()
+                if role_key != "incarcerated"
+                and (role := roles.get(role_key))
+                and role_id in member_role_ids
             ]
 
-            original_roles = [
-                role.id
-                for role in member.roles
-                if role.id
-                in (
-                    self.config.ELECTORAL_ROLE_ID,
-                    self.config.APPROVED_ROLE_ID,
-                    self.config.TEMPORARY_ROLE_ID,
+            original_roles = tuple(
+                role_id
+                for role_id in (
+                    role_ids["electoral"],
+                    role_ids["approved"],
+                    role_ids["temporary"],
                 )
-            ]
+                if role_id in member_role_ids
+            )
 
             if roles_to_remove:
                 await member.remove_roles(roles_to_remove)
@@ -1955,7 +2035,7 @@ class Roles(interactions.Extension):
                 )
 
             if incarcerated_role:
-                await member.add_roles([incarcerated_role])
+                await member.add_roles((incarcerated_role,))
                 logger.info(
                     f"Added incarcerated role {incarcerated_role.id} to {member}"
                 )
@@ -1971,8 +2051,7 @@ class Roles(interactions.Extension):
         }
         await self.save_incarcerated_members()
 
-        guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-        executor = ctx.author if ctx else None
+        executor = getattr(ctx, "author", None)
         log_message = (
             f"{member.mention} has been incarcerated until <t:{release_time}:F> "
             f"(<t:{release_time}:R>) by {executor.mention if executor else 'the system'}."
@@ -1985,57 +2064,67 @@ class Roles(interactions.Extension):
         roles: Dict[str, Optional[interactions.Role]],
         ctx: Optional[interactions.SlashContext],
     ) -> None:
-        incarcerated_role = roles.get("incarcerated")
-        member_data = self.incarcerated_members.get(str(member.id), {})
-        original_roles = member_data.get("original_roles", [])
+        member_id_str = str(member.id)
+        member_data = self.incarcerated_members.get(member_id_str, {})
+        original_role_ids = frozenset(member_data.get("original_roles", []))
+        current_role_ids = {role.id for role in member.roles}
 
-        roles_to_add: List[interactions.Role] = [
+        roles_to_add = tuple(
             role
             for role in member.guild.roles
-            if role.id in original_roles and role not in member.roles
-        ]
+            if role.id in original_role_ids and role.id not in current_role_ids
+        )
 
-        if incarcerated_role and incarcerated_role in member.roles:
-            await member.remove_roles([incarcerated_role])
+        if (incarcerated_role := roles.get("incarcerated")) in member.roles:
+            await member.remove_roles((incarcerated_role,))
             logger.info(f"Removed incarcerated role from {member}")
 
         if roles_to_add:
             await member.add_roles(roles_to_add)
-            logger.info(f"Restored roles {[r.id for r in roles_to_add]} to {member}")
+            logger.info(
+                f"Restored roles {tuple(r.id for r in roles_to_add)} to {member}"
+            )
 
-        self.incarcerated_members.pop(str(member.id), None)
+        del self.incarcerated_members[member_id_str]
         await self.save_incarcerated_members()
 
-        guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-        executor = ctx.author if ctx else None
-        log_message = (
-            f"{member.mention} has been released and their original roles have been restored "
-            f"by {executor.mention if executor else 'the system'}."
-        )
+        executor = getattr(ctx, "author", None) if ctx else None
+        release_time = int(float(member_data.get("release_time", 0)))
+        current_time = int(time.time())
+        log_message = f"{member.mention} has been released by {executor.mention if executor else 'the system'} at <t:{current_time}:F>. Scheduled: <t:{release_time}:F>."
         await self.send_success(ctx, log_message)
 
     async def schedule_release(
         self, member_id: str, data: Dict[str, Any], delay: float
     ) -> None:
-        await asyncio.sleep(delay)
-        await self.release_prisoner(member_id, data)
+        try:
+            await asyncio.wait_for(asyncio.sleep(delay), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            await self.release_prisoner(member_id, data)
 
     async def release_prisoner(self, member_id: str, data: Dict[str, Any]) -> None:
-        guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+        release_time: int = int(float(data.get("release_time", 0)))
+        current_time: int = int(time.time())
+
         try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
             member = await guild.fetch_member(int(member_id))
+        except Exception as e:
+            error_msg = f"Error fetching guild/member {member_id}: {e!r}. Release time: <t:{release_time}:F>"
+            logger.error(error_msg)
+            await self.send_error(None, error_msg)
+            return
+
+        try:
             if member:
-                await self.manage_penitentiary_status(None, member, "release")
-                release_time = int(float(data["release_time"]))
-                log_message = f"{member.mention} has been released at <t:{int(time.time())}:F>. Scheduled release time was <t:{release_time}:F>."
-                await self.send_success(None, log_message)
+                await self.manage_penitentiary_status(None, member, Action.RELEASE)
             else:
-                release_time = int(float(data["release_time"]))
-                log_message = f"Member with ID {member_id} not found in guild during release. Scheduled release time was <t:{release_time}:F>."
+                log_message = f"Member {member_id} not found. Scheduled release: <t:{release_time}:F>."
                 await self.send_error(None, log_message)
         except Exception as e:
-            release_time = int(float(data["release_time"]))
-            error_msg = f"Error releasing member {member_id}: {str(e)}. Scheduled release time was <t:{release_time}:F>."
+            error_msg = f"Release failed for {member_id}: {e!r}. Scheduled: <t:{release_time}:F>."
             logger.error(error_msg)
             await self.send_error(None, error_msg)
         finally:
@@ -2046,20 +2135,18 @@ class Roles(interactions.Extension):
         self, guild: interactions.Guild
     ) -> Dict[str, Optional[interactions.Role]]:
         role_ids = self._get_role_ids()
+        roles: Dict[str, Optional[interactions.Role]] = {}
 
-        async def fetch_role(
-            key: str, role_id: int
-        ) -> Tuple[str, Optional[interactions.Role]]:
+        for key, role_id in role_ids.items():
             try:
                 role = await guild.fetch_role(role_id)
                 logger.info(f"Successfully fetched {key} role: {role.id}")
-                return key, role
+                roles[key] = role
             except Exception as e:
                 logger.error(f"Failed to fetch {key} role (ID: {role_id}): {e}")
-                return key, None
+                continue
 
-        results = await asyncio.gather(*(fetch_role(k, v) for k, v in role_ids.items()))
-        return {k: v for k, v in results if v is not None}
+        return roles
 
     # Events
 
@@ -2068,13 +2155,15 @@ class Roles(interactions.Extension):
         if event.message.author.bot:
             return
 
-        member = await event.message.guild.fetch_member(event.message.author.id)
+        member_id = event.message.author.id
+        member = await event.message.guild.fetch_member(member_id)
+
         if not any(role.id == self.config.TEMPORARY_ROLE_ID for role in member.roles):
             return
 
-        author_id: str = str(event.message.author.id)
+        author_id: str = str(member_id)
         message_content: str = event.message.content.strip()
-        current_time: float = time.time()
+        current_time: float = time.monotonic()
 
         async with self._stats_lock:
             user_stats = await self._process_user_stats(
@@ -2085,43 +2174,99 @@ class Roles(interactions.Extension):
     async def _process_user_stats(
         self, author_id: str, message_content: str, current_time: float
     ) -> Dict[str, Any]:
-        user_stats = self.stats.setdefault(
-            author_id,
-            {
-                "message_timestamps": [],
-                "last_message": "",
-                "repetition_count": 0,
-                "invalid_message_count": 0,
-                "feedback_score": 0,
-            },
-        )
+        default_stats = {
+            "message_timestamps": [],
+            "last_message": 0,
+            "repetition_count": 0,
+            "invalid_message_count": 0,
+            "feedback_score": 0,
+            "violation_history": [],
+            "recovery_streaks": 0,
+        }
+
+        if author_id not in self.stats:
+            self.stats[author_id] = default_stats.copy()
+
+        user_stats: Dict[str, Any] = self.stats[author_id]
+        for key, value in default_stats.items():
+            if key not in user_stats:
+                user_stats[key] = value
 
         message_rate_window = self.dynamic_config["MESSAGE_RATE_WINDOW"]
+        short_window, long_window = (
+            message_rate_window * 0.25,
+            message_rate_window * 2.0,
+        )
+        cutoff_short, cutoff_long = (
+            current_time - short_window,
+            current_time - long_window,
+        )
+
+        message_timestamps = user_stats["message_timestamps"]
+        recent_msgs = [ts for ts in message_timestamps if ts > cutoff_short]
+        historical_msgs = [
+            ts for ts in message_timestamps if cutoff_long < ts <= cutoff_short
+        ]
+
         user_stats["message_timestamps"] = [
-            ts
-            for ts in user_stats["message_timestamps"]
-            if current_time - ts <= message_rate_window
-        ] + [current_time]
+            *historical_msgs,
+            *recent_msgs,
+            current_time,
+        ]
 
         classification = await self._classify_message_advanced(
             message_content.lower(), user_stats
         )
+        is_invalid = classification["is_invalid"]
+        invalid_message_count = user_stats["invalid_message_count"]
+        feedback_score = user_stats["feedback_score"]
+        recovery_streaks = user_stats["recovery_streaks"]
 
-        if classification["is_invalid"]:
-            user_stats["invalid_message_count"] += 1
+        if is_invalid:
+            reasons = classification["reasons"]
+            user_stats["invalid_message_count"] = invalid_message_count + 1
+            user_stats["recovery_streaks"] = 0
+
+            violation_history = user_stats.setdefault("violation_history", [])
+            violation_history.append(
+                {
+                    "timestamp": current_time,
+                    "reasons": reasons,
+                    "message_rate": (
+                        len(recent_msgs) / short_window if short_window else 0
+                    ),
+                }
+            )
+            user_stats["violation_history"] = violation_history[-10:]
+
             logger.warning(
-                f"Message violation detected for user {author_id}: "
-                f"{', '.join(classification['reasons'])}",
+                f"Message violation detected for user {author_id}: {','.join(reasons if isinstance(reasons, list) else [])}",
                 extra={
                     "user_id": author_id,
-                    "violations": classification["reasons"],
+                    "violations": reasons,
                     "message_stats": user_stats,
                 },
             )
+
+            repeated_violations = sum(
+                bool(
+                    set(v["reasons"] if isinstance(v["reasons"], list) else [])
+                    & set(reasons if isinstance(reasons, list) else [])
+                )
+                for v in violation_history[-3:]
+            )
+            base_penalty = len(reasons) if isinstance(reasons, list) else 0
+            pattern_multiplier = 1 + (repeated_violations * 0.5)
+
+            user_stats["feedback_score"] = max(
+                -5, feedback_score - (base_penalty * pattern_multiplier)
+            )
             await self._adjust_thresholds_dynamic(user_stats)
         else:
-            user_stats["invalid_message_count"] = max(
-                user_stats["invalid_message_count"] - 1, 0
+            user_stats["invalid_message_count"] = max(0, invalid_message_count - 1)
+            user_stats["recovery_streaks"] = recovery_streaks + 1
+            user_stats["feedback_score"] = min(
+                5, feedback_score + min(1 + (recovery_streaks * 0.2), 2)
             )
 
         return user_stats
@@ -2129,45 +2274,77 @@ class Roles(interactions.Extension):
     async def _classify_message_advanced(
         self, message: str, user_stats: Dict[str, Any]
     ) -> Dict[str, Union[bool, List[str]]]:
-        violations = Message(message, user_stats, self.dynamic_config).analyze()
-
-        return {"is_invalid": bool(violations), "reasons": violations}
-
-    async def _adjust_thresholds_dynamic(self, user_stats: Dict[str, Any]) -> None:
-        feedback: int = user_stats.get("feedback_score", 0)
-        adjustment_factor: float = self._calculate_adaptive_adjustment(feedback)
-
-        thresholds = {
-            "DIGIT_THRESHOLD": (0.1, 1.0),
-            "MIN_ENTROPY_THRESHOLD": (0.0, 4.0),
+        result = Message(message, user_stats, self.dynamic_config).analyze()
+        return {
+            "is_invalid": bool(result),
+            "reasons": result if isinstance(result, list) else [],
         }
 
-        for threshold_name, (min_val, max_val) in thresholds.items():
-            current_val = self.dynamic_config[threshold_name]
-            new_val = min(max(current_val + adjustment_factor, min_val), max_val)
-            self.dynamic_config[threshold_name] = new_val
+    async def _adjust_thresholds_dynamic(self, user_stats: Dict[str, Any]) -> None:
+        feedback = user_stats.get("feedback_score", 0)
+        message_count = len(user_stats.get("message_timestamps", []))
+        invalid_count = user_stats.get("invalid_message_count", 0)
 
-    def _calculate_adaptive_adjustment(self, feedback: int) -> float:
-        base_factor = 0.01
-        scaling_factor = math.tanh(abs(feedback) / 10)
-        return base_factor * feedback * scaling_factor
+        confidence = min(1.0, message_count / 100)
+        violation_ratio = invalid_count / max(1, message_count)
+        base_factor = 0.01 * (1 + confidence)
+        adj_factor = (
+            base_factor
+            * feedback
+            * math.tanh(abs(feedback) / 5)
+            * (1.5 if violation_ratio > 0.3 else 1.0)
+        )
+
+        time_delta = time.time() - user_stats.get("last_threshold_adjustment", 0)
+        decay_factor = math.exp(-time_delta / 3600)
+
+        logger.info(
+            f"Adjusting thresholds - feedback: {feedback}, confidence: {confidence:.2f}, "
+            f"violation_ratio: {violation_ratio:.2f}, adjustment: {adj_factor:.4f}"
+        )
+
+        default_thresholds = {"DIGIT_THRESHOLD": 0.5, "MIN_ENTROPY_THRESHOLD": 1.5}
+        thresholds = (
+            ("DIGIT_THRESHOLD", 0.1, 1.0),
+            ("MIN_ENTROPY_THRESHOLD", 0.0, 4.0),
+        )
+
+        alpha = 0.3 * confidence
+        for name, min_val, max_val in thresholds:
+            old_val = self.dynamic_config[name]
+            default = default_thresholds[name]
+            decay_adjustment = (default - old_val) * (1 - decay_factor)
+            new_val = min(
+                max(old_val + adj_factor + decay_adjustment, min_val), max_val
+            )
+            self.dynamic_config[name] = old_val * (1 - alpha) + new_val * alpha
+
+            logger.info(
+                f"Adjusted {name}: {old_val:.4f} -> {new_val:.4f} "
+                f"(default: {default}, decay: {decay_adjustment:.4f})"
+            )
+
+        user_stats["last_threshold_adjustment"] = time.time()
 
     async def _debounce_save_stats(self) -> None:
-        if self._save_stats_task is not None:
+        if self._save_stats_task:
             self._save_stats_task.cancel()
-        self._save_stats_task = asyncio.create_task(self._delayed_save_stats())
+        self._save_stats_task = asyncio.create_task(
+            self._delayed_save_stats(),
+            name=f"save_stats_{id(self)}_{time.monotonic_ns()}",
+        )
 
     async def _delayed_save_stats(self) -> None:
         try:
-            await asyncio.sleep(5)
+            await asyncio.sleep(5.0)
             async with self._stats_lock:
                 await self.save_stats_roles()
         except asyncio.CancelledError:
-            pass
+            return
         except Exception as e:
             logger.error(f"Error in _delayed_save_stats: {e}", exc_info=True)
         finally:
-            self._save_stats_task = None
+            object.__setattr__(self, "_save_stats_task", None)
 
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
@@ -2177,7 +2354,7 @@ class Roles(interactions.Extension):
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
-        tasks_to_stop: Final[tuple] = (
+        tasks_to_stop: tuple = (
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
             self.check_incarcerated_members,
@@ -2195,20 +2372,18 @@ class Roles(interactions.Extension):
 
     @interactions.listen(NewThreadCreate)
     async def on_new_thread_create(self, event: NewThreadCreate) -> None:
-        if not isinstance(event.thread, interactions.GuildPublicThread):
-            return
-
-        if not all(
-            (
-                event.thread.parent_id == self.config.VETTING_FORUM_ID,
-                event.thread.id not in self.processed_thread_ids,
-                event.thread.owner_id is not None,
-            )
+        thread = event.thread
+        if not isinstance(thread := event.thread, interactions.GuildPublicThread) or (
+            (thread.parent_id != self.config.VETTING_FORUM_ID)
+            | (thread.id in self.processed_thread_ids)
+            | (thread.owner_id is None)
         ):
             return
 
-        await self.handle_new_thread(event.thread)
-        self.processed_thread_ids.add(event.thread.id)
+        try:
+            await self.handle_new_thread(thread)
+        finally:
+            self.processed_thread_ids.add(thread.id)
 
     # Tasks
 
@@ -2216,169 +2391,142 @@ class Roles(interactions.Extension):
     async def cleanup_old_locks(self) -> None:
         current_time: datetime = datetime.now(timezone.utc)
         threshold: timedelta = timedelta(days=7)
-        keys_to_remove: List[int] = [
-            key
-            for key, val in self.member_lock_map.items()
-            if current_time - val["last_used"] > threshold and not val["lock"].locked()
-        ]
-        for key in keys_to_remove:
-            del self.member_lock_map[key]
-        logger.info(f"Cleaned up {len(keys_to_remove)} old locks.")
+        self.member_lock_map = {
+            k: v
+            for k, v in self.member_lock_map.items()
+            if not (
+                isinstance(v["lock"], asyncio.Lock)
+                and not v["lock"].locked()
+                and (current_time - v["last_used"]).total_seconds()
+                > threshold.total_seconds()
+            )
+        }
+        removed: int = len(self.member_lock_map) - len(self.member_lock_map)
+        logger.info(f"Cleaned up {removed} old locks.")
 
     @interactions.Task.create(interactions.IntervalTrigger(seconds=30))
     async def check_incarcerated_members(self) -> None:
+        self.incarcerated_members = await self.model.load_data(
+            "incarcerated_members.json", dict
+        )
         now: float = time.time()
-        releasable_prisoners: List[Tuple[str, Dict[str, Any]]] = []
+        release_times: Dict[str, float] = {
+            member_id: float(data["release_time"])
+            for member_id, data in self.incarcerated_members.items()
+        }
 
-        async def process_member(member_id: str, data: Dict[str, Any]) -> None:
-            try:
-                release_time: float = float(data["release_time"])
-                if now >= release_time:
-                    releasable_prisoners.append((member_id, data))
-                elif (release_time - now) <= 60:
-                    delay: float = max(0, release_time - now)
-                    asyncio.create_task(self.schedule_release(member_id, data, delay))
-            except Exception as e:
-                logger.error(f"Error processing member {member_id}: {e}")
-
-        await asyncio.gather(
-            *(
-                process_member(member_id, data)
-                for member_id, data in self.incarcerated_members.items()
+        release_map: Dict[str, Dict[str, Any]] = dict(
+            itertools.compress(
+                self.incarcerated_members.items(),
+                (t <= now for t in release_times.values()),
             )
         )
 
-        release_tasks = (
-            self.release_prisoner(member_id, data)
-            for member_id, data in releasable_prisoners
+        schedule_map: Dict[str, Dict[str, Any]] = dict(
+            itertools.compress(
+                self.incarcerated_members.items(),
+                (0 < t - now <= 60 for t in release_times.values()),
+            )
         )
-        release_results = await asyncio.gather(*release_tasks, return_exceptions=True)
 
-        for result in release_results:
-            if isinstance(result, Exception):
-                logger.error(f"Error releasing prisoner: {result}")
+        tasks = (
+            asyncio.create_task(
+                self.schedule_release(
+                    member_id, data, max(0.0, float(data["release_time"]) - now)
+                ),
+                name=f"release_{member_id}",
+            )
+            for member_id, data in schedule_map.items()
+        )
+        tuple(tasks)
 
-        if releasable_prisoners:
-            logger.info(f"Released {len(releasable_prisoners)} prisoners")
+        exceptions: List[Exception] = []
+        for member_id, data in release_map.items():
+            try:
+                await self.release_prisoner(member_id, data)
+            except Exception as e:
+                exceptions.append(e)
+                logger.error(f"Error releasing prisoner: {e}", exc_info=True)
+
+        if release_map:
+            logger.info(
+                f"Released {len(release_map)} prisoners"
+                f"{f' with {len(exceptions)} errors' if exceptions else ''}"
+            )
         else:
-            logger.info("No prisoners to release at this time")
+            logger.debug("No prisoners to release at this time")
 
     @interactions.Task.create(interactions.IntervalTrigger(hours=1))
     async def update_roles_based_on_activity(self) -> None:
         try:
             guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
             roles: Dict[str, interactions.Role] = {
-                role_name: await guild.fetch_role(role_id)
-                for role_name, role_id in {
-                    "approved": self.config.APPROVED_ROLE_ID,
-                    "temporary": self.config.TEMPORARY_ROLE_ID,
-                    "electoral": self.config.ELECTORAL_ROLE_ID,
-                }.items()
+                name: await guild.fetch_role(id_)
+                for name, id_ in (
+                    ("approved", self.config.APPROVED_ROLE_ID),
+                    ("temporary", self.config.TEMPORARY_ROLE_ID),
+                    ("electoral", self.config.ELECTORAL_ROLE_ID),
+                )
             }
 
-            async def process_member(
-                member_id: str, stats: Dict[str, Any]
-            ) -> Tuple[int, str, List[interactions.Role], List[interactions.Role]]:
-                try:
-                    message_timestamps = stats.get("message_timestamps", [])
-                    valid_messages = len(message_timestamps) - stats.get(
-                        "invalid_message_count", 0
-                    )
-
-                    if valid_messages < 50:
-                        return int(member_id), "", [], []
-
-                    member: Optional[interactions.Member] = await guild.fetch_member(
-                        int(member_id)
-                    )
-                    if not member:
-                        logger.warning(
-                            f"Member {member_id} not found during processing"
-                        )
-                        return int(member_id), "", [], []
-
-                    member_role_ids: Set[int] = {role.id for role in member.roles}
-
-                    if all(
-                        [
-                            roles["temporary"].id in member_role_ids,
-                            roles["approved"].id not in member_role_ids,
-                            roles["electoral"].id not in member_role_ids,
-                            valid_messages >= 5,
-                        ]
-                    ):
-                        reason: str = (
-                            f"Sent {valid_messages} valid messages, "
-                            f"upgraded from {roles['temporary'].name} to {roles['approved'].name}."
-                        )
-                        return (
-                            int(member_id),
-                            reason,
-                            [roles["temporary"]],
-                            [roles["approved"]],
-                        )
-
-                    return int(member_id), "", [], []
-
-                except Exception as e:
-                    logger.error(
-                        f"Error processing member {member_id}: {str(e)}\n{traceback.format_exc()}"
-                    )
-                    return int(member_id), "", [], []
-
-            results: List[
-                Tuple[int, str, List[interactions.Role], List[interactions.Role]]
-            ] = await asyncio.gather(
-                *(
-                    process_member(member_id, stats)
-                    for member_id, stats in self.stats.items()
-                ),
-                return_exceptions=True,
-            )
-
-            role_updates: Dict[str, Dict[int, List[interactions.Role]]] = {
-                "remove": defaultdict(list),
-                "add": defaultdict(list),
+            role_updates: Dict[str, DefaultDict[int, List[interactions.Role]]] = {
+                op: defaultdict(list) for op in ("remove", "add")
             }
-            members_to_update: Set[int] = set()
             log_messages: List[str] = []
+            members_to_update: Set[int] = set()
 
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Failed to process member: {result}")
+            filtered_stats = {
+                mid: stats
+                for mid, stats in self.stats.items()
+                if isinstance(stats, dict)
+                and (
+                    len(stats.get("message_timestamps", []))
+                    - stats.get("invalid_message_count", 0)
+                )
+                >= 50
+            }
+
+            for member_id, stats in filtered_stats.items():
+                if not (member := await guild.fetch_member(int(member_id))):
+                    logger.warning(f"Member {member_id} not found during processing")
                     continue
+                member_role_ids: Set[int] = {role.id for role in member.roles}
+                valid_messages = len(stats.get("message_timestamps", [])) - stats.get(
+                    "invalid_message_count", 0
+                )
 
-                member_id, reason, roles_to_remove, roles_to_add = result
-                if reason:
-                    role_updates["remove"][member_id].extend(roles_to_remove)
-                    role_updates["add"][member_id].extend(roles_to_add)
-                    members_to_update.add(member_id)
-                    log_messages.append(f"Updated roles for {member_id}: {reason}")
-
+                if all(
+                    (
+                        roles["temporary"].id in member_role_ids,
+                        roles["approved"].id not in member_role_ids,
+                        roles["electoral"].id not in member_role_ids,
+                        valid_messages >= 5,
+                    )
+                ):
+                    member_id_int = int(member_id)
+                    role_updates["remove"][member_id_int].append(roles["temporary"])
+                    role_updates["add"][member_id_int].append(roles["approved"])
+                    members_to_update.add(member_id_int)
+                    log_messages.append(
+                        f"Updated roles for {member_id}: Sent {valid_messages} valid messages, "
+                        f"upgraded from {roles['temporary'].name} to {roles['approved'].name}."
+                    )
             if members_to_update:
-
-                async def update_member_roles(member_id: int) -> None:
+                for member_id in members_to_update:
                     try:
-                        member = await guild.fetch_member(member_id)
-                        if not member:
+                        if member := await guild.fetch_member(member_id):
+                            if remove_roles := role_updates["remove"][int(member_id)]:
+                                await member.remove_roles(remove_roles)
+                            if add_roles := role_updates["add"][int(member_id)]:
+                                await member.add_roles(add_roles)
+                        else:
                             logger.error(
                                 f"Member {member_id} not found during role update"
                             )
-                            return
-
-                        if role_updates["remove"][member_id]:
-                            await member.remove_roles(role_updates["remove"][member_id])
-
-                        if role_updates["add"][member_id]:
-                            await member.add_roles(role_updates["add"][member_id])
-
                     except Exception as e:
                         logger.error(
                             f"Error updating roles for member {member_id}: {str(e)}\n{traceback.format_exc()}"
                         )
-
-                for member_id in members_to_update:
-                    await update_member_roles(member_id)
 
                 if log_messages:
                     await self.send_success(None, "\n".join(log_messages))
@@ -2403,18 +2551,23 @@ class Roles(interactions.Extension):
 
     async def handle_new_thread(self, thread: interactions.GuildPublicThread) -> None:
         try:
-            timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M")
+            timestamp = f"{int(datetime.now(timezone.utc).strftime('%y%m%d%H%M'))}"
             new_title = f"[{timestamp}] {thread.name}"
 
-            await asyncio.gather(
-                thread.edit(name=new_title),
-                self._send_review_components(thread),
+            await thread.edit(name=new_title)
+
+            review_task = asyncio.create_task(self._send_review_components(thread))
+            notify_task = asyncio.create_task(
                 self.notify_vetting_reviewers(
                     self.config.VETTING_ROLE_IDS, thread, timestamp
-                ),
+                )
             )
+
+            await review_task
+            await notify_task
+
         except Exception as e:
-            logger.exception(f"Error processing new post: {str(e)}")
+            logger.exception(f"Error processing new post: {e!r}")
 
     async def _send_review_components(
         self, thread: interactions.GuildPublicThread
@@ -2428,56 +2581,59 @@ class Roles(interactions.Extension):
     async def handle_custom_roles_menu(
         self, ctx: interactions.ComponentContext
     ) -> None:
-        if not (match := self.custom_roles_menu_pattern.match(ctx.custom_id)):
-            await self.send_error(ctx, "Invalid custom ID format.")
-            return
-
-        member_id: int = int(match.group(1))
-
-        if not ctx.values:
-            await self.send_error(ctx, "No action selected.", log_to_channel=False)
-            return
-
-        action: Literal["add", "remove"] = ctx.values[0]
-
-        try:
-            member: interactions.Member = await ctx.guild.fetch_member(member_id)
-        except NotFound:
-            await self.send_error(ctx, f"Member with ID {member_id} not found.")
-            return
-
-        options = [
-            interactions.StringSelectOption(label=role, value=role)
-            for role in self.custom_roles.keys()
-            if len(self.custom_roles) <= 25
-        ][:25]
-
-        if not options:
-            await self.send_error(
-                ctx, "No custom roles available.", log_to_channel=False
-            )
-            return
-
-        if len(options) > 25:
+        if (
+            not (match := self.custom_roles_menu_pattern.match(ctx.custom_id))
+            or not ctx.values
+        ):
             await self.send_error(
                 ctx,
-                "Too many custom roles. Pagination not implemented yet.",
-                log_to_channel=False,
+                (
+                    "Please select an action (add/remove) from the dropdown menu to continue."
+                    if match
+                    else "Invalid menu format"
+                ),
             )
             return
 
-        components = [
-            interactions.StringSelectMenu(
-                *options,
-                custom_id=f"{action}_roles_menu_{member.id}",
-                placeholder="Select role",
-                max_values=1,
+        member_id: int = int(match[1])
+        action: Literal["add", "remove"] = ctx.values[0]
+
+        member: interactions.Member = await ctx.guild.fetch_member(member_id)
+        if not member:
+            await self.send_error(ctx, f"Unable to find member with ID {member_id}.")
+            return
+
+        custom_roles_count: int = len(self.custom_roles)
+        if not custom_roles_count or custom_roles_count > 25:
+            await self.send_error(
+                ctx,
+                (
+                    lambda x: (
+                        "There are currently no custom roles configured that can be managed."
+                        if not x
+                        else "There are too many custom roles to display in a single menu. Support for multiple pages will be added soon."
+                    )
+                )(custom_roles_count),
             )
-        ]
+            return
+
+        options: tuple[interactions.StringSelectOption, ...] = tuple(
+            map(
+                lambda role: interactions.StringSelectOption(label=role, value=role),
+                self.custom_roles,
+            )
+        )
 
         await ctx.send(
-            f"Select role to {action} for {member.mention}:",
-            components=components,
+            f"Please select which role you would like to {action} {('to' if action == 'add' else 'from')} {member.mention}",
+            components=[
+                interactions.StringSelectMenu(
+                    *options,
+                    custom_id=f"{action}_roles_menu_{member.id}",
+                    placeholder="Select role to manage",
+                    max_values=1,
+                )
+            ],
             ephemeral=True,
         )
 
@@ -2490,16 +2646,15 @@ class Roles(interactions.Extension):
                 f"on_role_menu_select triggered with custom_id: {ctx.custom_id}"
             )
 
-            match = self.role_menu_regex_pattern.match(ctx.custom_id)
-            if not match:
+            if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
                 logger.error(f"Invalid custom ID format: {ctx.custom_id}")
                 return await self.send_error(ctx, "Invalid custom ID format.")
 
-            action, member_id = match.groups()
-            member_id = int(member_id)
+            action, member_id_str = match.groups()
+            member_id = int(member_id_str)
             logger.info(f"Parsed action: {action}, member_id: {member_id}")
 
-            if action not in [Action.ADD.value, Action.REMOVE.value]:
+            if action not in {Action.ADD.value, Action.REMOVE.value}:
                 logger.error(f"Invalid action: {action}")
                 return await self.send_error(ctx, f"Invalid action: {action}")
 
@@ -2511,20 +2666,18 @@ class Roles(interactions.Extension):
                     ctx, f"Member with ID {member_id} not found."
                 )
 
-            if not ctx.values:
+            if not (selected_role := next(iter(ctx.values), None)):
                 logger.warning("No role selected.")
                 return await self.send_error(
-                    ctx, "No role selected.", log_to_channel=False
+                    ctx,
+                    "Please select a role from the dropdown menu to continue.",
                 )
 
-            selected_role = ctx.values[0]
             logger.info(f"Selected role: {selected_role}")
 
-            updated_roles = await self.update_custom_roles(
+            if updated_roles := await self.update_custom_roles(
                 member_id, {selected_role}, Action(action)
-            )
-
-            if updated_roles:
+            ):
                 action_past = "added to" if action == "add" else "removed from"
                 success_message = (
                     f"The role {selected_role} has been {action_past} {member.mention}."
@@ -2544,22 +2697,22 @@ class Roles(interactions.Extension):
     async def update_custom_roles(
         self, user_id: int, roles: Set[str], action: Action
     ) -> Set[str]:
-        updated_roles = set()
+        updated_roles: set[str] = set()
         for role in roles:
             if role not in self.custom_roles:
                 self.custom_roles[role] = set()
+                updated_roles.add(role)
+                continue
 
-            role_members = self.custom_roles[role]
-            if action == Action.ADD:
-                if user_id not in role_members:
-                    role_members.add(user_id)
-                    updated_roles.add(role)
-            elif action == Action.REMOVE:
-                if user_id in role_members:
-                    role_members.remove(user_id)
-                    updated_roles.add(role)
-                    if not role_members:
-                        del self.custom_roles[role]
+            members = self.custom_roles[role]
+            if action == Action.ADD and user_id not in members:
+                members.add(user_id)
+                updated_roles.add(role)
+            elif action == Action.REMOVE and user_id in members:
+                members.remove(user_id)
+                if not members:
+                    self.custom_roles.pop(role, None)
+                updated_roles.add(role)
 
         if updated_roles:
             await self.save_custom_roles()
@@ -2567,9 +2720,9 @@ class Roles(interactions.Extension):
 
     async def save_custom_roles(self) -> None:
         try:
-            serializable_custom_roles = {
-                role: list(members) for role, members in self.custom_roles.items()
-            }
+            serializable_custom_roles = dict(
+                map(lambda x: (x[0], list(x[1])), self.custom_roles.items())
+            )
             await self.model.save_data("custom.json", serializable_custom_roles)
             logger.info("Custom roles saved successfully")
         except Exception as e:
@@ -2579,16 +2732,16 @@ class Roles(interactions.Extension):
     async def save_stats_roles(self) -> None:
         try:
             await self.model.save_data("stats.json", dict(self.stats))
-            logger.info(f"Stats saved successfully: {self.stats}")
+            logger.info(f"Stats saved successfully: {self.stats!r}")
         except Exception as e:
-            logger.error(f"Failed to save stats roles: {e}", exc_info=True)
+            logger.error(f"Failed to save stats roles: {e!r}", exc_info=True)
             raise
 
     async def save_incarcerated_members(self) -> None:
         try:
             await self.model.save_data(
-                "incarcerated_members.json", self.incarcerated_members
+                "incarcerated_members.json", dict(self.incarcerated_members)
             )
         except Exception as e:
-            logger.error(f"Failed to save incarcerated members: {e}")
+            logger.error(f"Failed to save incarcerated members: {e!r}")
             raise
