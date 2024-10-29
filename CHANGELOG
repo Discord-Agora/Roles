@@ -1,3 +1,13 @@
+## 2024-10-30
+
+### Added
+- Added recovery streaks and violation history tracking
+- Implemented adaptive threshold adjustments with decay
+
+### Changed
+- Replace Final type hints with regular type hints where unnecessary
+- Enhance message violation detection with pattern recognition
+
 ## 2024-10-26
 
 ### Added
