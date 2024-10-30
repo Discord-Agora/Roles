@@ -1040,7 +1040,7 @@ class Roles(interactions.Extension):
         else:
             await self.send_error(
                 ctx,
-                f"No changes were made because the specified roles {'already exist' if action == 'add' else 'don\'t exist'}. Please check the role names and try again.",
+                f"No changes were made because the specified roles {'already exist' if action == 'add' else '''don't exist'''}. Please check the role names and try again.",
             )
 
     @interactions.user_context_menu(name="Custom Roles")
