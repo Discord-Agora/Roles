@@ -8,6 +8,9 @@
 - Replace Final type hints with regular type hints where unnecessary
 - Enhance message violation detection with pattern recognition
 
+### Fixed
+- Corrected f-string syntax
+
 ## 2024-10-26
 
 ### Added
