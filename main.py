@@ -170,7 +170,7 @@ class Approval:
 
 
 class Model(Generic[T]):
-    def __init__(self):
+    def __init__(self) -> None:
         self.base_path: URL = URL(str(Path(__file__).parent))
         self._data_cache: Dict[str, Any] = {}
         self.parser: cysimdjson.JSONParser = cysimdjson.JSONParser()
@@ -194,6 +194,7 @@ class Model(Generic[T]):
                             f"Attempt {attempt + 1} failed: {e}. Retrying..."
                         )
                         await asyncio.sleep(delay * (2**attempt))
+                return None
 
             return wrapper
 
@@ -203,7 +204,9 @@ class Model(Generic[T]):
         return self._file_locks.setdefault(file_name, asyncio.Lock())
 
     @asynccontextmanager
-    async def _file_operation(self, file_path: Path, mode: str):
+    async def _file_operation(
+        self, file_path: Path, mode: str
+    ) -> AsyncGenerator[Any, None]:
         lock = await self._get_file_lock(str(file_path))
         async with lock:
             try:
@@ -239,16 +242,29 @@ class Model(Generic[T]):
                 }
             elif issubclass(model, BaseModel):
                 instance = await loop.run_in_executor(
-                    self._executor, lambda: model.model_validate(json_parsed)
+                    self._executor,
+                    lambda: (
+                        model.model_validate_json(content)
+                        if content
+                        else model.model_validate({})
+                    ),
                 )
             elif model == Counter:
-                instance = dict(Counter(json_parsed))
+                instance = Counter(json_parsed)
+                instance = cast(T, instance)
             else:
-                instance = json_parsed
+                if issubclass(model, BaseModel):
+                    instance = model.model_validate({})
+                elif model == Counter:
+                    instance = cast(T, Counter())
+                else:
+                    instance = {}
+                await self.save_data(file_name, instance)
+                return cast(T, instance)
 
             self._data_cache[file_name] = instance
             logger.info(f"Successfully loaded data from {file_name}")
-            return cast(T, instance if isinstance(instance, model) else model(instance))
+            return cast(T, instance)
 
         except FileNotFoundError:
             logger.info(f"{file_name} not found. Creating new.")
@@ -256,12 +272,12 @@ class Model(Generic[T]):
                 instance = {}
             else:
                 instance = (
-                    model()
+                    model.model_validate({})
                     if issubclass(model, BaseModel)
                     else Counter() if model == Counter else {}
                 )
             await self.save_data(file_name, instance)
-            return instance if isinstance(instance, model) else model(instance)
+            return cast(T, instance)
 
         except Exception as e:
             error_msg = f"Unexpected error loading {file_name}: {e}"
@@ -276,7 +292,11 @@ class Model(Generic[T]):
             json_data = await loop.run_in_executor(
                 self._executor,
                 lambda: orjson.dumps(
-                    data.dict() if hasattr(data, "dict") else data,
+                    (
+                        data.model_dump(mode="json")
+                        if isinstance(data, BaseModel)
+                        else data
+                    ),
                     option=orjson.OPT_INDENT_2
                     | orjson.OPT_SERIALIZE_NUMPY
                     | orjson.OPT_NON_STR_KEYS,
@@ -293,7 +313,7 @@ class Model(Generic[T]):
             logger.error(f"Error saving {file_name}: {e}")
             raise
 
-    def __del__(self):
+    def __del__(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -855,23 +875,68 @@ class Roles(interactions.Extension):
         )
         field_count = 0
         max_fields = 25
+        total_chars = len(current_embed.title or "") + len(
+            current_embed.description or ""
+        )
 
-        async def add_field(name: str, value: str, inline: bool = False) -> None:
-            nonlocal current_embed, field_count
-            current_embed.add_field(
-                name=name,
-                value=value or "*No data is currently available for this field*",
-                inline=inline,
-            )
-            field_count += 1
-            if field_count >= max_fields:
-                embeds.append(current_embed)
-                current_embed = await self.create_embed(
-                    title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
-                    description="Continued configuration details.",
-                    color=EmbedColor.INFO,
+        async def add_field(name: str, value: str, inline: bool = True) -> None:
+            nonlocal current_embed, field_count, total_chars
+            name = name[:256]
+
+            if len(value) > 1024:
+                chunks = [value[i : i + 1024] for i in range(0, len(value), 1024)]
+                for i, chunk in enumerate(chunks):
+                    field_name = f"{name} (Part {i+1})"[:256]
+                    field_value = (
+                        chunk or "*No data is currently available for this field*"
+                    )
+
+                    field_chars = len(field_name) + len(field_value)
+                    if total_chars + field_chars > 6000 or field_count >= max_fields:
+                        embeds.append(current_embed)
+                        current_embed = await self.create_embed(
+                            title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
+                            description="Continued configuration details.",
+                            color=EmbedColor.INFO,
+                        )
+                        field_count = 0
+                        total_chars = len(current_embed.title or "") + len(
+                            current_embed.description or ""
+                        )
+
+                    current_embed.add_field(
+                        name=field_name,
+                        value=field_value,
+                        inline=inline,
+                    )
+                    field_count += 1
+                    total_chars += field_chars
+            else:
+                field_name = name[:256]
+                field_value = (
+                    value[:1024] or "*No data is currently available for this field*"
                 )
-                field_count = 0
+                field_chars = len(field_name) + len(field_value)
+
+                if total_chars + field_chars > 6000 or field_count >= max_fields:
+                    embeds.append(current_embed)
+                    current_embed = await self.create_embed(
+                        title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
+                        description="Continued configuration details.",
+                        color=EmbedColor.INFO,
+                    )
+                    field_count = 0
+                    total_chars = len(current_embed.title or "") + len(
+                        current_embed.description or ""
+                    )
+
+                current_embed.add_field(
+                    name=field_name,
+                    value=field_value,
+                    inline=inline,
+                )
+                field_count += 1
+                total_chars += field_chars
 
         match config:
             case "vetting":
@@ -1328,9 +1393,12 @@ class Roles(interactions.Extension):
         )
 
     def get_role_ids_to_assign(self, kwargs: Dict[str, str]) -> Set[int]:
+        filtered_items: List[Tuple[str, str]] = [
+            (k, v) for k, v in kwargs.items() if isinstance(v, str) and v is not None
+        ]
         return {
             role_id
-            for param, value in kwargs.items()
+            for param, value in filtered_items
             if value
             and (role_id := self.vetting_roles.assigned_roles.get(param, {}).get(value))
         }
@@ -1427,12 +1495,15 @@ class Roles(interactions.Extension):
             else:
                 yield
         finally:
-            now = datetime.now(timezone.utc)
+            current_time: datetime = datetime.now(timezone.utc)
             self.member_lock_map = {
                 mid: info
                 for mid, info in self.member_lock_map.items()
-                if isinstance(info["last_used"], datetime)
-                if (now - info["last_used"]).total_seconds() <= 3600
+                if isinstance(info["lock"], asyncio.Lock)
+                and not info["lock"].locked()
+                and isinstance(info["last_used"], datetime)
+                and (current_time - cast(datetime, info["last_used"])).total_seconds()
+                <= 3600
             }
 
     async def process_approval_status_change(
@@ -2174,7 +2245,7 @@ class Roles(interactions.Extension):
     async def _process_user_stats(
         self, author_id: str, message_content: str, current_time: float
     ) -> Dict[str, Any]:
-        default_stats = {
+        default_stats: Dict[str, Any] = {
             "message_timestamps": [],
             "last_message": 0,
             "repetition_count": 0,
@@ -2184,10 +2255,11 @@ class Roles(interactions.Extension):
             "recovery_streaks": 0,
         }
 
-        if author_id not in self.stats:
-            self.stats[author_id] = default_stats.copy()
+        if str(author_id) not in self.stats:
+            self.stats[str(author_id)] = cast(int, default_stats.copy())
 
-        user_stats: Dict[str, Any] = self.stats[author_id]
+        user_stats = cast(Dict[str, Any], self.stats[str(author_id)])
+
         for key, value in default_stats.items():
             if key not in user_stats:
                 user_stats[key] = value
@@ -2397,7 +2469,9 @@ class Roles(interactions.Extension):
             if not (
                 isinstance(v["lock"], asyncio.Lock)
                 and not v["lock"].locked()
-                and (current_time - v["last_used"]).total_seconds()
+                and isinstance(v["last_used"], datetime)
+                and isinstance(current_time, datetime)
+                and (current_time - cast(datetime, v["last_used"])).total_seconds()
                 > threshold.total_seconds()
             )
         }
@@ -2491,9 +2565,10 @@ class Roles(interactions.Extension):
                     logger.warning(f"Member {member_id} not found during processing")
                     continue
                 member_role_ids: Set[int] = {role.id for role in member.roles}
-                valid_messages = len(stats.get("message_timestamps", [])) - stats.get(
-                    "invalid_message_count", 0
-                )
+                stats_dict = cast(Dict[str, Any], stats)
+                valid_messages = len(
+                    stats_dict.get("message_timestamps", [])
+                ) - stats_dict.get("invalid_message_count", 0)
 
                 if all(
                     (
@@ -2512,12 +2587,12 @@ class Roles(interactions.Extension):
                         f"upgraded from {roles['temporary'].name} to {roles['approved'].name}."
                     )
             if members_to_update:
-                for member_id in members_to_update:
+                for member_id_int in members_to_update:
                     try:
-                        if member := await guild.fetch_member(member_id):
-                            if remove_roles := role_updates["remove"][int(member_id)]:
+                        if member := await guild.fetch_member(member_id_int):
+                            if remove_roles := role_updates["remove"][member_id_int]:
                                 await member.remove_roles(remove_roles)
-                            if add_roles := role_updates["add"][int(member_id)]:
+                            if add_roles := role_updates["add"][member_id_int]:
                                 await member.add_roles(add_roles)
                         else:
                             logger.error(
@@ -2531,14 +2606,17 @@ class Roles(interactions.Extension):
                 if log_messages:
                     await self.send_success(None, "\n".join(log_messages))
 
-            self.stats = {
-                k: v
-                for k, v in self.stats.items()
-                if (
-                    int(k) not in members_to_update
-                    or len(v.get("message_timestamps", [])) < 5
-                )
-            }
+            self.stats = Counter(
+                {
+                    k: cast(Dict[str, Any], v)
+                    for k, v in self.stats.items()
+                    if (
+                        int(k) not in members_to_update
+                        or len(cast(Dict[str, Any], v).get("message_timestamps", []))
+                        < 5
+                    )
+                }
+            )
             await self.save_stats_roles()
 
         except Exception as e:
