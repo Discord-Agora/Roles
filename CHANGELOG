@@ -1,3 +1,10 @@
+## 2024-11-01
+
+### Changed
+- Refactored `_file_operation` to use `AsyncGenerator` and improved validation logic
+- Enhanced `add_field` method to handle long values and maintain character limits
+- Updated statistics handling to use `Counter`
+
 ## 2024-10-30
 
 ### Added
