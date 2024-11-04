@@ -5,5 +5,4 @@ cachetools
 pydantic
 yarl
 orjson
-loguru
 numpy
