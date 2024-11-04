@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import logging
 import math
 import os
 import re
@@ -12,9 +13,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from functools import lru_cache, partial, wraps
-from itertools import filterfalse, islice
+from itertools import islice
+from logging.handlers import RotatingFileHandler
 from multiprocessing import cpu_count
-from operator import attrgetter, sub
+from operator import attrgetter
 from pathlib import Path
 from typing import (
     Any,
@@ -53,40 +55,23 @@ from interactions.api.events import (
 )
 from interactions.client.errors import NotFound
 from interactions.ext.paginators import Paginator
-from loguru import logger
 from pydantic import BaseModel, Field
 from yarl import URL
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE: str = os.path.join(BASE_DIR, "roles.log")
 
-logger.remove()
-logger.add(
-    sink=LOG_FILE,
-    level="DEBUG",
-    format=(
-        "{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | "
-        "{process}:{thread} | "
-        "{level: <8} | "
-        "{name}:{function}:{line} - "
-        "{message}"
-    ),
-    filter=lambda record: (
-        record["name"].startswith("extensions.github_d_com__kazuki388_s_Roles.main")
-    ),
-    colorize=None,
-    serialize=False,
-    backtrace=True,
-    diagnose=True,
-    context=None,
-    enqueue=False,
-    catch=True,
-    rotation="1 MB",
-    retention=1,
-    compression="gz",
-    encoding="utf-8",
-    mode="a",
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter(
+    "%(asctime)s | %(process)d:%(thread)d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
+    "%Y-%m-%d %H:%M:%S.%f %z",
 )
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 # Model
 
