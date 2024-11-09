@@ -1363,91 +1363,43 @@ class Roles(interactions.Extension):
         domicile: Optional[str] = None,
         status: Optional[str] = None,
     ) -> None:
-        if not (
-            self.validate_vetting_permissions(ctx)
-            and (
-                role_ids := self.get_role_ids_to_assign(
-                    {
-                        k: v
-                        for k, v in zip(
-                            ("ideology", "domicile", "status"),
-                            (ideology, domicile, status),
-                        )
-                        if v is not None
-                    }
+        kwargs = dict(
+            zip(("ideology", "domicile", "status"), (ideology, domicile, status))
+        )
+        role_ids = self.get_role_ids_to_assign(
+            dict(
+                filter(
+                    lambda x: isinstance(x, tuple) and x[1] is not None, kwargs.items()
                 )
             )
-            and self.validate_vetting_permissions_with_roles(ctx, role_ids)
-        ):
+        )
+
+        if not self.validate_vetting_permissions(ctx):
             await self.send_error(
-                ctx,
-                next(
-                    msg
-                    for valid, msg in [
-                        (
-                            self.validate_vetting_permissions(ctx),
-                            "You do not have the required permissions to use this command.",
-                        ),
-                        (
-                            bool(role_ids),
-                            f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(k for k, v in dict(zip(('ideology', 'domicile', 'status'), (ideology, domicile, status))).items() if v is not None) or 'ideology, domicile, or status'}).",
-                        ),
-                        (
-                            self.validate_vetting_permissions_with_roles(ctx, role_ids),
-                            "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
-                        ),
-                    ]
-                    if not valid
-                ),
+                ctx, "You do not have the required permissions to use this command."
             )
             return
 
-        member_role_ids = {role.id for role in member.roles}
-        ROLE_PRIORITIES = {
-            self.config.MISSING_ROLE_ID: 1,
-            self.config.INCARCERATED_ROLE_ID: 2,
-            self.config.ELECTORAL_ROLE_ID: 3,
-            self.config.APPROVED_ROLE_ID: 4,
-            self.config.TEMPORARY_ROLE_ID: 5,
-        }
-
-        if priority_roles := {
-            role_id: prio
-            for role_id, prio in (
-                (rid, ROLE_PRIORITIES[rid])
-                for rid in member_role_ids & ROLE_PRIORITIES.keys()
+        if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
+            await self.send_error(
+                ctx,
+                "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
             )
-        }:
-            if (
-                highest_priority_role := min(
-                    priority_roles.items(), key=lambda x: x[1]
-                )[0]
-            ) in (
-                self.config.MISSING_ROLE_ID,
-                self.config.INCARCERATED_ROLE_ID,
-            ):
-                await self.send_error(
-                    ctx,
-                    f"Cannot modify roles while member has the <@&{highest_priority_role}> role. Remove this role first.",
-                )
-                return
+            return
 
+        if not role_ids:
+            role_types = tuple(k for k, v in kwargs.items() if v is not None)
+            await self.send_error(
+                ctx,
+                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, or status'}).",
+            )
+            return
+
+        if action == Action.ADD and await self.check_role_assignment_conflicts(
+            ctx, member, role_ids
+        ):
+            return
         if action == Action.ADD:
-            if await self.check_role_assignment_conflicts(ctx, member, role_ids):
-                return
-
-            roles_to_remove = {
-                existing_role_id
-                for existing_role_id in member_role_ids & ROLE_PRIORITIES.keys()
-                for new_role_id in role_ids & ROLE_PRIORITIES.keys()
-                if ROLE_PRIORITIES[new_role_id] < ROLE_PRIORITIES[existing_role_id]
-            }
-
-            if roles_to_remove:
-                await member.remove_roles(
-                    [role for role in member.roles if role.id in roles_to_remove]
-                )
-
             await self.assign_roles_to_member(ctx, member, list(role_ids))
         else:
             await self.remove_roles_from_member(ctx, member, role_ids)
