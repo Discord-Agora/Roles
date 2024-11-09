@@ -1194,7 +1194,7 @@ class Roles(interactions.Extension):
     # Vetting commands
 
     @module_group_vetting.subcommand(
-        "maintenance",
+        "inactive",
         sub_cmd_description="Convert inactive members to missing members",
     )
     @error_handler
@@ -1214,13 +1214,11 @@ class Roles(interactions.Extension):
             missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
 
             if not all((temp_role, missing_role)):
-                return await self.send_error(
-                    ctx,
-                    "Could not fetch required roles. Please check role IDs.",
-                )
+                return await self.send_error(ctx, "Could not fetch required roles.")
 
-            cutoff = datetime.now() - timedelta(days=15)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=15)
             converted_members = []
+
             text_channels = {
                 channel
                 for channel in guild.channels
@@ -1233,41 +1231,222 @@ class Roles(interactions.Extension):
                 )
             }
 
-            for member in temp_role.members:
-                try:
-                    messages = []
-                    for channel in text_channels:
-                        async for message in channel.history(limit=100):
-                            if message.author.id == member.id:
-                                messages.append(message.created_at)
+            temp_members = list(temp_role.members)
+            total_members = len(temp_members)
+            processed = 0
 
-                    last_message_time = max(messages, default=None)
+            BATCH_SIZE = 8
+            ROLE_CHANGE_INTERVAL = 0.5
+            REPORT_THRESHOLD = 10
 
-                    if not last_message_time or last_message_time < cutoff:
-                        await member.remove_roles([temp_role])
-                        await member.add_roles([missing_role])
-                        converted_members.append(member.mention)
+            for i in range(0, total_members, BATCH_SIZE):
+                batch = temp_members[i : i + BATCH_SIZE]
+                batch_start = time.monotonic()
 
-                except Exception as e:
-                    logger.error(f"Error converting member {member.id}: {e}")
-                    continue
+                for member in batch:
+                    try:
+                        should_convert = await self._check_member_activity(
+                            member, text_channels, cutoff
+                        )
+
+                        if should_convert:
+                            try:
+                                await member.remove_roles([temp_role])
+                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+                                await member.add_roles([missing_role])
+                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+
+                                converted_members.append(member.mention)
+                                logger.info(
+                                    f"Successfully converted member {member.id}"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to update roles for {member.id}: {e}"
+                                )
+                                continue
+
+                    except Exception as e:
+                        logger.error(f"Error processing member {member.id}: {e}")
+                        continue
+
+                processed += len(batch)
+
+                if len(converted_members) >= REPORT_THRESHOLD:
+                    await self.send_success(
+                        ctx,
+                        f"Progress: {processed}/{total_members} members processed\n"
+                        f"Converted members:\n" + "\n".join(converted_members),
+                    )
+                    converted_members = []
+
+                elapsed = time.monotonic() - batch_start
+                if elapsed < 5.0:
+                    await asyncio.sleep(5.0 - elapsed)
 
             if converted_members:
                 await self.send_success(
                     ctx,
-                    f"Successfully converted {len(converted_members)} inactive members to missing status:\n"
-                    + "\n".join(converted_members),
+                    f"Final batch - Progress: {processed}/{total_members}\n"
+                    f"Converted members:\n" + "\n".join(converted_members),
                 )
-            else:
-                await self.send_success(
-                    ctx, "No inactive members found that need to be converted."
-                )
+
+            await self.send_success(
+                ctx, f"Maintenance complete: Processed {total_members} members."
+            )
 
         except Exception as e:
             logger.error(f"Error in convert_inactive_members: {e}")
             await self.send_error(
                 ctx, f"An error occurred while converting members: {str(e)}"
             )
+
+    async def _check_member_activity(
+        self,
+        member: interactions.Member,
+        text_channels: set[interactions.GuildChannel],
+        cutoff: datetime,
+    ) -> bool:
+        try:
+            last_message_time = await self._get_last_message_time(
+                member, text_channels, cutoff
+            )
+            if last_message_time and last_message_time.tzinfo is None:
+                last_message_time = last_message_time.replace(tzinfo=timezone.utc)
+            return not last_message_time or last_message_time < cutoff
+        except Exception as e:
+            logger.error(f"Error checking activity for member {member.id}: {e}")
+            raise
+
+    async def _get_last_message_time(
+        self,
+        member: interactions.Member,
+        text_channels: set[interactions.GuildChannel],
+        cutoff: datetime,
+    ) -> Optional[datetime]:
+        sem = asyncio.Semaphore(5)
+
+        async def check_channel(channel):
+            async with sem:
+                try:
+                    async for message in channel.history(limit=50):
+                        if message.author.id == member.id:
+                            return message.created_at
+                except Exception as e:
+                    logger.error(f"Error checking channel {channel.id}: {e}")
+                return None
+
+        results = await asyncio.gather(
+            *[check_channel(channel) for channel in text_channels],
+            return_exceptions=True,
+        )
+
+        last_times = [r for r in results if isinstance(r, datetime)]
+        return max(last_times, default=None)
+
+    @module_group_vetting.subcommand(
+        "conflicts", sub_cmd_description="Check and resolve role conflicts"
+    )
+    @error_handler
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
+        ROLE_PRIORITIES = {
+            self.config.MISSING_ROLE_ID: 1,
+            self.config.INCARCERATED_ROLE_ID: 2,
+            self.config.ELECTORAL_ROLE_ID: 3,
+            self.config.APPROVED_ROLE_ID: 4,
+            self.config.TEMPORARY_ROLE_ID: 5,
+        }
+        BATCH_SIZE = 8
+        ROLE_CHANGE_INTERVAL = 0.5
+
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            await self.send_error(
+                ctx, "You need Administrator permission to use this command"
+            )
+            return
+
+        await ctx.defer()
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            processed, conflicts = 0, 0
+            log_buffer = []
+
+            member_ids = [member.id for member in ctx.guild.members]
+
+            for member_id in member_ids:
+                try:
+                    member = await guild.fetch_member(member_id)
+                    member_role_ids = {role.id for role in member.roles}
+                    priority_roles = {}
+
+                    for role_id, prio in ROLE_PRIORITIES.items():
+                        if role_id in member_role_ids:
+                            priority_roles[role_id] = prio
+
+                    if len(priority_roles) > 1:
+                        highest_prio = min(priority_roles.values())
+                        roles_to_remove = set()
+
+                        for role_id, prio in priority_roles.items():
+                            if prio > highest_prio:
+                                roles_to_remove.add(role_id)
+
+                        if roles_to_remove:
+                            roles_to_remove_objects = []
+                            for role in member.roles:
+                                if role.id in roles_to_remove:
+                                    roles_to_remove_objects.append(role)
+
+                            await member.remove_roles(roles_to_remove_objects)
+                            await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+
+                            conflicts += 1
+                            log_buffer.append(
+                                f"Resolved role conflict for {member.mention}: "
+                                f"Removed {len(roles_to_remove)} conflicting role(s)"
+                            )
+
+                            if len(log_buffer) >= 5:
+                                await self.send_success(
+                                    None, "\n".join(log_buffer), log_to_channel=True
+                                )
+                                log_buffer.clear()
+
+                except Exception as e:
+                    logger.error(
+                        f"Error processing member {member_id}: {str(e)}\n"
+                        f"{traceback.format_exc()}"
+                    )
+
+                processed += 1
+
+                if processed % BATCH_SIZE == 0:
+                    await asyncio.sleep(5)
+
+            if log_buffer:
+                await self.send_success(
+                    None, "\n".join(log_buffer), log_to_channel=True
+                )
+
+            if conflicts:
+                await self.send_success(
+                    None,
+                    f"Role conflict check completed: Processed {processed} members, "
+                    f"resolved {conflicts} role conflicts.",
+                    log_to_channel=True,
+                )
+
+            logger.info(
+                f"Role conflict check completed: Processed {processed} members, "
+                f"resolved {conflicts} role conflicts."
+            )
+
+        except Exception as e:
+            error_msg = f"Critical error in role conflict check task: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            await self.send_error(None, error_msg, log_to_channel=True)
 
     @module_group_vetting.subcommand(
         "assign", sub_cmd_description="Add roles to a member"
@@ -2477,7 +2656,6 @@ class Roles(interactions.Extension):
         self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
-        self.check_role_conflicts.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
@@ -2485,7 +2663,6 @@ class Roles(interactions.Extension):
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
             self.check_incarcerated_members,
-            self.check_role_conflicts,
         )
         for task in tasks_to_stop:
             task.stop()
@@ -2514,92 +2691,6 @@ class Roles(interactions.Extension):
             self.processed_thread_ids.add(thread.id)
 
     # Tasks
-
-    @interactions.Task.create(interactions.IntervalTrigger(days=7))
-    async def check_role_conflicts(self) -> None:
-        ROLE_PRIORITIES = {
-            self.config.MISSING_ROLE_ID: 1,
-            self.config.INCARCERATED_ROLE_ID: 2,
-            self.config.ELECTORAL_ROLE_ID: 3,
-            self.config.APPROVED_ROLE_ID: 4,
-            self.config.TEMPORARY_ROLE_ID: 5,
-        }
-        BATCH_SIZE = 5
-
-        try:
-            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            processed, conflicts = 0, 0
-            log_buffer = []
-
-            async for member in guild.get_members():
-                try:
-                    member_role_ids = {role.id for role in member.roles}
-                    priority_roles = {}
-
-                    for role_id, prio in ROLE_PRIORITIES.items():
-                        if role_id in member_role_ids:
-                            priority_roles[role_id] = prio
-
-                    if len(priority_roles) > 1:
-                        highest_prio = min(priority_roles.values())
-                        roles_to_remove = set()
-
-                        for role_id, prio in priority_roles.items():
-                            if prio > highest_prio:
-                                roles_to_remove.add(role_id)
-
-                        if roles_to_remove:
-                            roles_to_remove_objects = []
-                            for role in member.roles:
-                                if role.id in roles_to_remove:
-                                    roles_to_remove_objects.append(role)
-
-                            await member.remove_roles(roles_to_remove_objects)
-                            conflicts += 1
-                            log_buffer.append(
-                                f"Resolved role conflict for {member.mention}: "
-                                f"Removed {len(roles_to_remove)} conflicting role(s)"
-                            )
-
-                            if len(log_buffer) >= 5:
-                                await self.send_success(
-                                    None, "\n".join(log_buffer), log_to_channel=True
-                                )
-                                log_buffer.clear()
-
-                except Exception as e:
-                    logger.error(
-                        f"Error processing member {member.id}: {str(e)}\n"
-                        f"{traceback.format_exc()}"
-                    )
-
-                processed += 1
-
-                if processed % BATCH_SIZE == 0:
-                    await asyncio.sleep(5)
-
-            if log_buffer:
-                await self.send_success(
-                    None, "\n".join(log_buffer), log_to_channel=True
-                )
-
-            if conflicts:
-                await self.send_success(
-                    None,
-                    f"Role conflict check completed: Processed {processed} members, "
-                    f"resolved {conflicts} role conflicts.",
-                    log_to_channel=True,
-                )
-
-            logger.info(
-                f"Role conflict check completed: Processed {processed} members, "
-                f"resolved {conflicts} role conflicts."
-            )
-
-        except Exception as e:
-            error_msg = f"Critical error in role conflict check task: {str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            await self.send_error(None, error_msg, log_to_channel=True)
 
     @interactions.Task.create(interactions.IntervalTrigger(days=7))
     async def cleanup_old_locks(self) -> None:
