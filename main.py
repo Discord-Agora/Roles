@@ -123,6 +123,7 @@ class Config:
     ELECTORAL_ROLE_ID: int = 1200043628899356702
     APPROVED_ROLE_ID: int = 1282944839679344721
     TEMPORARY_ROLE_ID: int = 1164761892015833129
+    MISSING_ROLE_ID: int = 1289949397362409472
     INCARCERATED_ROLE_ID: int = 1247284720044085370
     AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
         default_factory=lambda: [1213490790341279754]
@@ -729,11 +730,6 @@ class Roles(interactions.Extension):
     ) -> Tuple[interactions.Embed, List[interactions.Button]]:
         approval_info: Approval = self.approval_counts.get(thread.id, Approval())
         approval_count: int = approval_info.approval_count
-        required_count: int = (
-            self.config.REQUIRED_REJECTIONS
-            if approval_count >= self.config.REQUIRED_APPROVALS
-            else self.config.REQUIRED_APPROVALS
-        )
 
         reviewers_text: str = (
             ",".join(f"<@{rid}>" for rid in sorted(approval_info.reviewers, key=int))
@@ -1196,6 +1192,81 @@ class Roles(interactions.Extension):
         await ctx.send(tuple(itertools.islice(choices, 25)))
 
     # Vetting commands
+
+    @module_group_vetting.subcommand(
+        "maintenance",
+        sub_cmd_description="Convert inactive members to missing members",
+    )
+    @error_handler
+    async def convert_inactive_members(self, ctx: interactions.SlashContext) -> None:
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            await self.send_error(
+                ctx, "You need Administrator permission to use this command"
+            )
+            return
+
+        await ctx.defer()
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
+            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
+
+            if not all((temp_role, missing_role)):
+                return await self.send_error(
+                    ctx,
+                    "Could not fetch required roles. Please check role IDs.",
+                )
+
+            cutoff = datetime.now() - timedelta(days=15)
+            converted_members = []
+            text_channels = {
+                channel
+                for channel in guild.channels
+                if isinstance(channel, interactions.GuildChannel)
+                and channel.type
+                in (
+                    interactions.ChannelType.GUILD_TEXT,
+                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
+                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
+                )
+            }
+
+            for member in temp_role.members:
+                try:
+                    messages = []
+                    for channel in text_channels:
+                        async for message in channel.history(limit=100):
+                            if message.author.id == member.id:
+                                messages.append(message.created_at)
+
+                    last_message_time = max(messages, default=None)
+
+                    if not last_message_time or last_message_time < cutoff:
+                        await member.remove_roles([temp_role])
+                        await member.add_roles([missing_role])
+                        converted_members.append(member.mention)
+
+                except Exception as e:
+                    logger.error(f"Error converting member {member.id}: {e}")
+                    continue
+
+            if converted_members:
+                await self.send_success(
+                    ctx,
+                    f"Successfully converted {len(converted_members)} inactive members to missing status:\n"
+                    + "\n".join(converted_members),
+                )
+            else:
+                await self.send_success(
+                    ctx, "No inactive members found that need to be converted."
+                )
+
+        except Exception as e:
+            logger.error(f"Error in convert_inactive_members: {e}")
+            await self.send_error(
+                ctx, f"An error occurred while converting members: {str(e)}"
+            )
 
     @module_group_vetting.subcommand(
         "assign", sub_cmd_description="Add roles to a member"
@@ -2162,7 +2233,6 @@ class Roles(interactions.Extension):
 
     async def release_prisoner(self, member_id: str, data: Dict[str, Any]) -> None:
         release_time: int = int(float(data.get("release_time", 0)))
-        current_time: int = int(time.time())
 
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
@@ -2222,9 +2292,7 @@ class Roles(interactions.Extension):
         current_time: float = time.monotonic()
 
         async with self._stats_lock:
-            user_stats = await self._process_user_stats(
-                author_id, message_content, current_time
-            )
+            await self._process_user_stats(author_id, message_content, current_time)
             await self._debounce_save_stats()
 
     async def _process_user_stats(
@@ -2738,7 +2806,7 @@ class Roles(interactions.Extension):
 
             logger.info(f"Selected role: {selected_role}")
 
-            if updated_roles := await self.update_custom_roles(
+            if await self.update_custom_roles(
                 member_id, {selected_role}, Action(action)
             ):
                 action_past = "added to" if action == "add" else "removed from"
