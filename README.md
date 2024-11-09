@@ -21,6 +21,9 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
 - Advanced message analysis system to detect spam and low-quality content
 - Dynamic threshold adjustment based on user behavior and message patterns
 - Automatic role progression based on activity and message quality
+- Intelligent message quality assessment using entropy and pattern analysis
+- Automatic conflict resolution for role assignments
+- Recovery streak system to reward consistent good behavior
 
 ## Usage
 
@@ -45,9 +48,13 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
     - `domicile` (string, optional): Specify domicile role
     - `status` (string, optional): Specify status role
 
-- `/roles vetting maintenance`: Convert inactive members to missing members
+- `/roles vetting inactive`: Convert inactive members to missing members
   - Requires administrator permissions
   - Automatically identifies and converts inactive members after 15 days
+
+- `/roles vetting conflicts`: Check and resolve role conflicts
+  - Requires administrator permissions
+  - Automatically resolves conflicting role assignments based on role priorities
 
 - `/roles servant view`: Display a paginated list of all servant roles and their members
 
@@ -72,6 +79,7 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
 ## Configuration
 
 Key configuration settings include:
+
 - `VETTING_FORUM_ID`: Discord channel ID for vetting threads
 - `VETTING_ROLE_IDS`: List of role IDs authorized to participate in vetting
 - `ELECTORAL_ROLE_ID`: Role granted upon successful vetting
@@ -92,3 +100,18 @@ Key configuration settings include:
 - `MAX_REPETITIONS`: Maximum allowed message repetitions
 - `DIGIT_THRESHOLD`: Threshold for excessive digit usage
 - `MIN_ENTROPY_THRESHOLD`: Minimum required message entropy
+
+The dynamic threshold adjustment based on:
+
+- User feedback scores
+- Message quality
+- Activity patterns
+- Recovery streaks
+- Violation history
+
+These thresholds automatically adjust to:
+
+- Reward consistent good behavior
+- Penalize repeated violations
+- Account for different language patterns
+- Adapt to user-specific communication styles
