@@ -1363,43 +1363,91 @@ class Roles(interactions.Extension):
         domicile: Optional[str] = None,
         status: Optional[str] = None,
     ) -> None:
-        kwargs = dict(
-            zip(("ideology", "domicile", "status"), (ideology, domicile, status))
-        )
-        role_ids = self.get_role_ids_to_assign(
-            dict(
-                filter(
-                    lambda x: isinstance(x, tuple) and x[1] is not None, kwargs.items()
+        if not (
+            self.validate_vetting_permissions(ctx)
+            and (
+                role_ids := self.get_role_ids_to_assign(
+                    {
+                        k: v
+                        for k, v in zip(
+                            ("ideology", "domicile", "status"),
+                            (ideology, domicile, status),
+                        )
+                        if v is not None
+                    }
                 )
             )
-        )
-
-        if not self.validate_vetting_permissions(ctx):
-            await self.send_error(
-                ctx, "You do not have the required permissions to use this command."
-            )
-            return
-
-        if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
-            await self.send_error(
-                ctx,
-                "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
-            )
-            return
-
-        if not role_ids:
-            role_types = tuple(k for k, v in kwargs.items() if v is not None)
-            await self.send_error(
-                ctx,
-                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, or status'}).",
-            )
-            return
-
-        if action == Action.ADD and await self.check_role_assignment_conflicts(
-            ctx, member, role_ids
+            and self.validate_vetting_permissions_with_roles(ctx, role_ids)
         ):
+            await self.send_error(
+                ctx,
+                next(
+                    msg
+                    for valid, msg in [
+                        (
+                            self.validate_vetting_permissions(ctx),
+                            "You do not have the required permissions to use this command.",
+                        ),
+                        (
+                            bool(role_ids),
+                            f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(k for k, v in dict(zip(('ideology', 'domicile', 'status'), (ideology, domicile, status))).items() if v is not None) or 'ideology, domicile, or status'}).",
+                        ),
+                        (
+                            self.validate_vetting_permissions_with_roles(ctx, role_ids),
+                            "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
+                        ),
+                    ]
+                    if not valid
+                ),
+            )
             return
+
+        member_role_ids = {role.id for role in member.roles}
+        ROLE_PRIORITIES = {
+            self.config.MISSING_ROLE_ID: 1,
+            self.config.INCARCERATED_ROLE_ID: 2,
+            self.config.ELECTORAL_ROLE_ID: 3,
+            self.config.APPROVED_ROLE_ID: 4,
+            self.config.TEMPORARY_ROLE_ID: 5,
+        }
+
+        if priority_roles := {
+            role_id: prio
+            for role_id, prio in (
+                (rid, ROLE_PRIORITIES[rid])
+                for rid in member_role_ids & ROLE_PRIORITIES.keys()
+            )
+        }:
+            if (
+                highest_priority_role := min(
+                    priority_roles.items(), key=lambda x: x[1]
+                )[0]
+            ) in (
+                self.config.MISSING_ROLE_ID,
+                self.config.INCARCERATED_ROLE_ID,
+            ):
+                await self.send_error(
+                    ctx,
+                    f"Cannot modify roles while member has the <@&{highest_priority_role}> role. Remove this role first.",
+                )
+                return
+
         if action == Action.ADD:
+            if await self.check_role_assignment_conflicts(ctx, member, role_ids):
+                return
+
+            roles_to_remove = {
+                existing_role_id
+                for existing_role_id in member_role_ids & ROLE_PRIORITIES.keys()
+                for new_role_id in role_ids & ROLE_PRIORITIES.keys()
+                if ROLE_PRIORITIES[new_role_id] < ROLE_PRIORITIES[existing_role_id]
+            }
+
+            if roles_to_remove:
+                await member.remove_roles(
+                    [role for role in member.roles if role.id in roles_to_remove]
+                )
+
             await self.assign_roles_to_member(ctx, member, list(role_ids))
         else:
             await self.remove_roles_from_member(ctx, member, role_ids)
@@ -2476,6 +2524,7 @@ class Roles(interactions.Extension):
         self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
+        self.check_role_conflicts.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
@@ -2483,6 +2532,7 @@ class Roles(interactions.Extension):
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
             self.check_incarcerated_members,
+            self.check_role_conflicts,
         )
         for task in tasks_to_stop:
             task.stop()
@@ -2511,6 +2561,92 @@ class Roles(interactions.Extension):
             self.processed_thread_ids.add(thread.id)
 
     # Tasks
+
+    @interactions.Task.create(interactions.IntervalTrigger(days=7))
+    async def check_role_conflicts(self) -> None:
+        ROLE_PRIORITIES = {
+            self.config.MISSING_ROLE_ID: 1,
+            self.config.INCARCERATED_ROLE_ID: 2,
+            self.config.ELECTORAL_ROLE_ID: 3,
+            self.config.APPROVED_ROLE_ID: 4,
+            self.config.TEMPORARY_ROLE_ID: 5,
+        }
+        BATCH_SIZE = 5
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            processed, conflicts = 0, 0
+            log_buffer = []
+
+            async for member in guild.get_members():
+                try:
+                    member_role_ids = {role.id for role in member.roles}
+                    priority_roles = {}
+
+                    for role_id, prio in ROLE_PRIORITIES.items():
+                        if role_id in member_role_ids:
+                            priority_roles[role_id] = prio
+
+                    if len(priority_roles) > 1:
+                        highest_prio = min(priority_roles.values())
+                        roles_to_remove = set()
+
+                        for role_id, prio in priority_roles.items():
+                            if prio > highest_prio:
+                                roles_to_remove.add(role_id)
+
+                        if roles_to_remove:
+                            roles_to_remove_objects = []
+                            for role in member.roles:
+                                if role.id in roles_to_remove:
+                                    roles_to_remove_objects.append(role)
+
+                            await member.remove_roles(roles_to_remove_objects)
+                            conflicts += 1
+                            log_buffer.append(
+                                f"Resolved role conflict for {member.mention}: "
+                                f"Removed {len(roles_to_remove)} conflicting role(s)"
+                            )
+
+                            if len(log_buffer) >= 5:
+                                await self.send_success(
+                                    None, "\n".join(log_buffer), log_to_channel=True
+                                )
+                                log_buffer.clear()
+
+                except Exception as e:
+                    logger.error(
+                        f"Error processing member {member.id}: {str(e)}\n"
+                        f"{traceback.format_exc()}"
+                    )
+
+                processed += 1
+
+                if processed % BATCH_SIZE == 0:
+                    await asyncio.sleep(5)
+
+            if log_buffer:
+                await self.send_success(
+                    None, "\n".join(log_buffer), log_to_channel=True
+                )
+
+            if conflicts:
+                await self.send_success(
+                    None,
+                    f"Role conflict check completed: Processed {processed} members, "
+                    f"resolved {conflicts} role conflicts.",
+                    log_to_channel=True,
+                )
+
+            logger.info(
+                f"Role conflict check completed: Processed {processed} members, "
+                f"resolved {conflicts} role conflicts."
+            )
+
+        except Exception as e:
+            error_msg = f"Critical error in role conflict check task: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            await self.send_error(None, error_msg, log_to_channel=True)
 
     @interactions.Task.create(interactions.IntervalTrigger(days=7))
     async def cleanup_old_locks(self) -> None:
