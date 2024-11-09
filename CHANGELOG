@@ -2,6 +2,12 @@
 
 ### Added
 - Maintenance command for converting inactive members
+- Role conflict check task
+- Activity check for role conversion logic
+
+### Changed
+- Limited the number of concurrent executions of `/roles vetting maintenance` to 1
+- Streamlined role assignment validation
 
 ## 2024-11-01
 
