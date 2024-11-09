@@ -1,19 +1,23 @@
+## 2024-11-09
+
+### Added
+- Maintenance command for converting inactive members
+
 ## 2024-11-01
 
 ### Changed
-- Refactored `_file_operation` to use `AsyncGenerator` and improved validation logic
-- Enhanced `add_field` method to handle long values and maintain character limits
-- Updated statistics handling to use `Counter`
+- Refactored `_file_operation` to utilize `AsyncGenerator`
+- Enhanced `add_field` for handling long values with character limits
+- Updated statistics handling to leverage `Counter`
 
 ## 2024-10-30
 
 ### Added
-- Added recovery streaks and violation history tracking
-- Implemented adaptive threshold adjustments with decay
+- Recovery streaks and violation history tracking
+- Adaptive threshold adjustments with decay mechanism
 
 ### Changed
-- Replace Final type hints with regular type hints where unnecessary
-- Enhance message violation detection with pattern recognition
+- Replaced `Final` type hints with regular type hints where unnecessary
 
 ### Fixed
 - Corrected f-string syntax
@@ -21,97 +25,55 @@
 ## 2024-10-26
 
 ### Added
-- Added debug commands for configuration inspection
+- Debug commands for configuration inspection
 
 ### Changed
-- Removed non-ASCII character detection system and related thresholds
-- Removed profanity and spam detection methods
-- Changed concurrent role operations to sequential
+- Streamlined concurrent role operations to sequential execution
 - Updated approval/reviewer message formatting
+
+### Removed
+- Non-ASCII character detection system and related thresholds
+- Profanity and spam detection
 
 ## 2024-10-25
 
 ### Added
-- Implemented message validation with schema verification
-- Added loguru for enhanced logging capabilities
-- Added numpy for numerical computations
+- Message validation with schema verification
 
-### Changed
-- Migrated from stdlib logging to loguru framework for improved formatting
-- Removed log file compression
-- Enhanced debugging with better traceback information
+### Removed
+- Log file compression
 
 ## 2024-10-19
 
 ### Changed
-- Replaced explicit loops with list comprehensions and generators
-- Refactored approval/rejection logic for maintainability
+- Optimized code with list comprehensions and generators
+- Refactored approval/rejection logic
 - Implemented builder pattern for embed creation
-- Updated log directory structure
-- Improved memory efficiency for large role sets
+- Restructured log directory organization
 - Separated business logic from presentation layer
-- Added proper error handling and validation
 
 ## 2024-10-18
 
 ### Added
-- Added `log_to_channel` parameter for configurable notification routing
+- `log_to_channel` parameter for configurable notification routing
 
 ### Fixed
-- Added proper role hierarchy checks in vetting system
-- Fixed permission inheritance edge cases
-- Resolved `ApprovalInfo` serialization issues
+- Implemented proper role hierarchy checks
+- Resolved permission inheritance edge
+- Fixed `ApprovalInfo` serialization
 - Corrected type hints and validation
 
 ## 2024-10-17
 
 ### Added
-- Updated `assignable_roles` in vetting.json with new categories
-- Implemented role hierarchy validation system
+- Role hierarchy validation
 
 ### Changed
 - Implemented caching for frequently accessed roles
 - Reduced database queries for role operations
-- Migrated from regex library to standard re module
-- Updated pattern matching implementation
-
-## 2024-10-15
-
-### Added
-- Introduced vetting.json for centralized configuration
-- Added orjson dependency
-
-### Fixed
-- Implemented proper JSON parsing error handling
-- Added validation for required data fields
-- Improved performance with orjson replacement
-- Reduced memory usage in parsing operations
-
-### Changed
-- Removed deprecated configuration files
-- Updated minimum Python version to 3.9
-- Updated package versions for compatibility
 
 ## 2024-10-14
-
-### Added
-- Created requirements.txt
-- Added initial documentation
-- Configured development environment
 
 ### Changed
 - Implemented MVC architectural pattern
 - Separated data, presentation, and business logic
-- Completed initial project structure setup
-
-## Migration Notes
-
-### Upgrading from pre-2024-10-15
-- Replace regex with standard re module
-- Update JSON parsing to use orjson
-- Review role management configuration
-
-### Upgrading to 2024-10-15
-- Migrate logging to loguru
-- Install numpy and loguru dependencies
-- Update message processing configuration if using custom thresholds
