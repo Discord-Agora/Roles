@@ -1198,6 +1198,7 @@ class Roles(interactions.Extension):
         sub_cmd_description="Convert inactive members to missing members",
     )
     @error_handler
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
     async def convert_inactive_members(self, ctx: interactions.SlashContext) -> None:
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
             await self.send_error(
