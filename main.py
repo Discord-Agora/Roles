@@ -1220,6 +1220,7 @@ class Roles(interactions.Extension):
                 )
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=15)
+            grace_period = datetime.now(timezone.utc) - timedelta(days=1)
             converted_members = []
 
             text_channels = {
@@ -1237,74 +1238,92 @@ class Roles(interactions.Extension):
             temp_members = list(temp_role.members)
             total_members = len(temp_members)
             processed = 0
+            skipped = 0
 
-            BATCH_SIZE = 8
-            ROLE_CHANGE_INTERVAL = 0.5
+            BATCH_SIZE = 10
             REPORT_THRESHOLD = 10
-            BATCH_COOLDOWN = 5.0
+            BATCH_COOLDOWN = 10.0
+            PROGRESS_UPDATE_INTERVAL = 60.0
+            last_progress_update = time.monotonic()
 
             for i in range(0, total_members, BATCH_SIZE):
                 batch = temp_members[i : i + BATCH_SIZE]
                 batch_start = time.monotonic()
 
                 for member in batch:
+                    if member.joined_at and member.joined_at > grace_period:
+                        skipped += 1
+                        processed += 1
+                        continue
+
                     try:
                         should_convert = await self._check_member_activity(
                             member, text_channels, cutoff
                         )
 
                         if should_convert:
-                            try:
-                                new_roles = [
-                                    role.id
-                                    for role in member.roles
-                                    if role != temp_role
-                                ]
-                                new_roles.append(missing_role.id)
-                                await member.edit(
-                                    roles=new_roles, reason="Converting inactive member"
-                                )
-                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+                            new_roles = [
+                                role.id for role in member.roles if role != temp_role
+                            ]
+                            new_roles.append(missing_role.id)
 
-                                converted_members.append(member.mention)
-                                logger.info(
-                                    f"Successfully converted member {member.id}"
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to update roles for {member.id}: {e}"
-                                )
-                                continue
+                            await member.edit(
+                                roles=new_roles, reason="Converting inactive member"
+                            )
+                            await asyncio.sleep(1.0)
+
+                            converted_members.append(member.mention)
+                            logger.info(f"Updated roles for member {member.id}")
+
+                        processed += 1
+
+                        if len(converted_members) >= REPORT_THRESHOLD:
+                            await self.send_success(
+                                ctx,
+                                f"- Processed: {processed}/{total_members} members\n"
+                                f"- Skipped (grace period): {skipped}\n"
+                                f"- Recently converted members: "
+                                + ", ".join(converted_members),
+                            )
+                            converted_members = []
+                            await asyncio.sleep(1.0)
+
+                        current_time = time.monotonic()
+                        if (
+                            current_time - last_progress_update
+                            >= PROGRESS_UPDATE_INTERVAL
+                        ):
+                            await self.send_success(
+                                ctx,
+                                f"- Processed: {processed}/{total_members} members\n"
+                                f"- Skipped (grace period): {skipped}",
+                            )
+                            last_progress_update = current_time
 
                     except Exception as e:
                         logger.error(f"Error processing member {member.id}: {e}")
                         continue
-
-                processed += len(batch)
-
-                if len(converted_members) >= REPORT_THRESHOLD:
-                    await self.send_success(
-                        ctx,
-                        f"- Processed: {processed}/{total_members} members\n- Recently converted members: "
-                        + ", ".join(converted_members),
-                    )
-                    converted_members = []
-                    await asyncio.sleep(0.5)
 
                 elapsed = time.monotonic() - batch_start
                 if elapsed < BATCH_COOLDOWN:
                     await asyncio.sleep(BATCH_COOLDOWN - elapsed)
 
             if converted_members:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 await self.send_success(
                     ctx,
-                    f"- Total processed: {processed}/{total_members}\n- Last converted members: "
-                    + ", ".join(converted_members),
+                    f"- Total processed: {processed}/{total_members}\n"
+                    f"- Skipped (grace period): {skipped}\n"
+                    f"- Last converted members: " + ", ".join(converted_members),
                 )
 
-            await asyncio.sleep(0.5)
-            await self.send_success(ctx, f"- Total members processed: {total_members}")
+            await asyncio.sleep(1.0)
+            await self.send_success(
+                ctx,
+                f"- Total members processed: {total_members}\n"
+                f"- Members skipped (grace period): {skipped}\n"
+                f"- Members converted: {processed - skipped}",
+            )
 
         except Exception as e:
             logger.error(f"Error in convert_inactive_members: {e}")
@@ -1381,7 +1400,7 @@ class Roles(interactions.Extension):
             self.config.TEMPORARY_ROLE_ID: 5,
         }
         BATCH_SIZE = 8
-        ROLE_CHANGE_INTERVAL = 0.5
+        ROLE_CHANGE_INTERVAL = 1.0
         REPORT_INTERVAL = 5.0
 
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
@@ -1448,7 +1467,7 @@ class Roles(interactions.Extension):
                                         )
                                         log_buffer = []
                                         last_report_time = current_time
-                                        await asyncio.sleep(0.5)
+                                        await asyncio.sleep(ROLE_CHANGE_INTERVAL)
 
                     except Exception as e:
                         logger.error(
@@ -1463,11 +1482,11 @@ class Roles(interactions.Extension):
                     await asyncio.sleep(REPORT_INTERVAL - elapsed)
 
             if log_buffer:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
                 await self.send_success(None, "\n".join(log_buffer))
 
             if conflicts:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
                 await self.send_success(
                     None,
                     f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
