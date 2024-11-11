@@ -954,7 +954,7 @@ class Roles(interactions.Extension):
         async def check_channel(channel):
             async with sem:
                 try:
-                    async for message in channel.history(limit=15):
+                    async for message in channel.history(limit=1):
                         if message.author.id == member.id:
                             return message.created_at
                 except Exception as e:
