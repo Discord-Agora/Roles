@@ -1,3 +1,13 @@
+## 2024-11-11
+
+### Added
+- Conditional threshold adjustment based on validation flags
+- Toggle command to enable/disable validation features
+
+### Changed
+- Improved stats cleanup with periodic task
+- Removed concurrent validation in favor of sequential checks
+
 ## 2024-11-09
 
 ### Added
