@@ -73,6 +73,7 @@ file_handler = RotatingFileHandler(
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
+
 # Model
 
 
@@ -308,6 +309,7 @@ class Message:
     message: str
     user_stats: Dict[str, Any]
     config: Dict[str, float]
+    validation_flags: Dict[str, bool]
     _message_length: int = field(init=False, repr=False)
     _char_frequencies: Counter = field(init=False, repr=False)
     _is_chinese: bool = field(init=False, repr=False)
@@ -320,26 +322,32 @@ class Message:
             self,
             "_is_chinese",
             any(
-                map(
-                    lambda c: "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf",
-                    msg,
-                )
+                ord(c) in range(0x4E00, 0x9FFF + 1)
+                or ord(c) in range(0x3400, 0x4DBF + 1)
+                for c in msg
             ),
         )
 
     def analyze(self) -> frozenset[str]:
         violations: set[str] = set()
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                "message_repetition": executor.submit(self._check_repetition),
-                "excessive_digits": executor.submit(self._check_digit_ratio),
-                "low_entropy": executor.submit(self._check_entropy),
-            }
-            violations.update(k for k, f in futures.items() if f.result())
 
-        self.user_stats["feedback_score"] = max(
-            -5, min(5, self.user_stats.get("feedback_score", 0) - len(violations))
-        )
+        if self.validation_flags["repetition"]:
+            if self._check_repetition():
+                violations.add("message_repetition")
+
+        if self.validation_flags["digit_ratio"]:
+            if self._check_digit_ratio():
+                violations.add("excessive_digits")
+
+        if self.validation_flags["entropy"]:
+            if self._check_entropy():
+                violations.add("low_entropy")
+
+        if self.validation_flags["feedback"]:
+            self.user_stats["feedback_score"] = max(
+                -5, min(5, self.user_stats.get("feedback_score", 0) - len(violations))
+            )
+
         return frozenset(violations)
 
     def _check_repetition(self) -> bool:
@@ -347,28 +355,28 @@ class Message:
         if self.message == last_msg:
             rep_count = self.user_stats.get("repetition_count", 0) + 1
             self.user_stats["repetition_count"] = rep_count
-            return rep_count >= self.config["MAX_REPETITIONS"]
+            return rep_count >= self.config["MAX_REPEATED_MESSAGES"]
         self.user_stats.update({"repetition_count": 0, "last_message": self.message})
         return False
 
     def _check_digit_ratio(self) -> bool:
         if not self._message_length:
             return False
-        threshold = self.config["DIGIT_THRESHOLD"] * (1.5 if self._is_chinese else 1.0)
-        digit_count = sum(
-            freq for char, freq in self._char_frequencies.items() if char.isdigit()
+        threshold = self.config["DIGIT_RATIO_THRESHOLD"] * (
+            1.5 if self._is_chinese else 1.0
         )
+        digit_count = sum(1 for c in self.message if c.isdigit())
         return (digit_count / self._message_length) > threshold
 
     def _check_entropy(self) -> bool:
         if not self._message_length:
             return False
 
-        freqs = np.fromiter(self._char_frequencies.values(), dtype=np.float64)
+        freqs = np.array(list(self._char_frequencies.values()), dtype=np.float64)
         probs = freqs / self._message_length
         entropy = -np.sum(probs * np.log2(probs))
 
-        base_threshold = self.config["MIN_ENTROPY_THRESHOLD"] * (
+        base_threshold = self.config["MIN_MESSAGE_ENTROPY"] * (
             0.7 if self._is_chinese else 1.0
         )
         length_adjustment = (np.log2(max(self._message_length, 2)) / 10) * (
@@ -391,15 +399,21 @@ class Roles(interactions.Extension):
         self.stats: Counter[str] = Counter()
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, Approval] = {}
-        self.member_lock_map: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
-        self._stats_lock: asyncio.Lock = asyncio.Lock()
-        self._save_stats_task: asyncio.Task | None = None
-
-        self.dynamic_config: Dict[str, Union[float, int]] = {
-            "MESSAGE_RATE_WINDOW": 60.0,
-            "MAX_REPETITIONS": 3,
-            "DIGIT_THRESHOLD": 0.5,
-            "MIN_ENTROPY_THRESHOLD": 1.5,
+        self.member_role_locks: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
+        self.stats_lock: asyncio.Lock = asyncio.Lock()
+        self.stats_save_task: asyncio.Task | None = None
+        self.message_monitoring_enabled = False
+        self.validation_flags = {
+            "repetition": True,
+            "digit_ratio": True,
+            "entropy": True,
+            "feedback": True,
+        }
+        self.limit_config: Dict[str, Union[float, int]] = {
+            "MESSAGE_WINDOW_SECONDS": 60.0,
+            "MAX_REPEATED_MESSAGES": 3,
+            "DIGIT_RATIO_THRESHOLD": 0.5,
+            "MIN_MESSAGE_ENTROPY": 1.5,
         }
 
         self.cache = TTLCache(maxsize=100, ttl=300)
@@ -471,7 +485,7 @@ class Roles(interactions.Extension):
             )
         )
 
-    def _validate_roles(
+    def has_required_roles(
         self,
         ctx: interactions.ContextType,
         required_role_ids: frozenset[int],
@@ -490,12 +504,12 @@ class Roles(interactions.Extension):
         )
 
     def validate_vetting_permissions(self, ctx: interactions.ContextType) -> bool:
-        return self._validate_roles(ctx, frozenset(self.config.VETTING_ROLE_IDS))
+        return self.has_required_roles(ctx, frozenset(self.config.VETTING_ROLE_IDS))
 
     def validate_vetting_permissions_with_roles(
         self, ctx: interactions.ContextType, role_ids_to_add: Iterable[int]
     ) -> bool:
-        return self._validate_roles(
+        return self.has_required_roles(
             ctx,
             frozenset(self.config.VETTING_ROLE_IDS),
             frozenset(role_ids_to_add),
@@ -503,12 +517,12 @@ class Roles(interactions.Extension):
         )
 
     def validate_custom_permissions(self, ctx: interactions.ContextType) -> bool:
-        return self._validate_roles(
+        return self.has_required_roles(
             ctx, frozenset(self.config.AUTHORIZED_CUSTOM_ROLE_IDS)
         )
 
     def validate_penitentiary_permissions(self, ctx: interactions.ContextType) -> bool:
-        return self._validate_roles(
+        return self.has_required_roles(
             ctx, frozenset(self.config.AUTHORIZED_PENITENTIARY_ROLE_IDS)
         )
 
@@ -775,6 +789,314 @@ class Roles(interactions.Extension):
     # Debug commands
 
     @module_group_debug.subcommand(
+        "inactive",
+        sub_cmd_description="Convert inactive members to missing members",
+    )
+    @error_handler
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            await self.send_error(
+                ctx, "You need Administrator permission to use this command."
+            )
+            return
+
+        await ctx.defer()
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
+            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
+
+            if not all((temp_role, missing_role)):
+                return await self.send_error(
+                    ctx,
+                    f"Required roles could not be found. Please verify that both <@&{self.config.TEMPORARY_ROLE_ID}> and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
+                )
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=15)
+            grace_period = datetime.now(timezone.utc) - timedelta(days=1)
+            converted_members = []
+
+            text_channels = {
+                channel
+                for channel in guild.channels
+                if isinstance(channel, interactions.GuildChannel)
+                and channel.type
+                in (
+                    interactions.ChannelType.GUILD_TEXT,
+                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
+                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
+                )
+            }
+
+            temp_members = list(temp_role.members)
+            total_members = len(temp_members)
+            processed = 0
+            skipped = 0
+
+            BATCH_SIZE = 10
+            REPORT_THRESHOLD = 10
+            BATCH_COOLDOWN = 10.0
+            PROGRESS_UPDATE_INTERVAL = 60.0
+            last_progress_update = time.monotonic()
+
+            for i in range(0, total_members, BATCH_SIZE):
+                batch = temp_members[i : i + BATCH_SIZE]
+                batch_start = time.monotonic()
+
+                for member in batch:
+                    if member.joined_at and member.joined_at > grace_period:
+                        skipped += 1
+                        processed += 1
+                        continue
+
+                    try:
+                        should_convert = await self.check_member_last_activity(
+                            member, text_channels, cutoff
+                        )
+
+                        if should_convert:
+                            new_roles = [
+                                role.id for role in member.roles if role != temp_role
+                            ]
+                            new_roles.append(missing_role.id)
+
+                            await member.edit(
+                                roles=new_roles, reason="Converting inactive member"
+                            )
+                            await asyncio.sleep(1.0)
+
+                            converted_members.append(member.mention)
+                            logger.info(f"Updated roles for member {member.id}")
+
+                        processed += 1
+
+                        if len(converted_members) >= REPORT_THRESHOLD:
+                            await self.send_success(
+                                ctx,
+                                f"- Processed: {processed}/{total_members} members\n"
+                                f"- Skipped (grace period): {skipped}\n"
+                                f"- Recently converted members: "
+                                + ", ".join(converted_members),
+                            )
+                            converted_members = []
+                            await asyncio.sleep(1.0)
+
+                        current_time = time.monotonic()
+                        if (
+                            current_time - last_progress_update
+                            >= PROGRESS_UPDATE_INTERVAL
+                        ):
+                            await self.send_success(
+                                ctx,
+                                f"- Processed: {processed}/{total_members} members\n"
+                                f"- Skipped (grace period): {skipped}",
+                            )
+                            last_progress_update = current_time
+
+                    except Exception as e:
+                        logger.error(f"Error processing member {member.id}: {e}")
+                        continue
+
+                elapsed = time.monotonic() - batch_start
+                if elapsed < BATCH_COOLDOWN:
+                    await asyncio.sleep(BATCH_COOLDOWN - elapsed)
+
+            if converted_members:
+                await asyncio.sleep(1.0)
+                await self.send_success(
+                    ctx,
+                    f"- Total processed: {processed}/{total_members}\n"
+                    f"- Skipped (grace period): {skipped}\n"
+                    f"- Last converted members: " + ", ".join(converted_members),
+                )
+
+            await asyncio.sleep(1.0)
+            await self.send_success(
+                ctx,
+                f"- Total members processed: {total_members}\n"
+                f"- Members skipped (grace period): {skipped}\n"
+                f"- Members converted: {processed - skipped}",
+            )
+
+        except Exception as e:
+            logger.error(f"Error in process_inactive_members: {e}")
+            await self.send_error(
+                ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
+            )
+
+    async def check_member_last_activity(
+        self,
+        member: interactions.Member,
+        text_channels: set[interactions.GuildChannel],
+        cutoff: datetime,
+    ) -> bool:
+        try:
+            last_message_time = await self._get_last_message_time(
+                member, text_channels, cutoff
+            )
+            if last_message_time and last_message_time.tzinfo is None:
+                last_message_time = last_message_time.replace(tzinfo=timezone.utc)
+            return not last_message_time or last_message_time < cutoff
+        except Exception as e:
+            logger.error(f"Error checking activity for member {member.id}: {e}")
+            raise
+
+    async def _get_last_message_time(
+        self,
+        member: interactions.Member,
+        text_channels: set[interactions.GuildChannel],
+        cutoff: datetime,
+    ) -> Optional[datetime]:
+        sem = asyncio.Semaphore(5)
+
+        async def check_channel(channel):
+            async with sem:
+                try:
+                    async for message in channel.history(limit=15):
+                        if message.author.id == member.id:
+                            return message.created_at
+                except Exception as e:
+                    logger.error(f"Error checking channel {channel.id}: {e}")
+                return None
+
+        chunk_size = 15
+        last_times = []
+
+        for i in range(0, len(text_channels), chunk_size):
+            channel_chunk = list(text_channels)[i : i + chunk_size]
+            tasks = [check_channel(channel) for channel in channel_chunk]
+
+            for task in tasks:
+                try:
+                    result = await task
+                    if isinstance(result, datetime):
+                        if result > cutoff:
+                            return result
+                        last_times.append(result)
+                except Exception as e:
+                    logger.error(f"Error in channel check task: {e}")
+                await asyncio.sleep(0.2)
+
+        return max(last_times, default=None)
+
+    @module_group_debug.subcommand(
+        "conflicts", sub_cmd_description="Check and resolve role conflicts"
+    )
+    @error_handler
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
+        ROLE_PRIORITIES = {
+            self.config.MISSING_ROLE_ID: 1,
+            self.config.INCARCERATED_ROLE_ID: 2,
+            self.config.ELECTORAL_ROLE_ID: 3,
+            self.config.APPROVED_ROLE_ID: 4,
+            self.config.TEMPORARY_ROLE_ID: 5,
+        }
+        BATCH_SIZE = 8
+        ROLE_CHANGE_INTERVAL = 1.0
+        REPORT_INTERVAL = 5.0
+
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            await self.send_error(
+                ctx,
+                "You need Administrator permission to check role conflicts.",
+            )
+            return
+
+        await ctx.defer()
+
+        try:
+            processed, conflicts = 0, 0
+            log_buffer = []
+            last_report_time = time.monotonic()
+
+            member_chunks = [
+                list(ctx.guild.members)[i : i + BATCH_SIZE]
+                for i in range(0, len(ctx.guild.members), BATCH_SIZE)
+            ]
+
+            for chunk in member_chunks:
+                chunk_start = time.monotonic()
+
+                for member in chunk:
+                    try:
+                        member_role_ids = {role.id for role in member.roles}
+                        priority_roles = {
+                            role_id: prio
+                            for role_id, prio in ROLE_PRIORITIES.items()
+                            if role_id in member_role_ids
+                        }
+
+                        if len(priority_roles) > 1:
+                            highest_prio = min(priority_roles.values())
+                            roles_to_remove = {
+                                role_id
+                                for role_id, prio in priority_roles.items()
+                                if prio > highest_prio
+                            }
+
+                            if roles_to_remove:
+                                roles_to_keep = [
+                                    role.id
+                                    for role in member.roles
+                                    if role.id not in roles_to_remove
+                                ]
+                                await member.edit(
+                                    roles=roles_to_keep,
+                                    reason="Resolving role priority conflicts",
+                                )
+                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+
+                                conflicts += 1
+                                log_buffer.append(
+                                    f"- Member: {member.mention}\n- Removed roles: {len(roles_to_remove)}"
+                                )
+
+                                current_time = time.monotonic()
+                                if current_time - last_report_time >= REPORT_INTERVAL:
+                                    if log_buffer:
+                                        await self.send_success(
+                                            None, "\n".join(log_buffer)
+                                        )
+                                        log_buffer = []
+                                        last_report_time = current_time
+                                        await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing member {member.id}: {str(e)}\n"
+                            f"{traceback.format_exc()}"
+                        )
+
+                    processed += 1
+
+                elapsed = time.monotonic() - chunk_start
+                if elapsed < REPORT_INTERVAL:
+                    await asyncio.sleep(REPORT_INTERVAL - elapsed)
+
+            if log_buffer:
+                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+                await self.send_success(None, "\n".join(log_buffer))
+
+            if conflicts:
+                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
+                await self.send_success(
+                    None,
+                    f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
+                )
+
+            logger.info(
+                f"- Members processed: {processed}\n- Conflicts resolved: {conflicts}"
+            )
+
+        except Exception as e:
+            error_msg = f"Critical error in role conflict check:\n{str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            await self.send_error(None, error_msg, log_to_channel=True)
+
+    @module_group_debug.subcommand(
         "view", sub_cmd_description="View configuration files"
     )
     @interactions.slash_option(
@@ -822,7 +1144,7 @@ class Roles(interactions.Extension):
 
     async def _get_config_data(self, config: str) -> Optional[Any]:
         return (
-            self.dynamic_config
+            self.limit_config
             if config == "dynamic"
             else (
                 await self.model.load_data(
@@ -1194,312 +1516,64 @@ class Roles(interactions.Extension):
     # Vetting commands
 
     @module_group_vetting.subcommand(
-        "inactive",
-        sub_cmd_description="Convert inactive members to missing members",
+        "toggle",
+        sub_cmd_description="Configure message monitoring and validation settings",
+    )
+    @interactions.slash_option(
+        name="type",
+        argument_name="setting_type",
+        description="Type of setting to configure",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        choices=[
+            *(
+                interactions.SlashCommandChoice(
+                    name=n.replace("_", " ").title(), value=v
+                )
+                for n, v in (
+                    ("Message Monitoring", "monitoring"),
+                    ("Message Repetition", "repetition"),
+                    ("Digit Ratio", "digit_ratio"),
+                    ("Message Entropy", "entropy"),
+                    ("Feedback System", "feedback"),
+                )
+            )
+        ],
+    )
+    @interactions.slash_option(
+        name="state",
+        description="Enable or disable this setting",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        choices=[
+            *(
+                interactions.SlashCommandChoice(name=n, value=v)
+                for n, v in (("Enable", "enable"), ("Disable", "disable"))
+            )
+        ],
     )
     @error_handler
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def convert_inactive_members(self, ctx: interactions.SlashContext) -> None:
-        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
-            await self.send_error(
-                ctx, "You need Administrator permission to use this command."
-            )
-            return
-
-        await ctx.defer()
-
-        try:
-            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
-            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
-
-            if not all((temp_role, missing_role)):
-                return await self.send_error(
-                    ctx,
-                    f"Required roles could not be found. Please verify that both <@&{self.config.TEMPORARY_ROLE_ID}> and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
-                )
-
-            cutoff = datetime.now(timezone.utc) - timedelta(days=15)
-            grace_period = datetime.now(timezone.utc) - timedelta(days=1)
-            converted_members = []
-
-            text_channels = {
-                channel
-                for channel in guild.channels
-                if isinstance(channel, interactions.GuildChannel)
-                and channel.type
-                in (
-                    interactions.ChannelType.GUILD_TEXT,
-                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
-                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
-                )
-            }
-
-            temp_members = list(temp_role.members)
-            total_members = len(temp_members)
-            processed = 0
-            skipped = 0
-
-            BATCH_SIZE = 10
-            REPORT_THRESHOLD = 10
-            BATCH_COOLDOWN = 10.0
-            PROGRESS_UPDATE_INTERVAL = 60.0
-            last_progress_update = time.monotonic()
-
-            for i in range(0, total_members, BATCH_SIZE):
-                batch = temp_members[i : i + BATCH_SIZE]
-                batch_start = time.monotonic()
-
-                for member in batch:
-                    if member.joined_at and member.joined_at > grace_period:
-                        skipped += 1
-                        processed += 1
-                        continue
-
-                    try:
-                        should_convert = await self._check_member_activity(
-                            member, text_channels, cutoff
-                        )
-
-                        if should_convert:
-                            new_roles = [
-                                role.id for role in member.roles if role != temp_role
-                            ]
-                            new_roles.append(missing_role.id)
-
-                            await member.edit(
-                                roles=new_roles, reason="Converting inactive member"
-                            )
-                            await asyncio.sleep(1.0)
-
-                            converted_members.append(member.mention)
-                            logger.info(f"Updated roles for member {member.id}")
-
-                        processed += 1
-
-                        if len(converted_members) >= REPORT_THRESHOLD:
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}\n"
-                                f"- Recently converted members: "
-                                + ", ".join(converted_members),
-                            )
-                            converted_members = []
-                            await asyncio.sleep(1.0)
-
-                        current_time = time.monotonic()
-                        if (
-                            current_time - last_progress_update
-                            >= PROGRESS_UPDATE_INTERVAL
-                        ):
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}",
-                            )
-                            last_progress_update = current_time
-
-                    except Exception as e:
-                        logger.error(f"Error processing member {member.id}: {e}")
-                        continue
-
-                elapsed = time.monotonic() - batch_start
-                if elapsed < BATCH_COOLDOWN:
-                    await asyncio.sleep(BATCH_COOLDOWN - elapsed)
-
-            if converted_members:
-                await asyncio.sleep(1.0)
-                await self.send_success(
-                    ctx,
-                    f"- Total processed: {processed}/{total_members}\n"
-                    f"- Skipped (grace period): {skipped}\n"
-                    f"- Last converted members: " + ", ".join(converted_members),
-                )
-
-            await asyncio.sleep(1.0)
-            await self.send_success(
-                ctx,
-                f"- Total members processed: {total_members}\n"
-                f"- Members skipped (grace period): {skipped}\n"
-                f"- Members converted: {processed - skipped}",
+    async def toggle_settings(
+        self, ctx: interactions.SlashContext, setting_type: str, state: str
+    ) -> None:
+        if not self.validate_vetting_permissions(ctx):
+            return await self.send_error(
+                ctx, "You do not have the required permissions to use this command."
             )
 
-        except Exception as e:
-            logger.error(f"Error in convert_inactive_members: {e}")
-            await self.send_error(
-                ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
-            )
+        enabled = state == "enable"
 
-    async def _check_member_activity(
-        self,
-        member: interactions.Member,
-        text_channels: set[interactions.GuildChannel],
-        cutoff: datetime,
-    ) -> bool:
-        try:
-            last_message_time = await self._get_last_message_time(
-                member, text_channels, cutoff
-            )
-            if last_message_time and last_message_time.tzinfo is None:
-                last_message_time = last_message_time.replace(tzinfo=timezone.utc)
-            return not last_message_time or last_message_time < cutoff
-        except Exception as e:
-            logger.error(f"Error checking activity for member {member.id}: {e}")
-            raise
+        if setting_type == "monitoring":
+            self.message_monitoring_enabled = enabled
+            setting_name = "Message monitoring"
+        else:
+            self.validation_flags[setting_type] = enabled
+            setting_name = setting_type.replace("_", " ").title()
 
-    async def _get_last_message_time(
-        self,
-        member: interactions.Member,
-        text_channels: set[interactions.GuildChannel],
-        cutoff: datetime,
-    ) -> Optional[datetime]:
-        sem = asyncio.Semaphore(5)
-
-        async def check_channel(channel):
-            async with sem:
-                try:
-                    async for message in channel.history(limit=15):
-                        if message.author.id == member.id:
-                            return message.created_at
-                except Exception as e:
-                    logger.error(f"Error checking channel {channel.id}: {e}")
-                return None
-
-        chunk_size = 15
-        last_times = []
-
-        for i in range(0, len(text_channels), chunk_size):
-            channel_chunk = list(text_channels)[i : i + chunk_size]
-            tasks = [check_channel(channel) for channel in channel_chunk]
-
-            for task in tasks:
-                try:
-                    result = await task
-                    if isinstance(result, datetime):
-                        if result > cutoff:
-                            return result
-                        last_times.append(result)
-                except Exception as e:
-                    logger.error(f"Error in channel check task: {e}")
-                await asyncio.sleep(0.2)
-
-        return max(last_times, default=None)
-
-    @module_group_vetting.subcommand(
-        "conflicts", sub_cmd_description="Check and resolve role conflicts"
-    )
-    @error_handler
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
-        ROLE_PRIORITIES = {
-            self.config.MISSING_ROLE_ID: 1,
-            self.config.INCARCERATED_ROLE_ID: 2,
-            self.config.ELECTORAL_ROLE_ID: 3,
-            self.config.APPROVED_ROLE_ID: 4,
-            self.config.TEMPORARY_ROLE_ID: 5,
-        }
-        BATCH_SIZE = 8
-        ROLE_CHANGE_INTERVAL = 1.0
-        REPORT_INTERVAL = 5.0
-
-        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
-            await self.send_error(
-                ctx,
-                "You need Administrator permission to check role conflicts.",
-            )
-            return
-
-        await ctx.defer()
-
-        try:
-            processed, conflicts = 0, 0
-            log_buffer = []
-            last_report_time = time.monotonic()
-
-            member_chunks = [
-                list(ctx.guild.members)[i : i + BATCH_SIZE]
-                for i in range(0, len(ctx.guild.members), BATCH_SIZE)
-            ]
-
-            for chunk in member_chunks:
-                chunk_start = time.monotonic()
-
-                for member in chunk:
-                    try:
-                        member_role_ids = {role.id for role in member.roles}
-                        priority_roles = {
-                            role_id: prio
-                            for role_id, prio in ROLE_PRIORITIES.items()
-                            if role_id in member_role_ids
-                        }
-
-                        if len(priority_roles) > 1:
-                            highest_prio = min(priority_roles.values())
-                            roles_to_remove = {
-                                role_id
-                                for role_id, prio in priority_roles.items()
-                                if prio > highest_prio
-                            }
-
-                            if roles_to_remove:
-                                roles_to_keep = [
-                                    role.id
-                                    for role in member.roles
-                                    if role.id not in roles_to_remove
-                                ]
-                                await member.edit(
-                                    roles=roles_to_keep,
-                                    reason="Resolving role priority conflicts",
-                                )
-                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-
-                                conflicts += 1
-                                log_buffer.append(
-                                    f"- Member: {member.mention}\n- Removed roles: {len(roles_to_remove)}"
-                                )
-
-                                current_time = time.monotonic()
-                                if current_time - last_report_time >= REPORT_INTERVAL:
-                                    if log_buffer:
-                                        await self.send_success(
-                                            None, "\n".join(log_buffer)
-                                        )
-                                        log_buffer = []
-                                        last_report_time = current_time
-                                        await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing member {member.id}: {str(e)}\n"
-                            f"{traceback.format_exc()}"
-                        )
-
-                    processed += 1
-
-                elapsed = time.monotonic() - chunk_start
-                if elapsed < REPORT_INTERVAL:
-                    await asyncio.sleep(REPORT_INTERVAL - elapsed)
-
-            if log_buffer:
-                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(None, "\n".join(log_buffer))
-
-            if conflicts:
-                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(
-                    None,
-                    f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
-                )
-
-            logger.info(
-                f"- Members processed: {processed}\n- Conflicts resolved: {conflicts}"
-            )
-
-        except Exception as e:
-            error_msg = f"Critical error in role conflict check:\n{str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            await self.send_error(None, error_msg, log_to_channel=True)
+        await self.send_success(
+            ctx,
+            f"`{setting_name}` has been {'enabled' if enabled else 'disabled'}.",
+        )
 
     @module_group_vetting.subcommand(
         "assign", sub_cmd_description="Add roles to a member"
@@ -1540,7 +1614,7 @@ class Roles(interactions.Extension):
         domicile: Optional[str] = None,
         status: Optional[str] = None,
     ):
-        await self._manage_vetting_roles(
+        await self.update_vetting_roles(
             ctx, member, Action.ADD, ideology, domicile, status
         )
 
@@ -1583,11 +1657,11 @@ class Roles(interactions.Extension):
         domicile: Optional[str] = None,
         status: Optional[str] = None,
     ):
-        await self._manage_vetting_roles(
+        await self.update_vetting_roles(
             ctx, member, Action.REMOVE, ideology, domicile, status
         )
 
-    async def _manage_vetting_roles(
+    async def update_vetting_roles(
         self,
         ctx: interactions.SlashContext,
         member: interactions.Member,
@@ -1662,9 +1736,9 @@ class Roles(interactions.Extension):
         await self.autocomplete_vetting_role(ctx, "status")
 
     async def autocomplete_vetting_role(
-        self, ctx: interactions.AutocompleteContext, role_type: str
+        self, ctx: interactions.AutocompleteContext, role_category: str
     ) -> None:
-        if not (roles := getattr(self, "vetting_roles", None)) or role_type not in (
+        if not (roles := getattr(self, "vetting_roles", None)) or role_category not in (
             assigned := roles.assigned_roles
         ):
             await ctx.send([])
@@ -1675,7 +1749,9 @@ class Roles(interactions.Extension):
             tuple(
                 interactions.SlashCommandChoice(name=name, value=name)
                 for name in itertools.islice(
-                    filter(lambda x: user_input in x.casefold(), assigned[role_type]),
+                    filter(
+                        lambda x: user_input in x.casefold(), assigned[role_category]
+                    ),
                     25,
                 )
             )
@@ -1773,7 +1849,7 @@ class Roles(interactions.Extension):
     @asynccontextmanager
     async def member_lock(self, member_id: int) -> AsyncGenerator[None, None]:
         now = datetime.now(timezone.utc)
-        lock_info = self.member_lock_map.setdefault(
+        lock_info = self.member_role_locks.setdefault(
             member_id, {"lock": asyncio.Lock(), "last_used": now}
         )
         lock_info["last_used"] = now
@@ -1785,9 +1861,9 @@ class Roles(interactions.Extension):
                 yield
         finally:
             current_time: datetime = datetime.now(timezone.utc)
-            self.member_lock_map = {
+            self.member_role_locks = {
                 mid: info
-                for mid, info in self.member_lock_map.items()
+                for mid, info in self.member_role_locks.items()
                 if isinstance(info["lock"], asyncio.Lock)
                 and not info["lock"].locked()
                 and isinstance(info["last_used"], datetime)
@@ -2511,204 +2587,127 @@ class Roles(interactions.Extension):
 
     @interactions.listen(MessageCreate)
     async def on_message_create(self, event: MessageCreate) -> None:
-        if event.message.author.bot:
+        if (
+            not self.message_monitoring_enabled
+            or event.message.author.bot
+            or not event.message.guild
+        ):
             return
 
-        member_id = event.message.author.id
-        member = await event.message.guild.fetch_member(member_id)
+        guild = event.message.guild
+        author_id = event.message.author.id
+
+        try:
+            member = await guild.fetch_member(author_id)
+        except Exception:
+            return
 
         if not any(role.id == self.config.TEMPORARY_ROLE_ID for role in member.roles):
             return
 
-        author_id: str = str(member_id)
-        message_content: str = event.message.content.strip()
-        current_time: float = time.monotonic()
+        current_time = time.monotonic()
+        message_content = event.message.content.strip()
 
-        async with self._stats_lock:
-            await self._process_user_stats(author_id, message_content, current_time)
-            await self._debounce_save_stats()
-
-    async def _process_user_stats(
-        self, author_id: str, message_content: str, current_time: float
-    ) -> Dict[str, Any]:
-        default_stats: Dict[str, Any] = {
-            "message_timestamps": [],
-            "last_message": 0,
-            "repetition_count": 0,
-            "invalid_message_count": 0,
-            "feedback_score": 0,
-            "violation_history": [],
-            "recovery_streaks": 0,
-        }
-
-        if str(author_id) not in self.stats:
-            self.stats[str(author_id)] = cast(int, default_stats.copy())
-
-        user_stats = cast(Dict[str, Any], self.stats[str(author_id)])
-
-        for key, value in default_stats.items():
-            if key not in user_stats:
-                user_stats[key] = value
-
-        message_rate_window = self.dynamic_config["MESSAGE_RATE_WINDOW"]
-        short_window, long_window = (
-            message_rate_window * 0.25,
-            message_rate_window * 2.0,
-        )
-        cutoff_short, cutoff_long = (
-            current_time - short_window,
-            current_time - long_window,
-        )
-
-        message_timestamps = user_stats["message_timestamps"]
-        recent_msgs = [ts for ts in message_timestamps if ts > cutoff_short]
-        historical_msgs = [
-            ts for ts in message_timestamps if cutoff_long < ts <= cutoff_short
-        ]
-
-        user_stats["message_timestamps"] = [
-            *historical_msgs,
-            *recent_msgs,
-            current_time,
-        ]
-
-        classification = await self._classify_message_advanced(
-            message_content.lower(), user_stats
-        )
-        is_invalid = classification["is_invalid"]
-        invalid_message_count = user_stats["invalid_message_count"]
-        feedback_score = user_stats["feedback_score"]
-        recovery_streaks = user_stats["recovery_streaks"]
-
-        if is_invalid:
-            reasons = classification["reasons"]
-            user_stats["invalid_message_count"] = invalid_message_count + 1
-            user_stats["recovery_streaks"] = 0
-
-            violation_history = user_stats.setdefault("violation_history", [])
-            violation_history.append(
+        async with self.stats_lock:
+            stats = self.stats.setdefault(
+                str(author_id),
                 {
-                    "timestamp": current_time,
-                    "reasons": reasons,
-                    "message_rate": (
-                        len(recent_msgs) / short_window if short_window else 0
-                    ),
-                }
-            )
-            user_stats["violation_history"] = violation_history[-10:]
-
-            logger.warning(
-                f"Message violation detected for user {author_id}: {','.join(reasons if isinstance(reasons, list) else [])}",
-                extra={
-                    "user_id": author_id,
-                    "violations": reasons,
-                    "message_stats": user_stats,
+                    "message_timestamps": [],
+                    "invalid_message_count": 0,
+                    "feedback_score": 0.0,
+                    "recovery_streaks": 0,
+                    "last_threshold_adjustment": 0.0,
                 },
             )
 
-            repeated_violations = sum(
-                bool(
-                    set(v["reasons"] if isinstance(v["reasons"], list) else [])
-                    & set(reasons if isinstance(reasons, list) else [])
+            if not isinstance(stats, dict):
+                stats = stats.copy()
+            self.stats[str(author_id)] = stats
+
+            timestamps = stats["message_timestamps"]
+            cutoff = current_time - 7200
+            stats["message_timestamps"] = [
+                t for t in [*timestamps, current_time] if t > cutoff
+            ]
+
+            is_valid = not Message(
+                message_content, stats, self.limit_config, self.validation_flags
+            ).analyze()
+
+            invalid_count = stats["invalid_message_count"]
+            recovery_streaks = stats["recovery_streaks"]
+            feedback_score = stats["feedback_score"]
+
+            stats.update(
+                {
+                    "invalid_message_count": (
+                        invalid_count - (1 if invalid_count > 0 else 0)
+                        if is_valid
+                        else invalid_count + 1
+                    ),
+                    "recovery_streaks": (recovery_streaks + 1 if is_valid else 0),
+                    "feedback_score": (
+                        min(5.0, feedback_score + 0.5)
+                        if is_valid
+                        else max(-5.0, feedback_score - 1.0)
+                    ),
+                }
+            )
+
+            if not is_valid:
+                logger.warning(f"Invalid message from user {author_id}")
+
+            await self._adjust_thresholds(stats)
+            self.stats_save_task and self.stats_save_task.cancel()
+            self.stats_save_task = asyncio.create_task(self._save_stats())
+
+    async def _adjust_thresholds(self, user_stats: Dict[str, Any]) -> None:
+        feedback, last_adj = user_stats["feedback_score"], user_stats.get(
+            "last_threshold_adjustment", 0
+        )
+        time_delta = (now := time.time()) - last_adj
+
+        adj = 0.01 * feedback * math.tanh(abs(feedback) / 5)
+        decay = math.exp(-time_delta / 3600)
+
+        self.limit_config.update(
+            {
+                name: min(
+                    max(
+                        self.limit_config[name]
+                        + adj
+                        + (default - self.limit_config[name]) * (1 - decay),
+                        min_v,
+                    ),
+                    max_v,
                 )
-                for v in violation_history[-3:]
-            )
-            base_penalty = len(reasons) if isinstance(reasons, list) else 0
-            pattern_multiplier = 1 + (repeated_violations * 0.5)
-
-            user_stats["feedback_score"] = max(
-                -5, feedback_score - (base_penalty * pattern_multiplier)
-            )
-            await self._adjust_thresholds_dynamic(user_stats)
-        else:
-            user_stats["invalid_message_count"] = max(0, invalid_message_count - 1)
-            user_stats["recovery_streaks"] = recovery_streaks + 1
-            user_stats["feedback_score"] = min(
-                5, feedback_score + min(1 + (recovery_streaks * 0.2), 2)
-            )
-
-        return user_stats
-
-    async def _classify_message_advanced(
-        self, message: str, user_stats: Dict[str, Any]
-    ) -> Dict[str, Union[bool, List[str]]]:
-        result = Message(message, user_stats, self.dynamic_config).analyze()
-        return {
-            "is_invalid": bool(result),
-            "reasons": result if isinstance(result, list) else [],
-        }
-
-    async def _adjust_thresholds_dynamic(self, user_stats: Dict[str, Any]) -> None:
-        feedback = user_stats.get("feedback_score", 0)
-        message_count = len(user_stats.get("message_timestamps", []))
-        invalid_count = user_stats.get("invalid_message_count", 0)
-
-        confidence = min(1.0, message_count / 100)
-        violation_ratio = invalid_count / max(1, message_count)
-        base_factor = 0.01 * (1 + confidence)
-        adj_factor = (
-            base_factor
-            * feedback
-            * math.tanh(abs(feedback) / 5)
-            * (1.5 if violation_ratio > 0.3 else 1.0)
+                for name, (min_v, max_v, default) in {
+                    "DIGIT_RATIO_THRESHOLD": (0.1, 1.0, 0.5),
+                    "MIN_MESSAGE_ENTROPY": (0.0, 4.0, 1.5),
+                }.items()
+            }
         )
 
-        time_delta = time.time() - user_stats.get("last_threshold_adjustment", 0)
-        decay_factor = math.exp(-time_delta / 3600)
+        user_stats["last_threshold_adjustment"] = now
 
-        logger.info(
-            f"Adjusting thresholds - feedback: {feedback}, confidence: {confidence:.2f}, "
-            f"violation_ratio: {violation_ratio:.2f}, adjustment: {adj_factor:.4f}"
-        )
-
-        default_thresholds = {"DIGIT_THRESHOLD": 0.5, "MIN_ENTROPY_THRESHOLD": 1.5}
-        thresholds = (
-            ("DIGIT_THRESHOLD", 0.1, 1.0),
-            ("MIN_ENTROPY_THRESHOLD", 0.0, 4.0),
-        )
-
-        alpha = 0.3 * confidence
-        for name, min_val, max_val in thresholds:
-            old_val = self.dynamic_config[name]
-            default = default_thresholds[name]
-            decay_adjustment = (default - old_val) * (1 - decay_factor)
-            new_val = min(
-                max(old_val + adj_factor + decay_adjustment, min_val), max_val
-            )
-            self.dynamic_config[name] = old_val * (1 - alpha) + new_val * alpha
-
-            logger.info(
-                f"Adjusted {name}: {old_val:.4f} -> {new_val:.4f} "
-                f"(default: {default}, decay: {decay_adjustment:.4f})"
-            )
-
-        user_stats["last_threshold_adjustment"] = time.time()
-
-    async def _debounce_save_stats(self) -> None:
-        if self._save_stats_task:
-            self._save_stats_task.cancel()
-        self._save_stats_task = asyncio.create_task(
-            self._delayed_save_stats(),
-            name=f"save_stats_{id(self)}_{time.monotonic_ns()}",
-        )
-
-    async def _delayed_save_stats(self) -> None:
+    async def _save_stats(self) -> None:
         try:
             await asyncio.sleep(5.0)
-            async with self._stats_lock:
+            async with self.stats_lock:
                 await self.save_stats_roles()
         except asyncio.CancelledError:
-            return
+            pass
         except Exception as e:
-            logger.error(f"Error in _delayed_save_stats: {e}", exc_info=True)
+            logger.error(f"Failed to save stats: {e}")
         finally:
-            object.__setattr__(self, "_save_stats_task", None)
+            self.stats_save_task = None
 
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
         self.update_roles_based_on_activity.start()
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
+        self.cleanup_stats.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
@@ -2716,6 +2715,7 @@ class Roles(interactions.Extension):
             self.update_roles_based_on_activity,
             self.cleanup_old_locks,
             self.check_incarcerated_members,
+            self.cleanup_stats,
         )
         for task in tasks_to_stop:
             task.stop()
@@ -2745,13 +2745,67 @@ class Roles(interactions.Extension):
 
     # Tasks
 
+    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
+    async def cleanup_stats(self) -> None:
+        try:
+            guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            processed = removed = 0
+            members_to_remove = set()
+            temp_role_id = self.config.TEMPORARY_ROLE_ID
+            approved_role_id = self.config.APPROVED_ROLE_ID
+
+            for member_batch in (
+                tuple(islice(self.stats, i, i + 100))
+                for i in range(0, len(self.stats), 100)
+            ):
+                for member_id in member_batch:
+                    processed += 1
+                    try:
+                        member = await guild.fetch_member(int(member_id))
+                        if member:
+                            member_role_ids = frozenset(
+                                role.id for role in member.roles
+                            )
+                            if not (
+                                temp_role_id in member_role_ids
+                                and approved_role_id not in member_role_ids
+                            ):
+                                members_to_remove.add(member_id)
+                                removed += 1
+                        else:
+                            members_to_remove.add(member_id)
+                            removed += 1
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing member {member_id} during stats cleanup: {e!r}"
+                        )
+
+            if members_to_remove:
+                self.stats = Counter(
+                    {k: v for k, v in self.stats.items() if k not in members_to_remove}
+                )
+                await self.save_stats_roles()
+                logger.info(
+                    f"Stats cleanup completed - Processed: {processed}, Removed: {removed} members"
+                )
+            else:
+                logger.info(
+                    f"Stats cleanup completed - No members needed removal (Processed: {processed})"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Critical error in stats cleanup task: {e!r}\n{traceback.format_exc()}"
+            )
+            raise
+
     @interactions.Task.create(interactions.IntervalTrigger(days=7))
     async def cleanup_old_locks(self) -> None:
         current_time: datetime = datetime.now(timezone.utc)
         threshold: timedelta = timedelta(days=7)
-        self.member_lock_map = {
+        self.member_role_locks = {
             k: v
-            for k, v in self.member_lock_map.items()
+            for k, v in self.member_role_locks.items()
             if not (
                 isinstance(v["lock"], asyncio.Lock)
                 and not v["lock"].locked()
@@ -2761,7 +2815,7 @@ class Roles(interactions.Extension):
                 > threshold.total_seconds()
             )
         }
-        removed: int = len(self.member_lock_map) - len(self.member_lock_map)
+        removed: int = len(self.member_role_locks) - len(self.member_role_locks)
         logger.info(f"Cleaned up {removed} old locks.")
 
     @interactions.Task.create(interactions.IntervalTrigger(seconds=30))
@@ -2869,8 +2923,7 @@ class Roles(interactions.Extension):
                     role_updates["add"][member_id_int].append(roles["approved"])
                     members_to_update.add(member_id_int)
                     log_messages.append(
-                        f"Updated roles for {member_id}: Sent {valid_messages} valid messages, "
-                        f"upgraded from {roles['temporary'].name} to {roles['approved'].name}."
+                        f"Updated roles for `{member_id}`: Sent `{valid_messages}` valid messages, upgraded from `{roles['temporary'].name}` to `{roles['approved'].name}`."
                     )
             if members_to_update:
                 for member_id_int in members_to_update:
