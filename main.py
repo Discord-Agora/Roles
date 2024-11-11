@@ -2662,33 +2662,47 @@ class Roles(interactions.Extension):
             self.stats_save_task = asyncio.create_task(self._save_stats())
 
     async def _adjust_thresholds(self, user_stats: Dict[str, Any]) -> None:
-        feedback, last_adj = user_stats["feedback_score"], user_stats.get(
-            "last_threshold_adjustment", 0
-        )
+        if not self.message_monitoring_enabled or not self.validation_flags.get(
+            "feedback"
+        ):
+            return
+
+        feedback = user_stats.get("feedback_score", 0.0)
+        last_adj = user_stats.get("last_threshold_adjustment", 0.0)
         time_delta = (now := time.time()) - last_adj
 
         adj = 0.01 * feedback * math.tanh(abs(feedback) / 5)
         decay = math.exp(-time_delta / 3600)
 
-        self.limit_config.update(
-            {
-                name: min(
-                    max(
-                        self.limit_config[name]
-                        + adj
-                        + (default - self.limit_config[name]) * (1 - decay),
-                        min_v,
-                    ),
-                    max_v,
-                )
-                for name, (min_v, max_v, default) in {
-                    "DIGIT_RATIO_THRESHOLD": (0.1, 1.0, 0.5),
-                    "MIN_MESSAGE_ENTROPY": (0.0, 4.0, 1.5),
-                }.items()
-            }
-        )
+        threshold_map = {}
 
-        user_stats["last_threshold_adjustment"] = now
+        if self.validation_flags.get("digit_ratio"):
+            threshold_map["DIGIT_RATIO_THRESHOLD"] = (0.1, 1.0, 0.5)
+
+        if self.validation_flags.get("entropy"):
+            threshold_map["MIN_MESSAGE_ENTROPY"] = (0.0, 4.0, 1.5)
+
+        if threshold_map:
+            self.limit_config.update(
+                {
+                    name: min(
+                        max(
+                            self.limit_config[name]
+                            + adj
+                            + (default - self.limit_config[name]) * (1 - decay),
+                            min_v,
+                        ),
+                        max_v,
+                    )
+                    for name, (min_v, max_v, default) in threshold_map.items()
+                }
+            )
+
+            user_stats["last_threshold_adjustment"] = now
+
+            logger.debug(
+                f"Thresholds adjusted - Feedback: {feedback:.2f}, Adjustment: {adj:.4f}, Decay: {decay:.4f}"
+            )
 
     async def _save_stats(self) -> None:
         try:
