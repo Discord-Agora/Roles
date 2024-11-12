@@ -2716,6 +2716,44 @@ class Roles(interactions.Extension):
         finally:
             self.stats_save_task = None
 
+    @interactions.listen(MessageCreate)
+    async def on_missing_member_message(self, event: MessageCreate) -> None:
+        if any((event.message.author.bot, not event.message.guild)):
+            return
+
+        guild, author_id = event.message.guild, event.message.author.id
+
+        try:
+            member = await guild.fetch_member(author_id)
+            if self.config.MISSING_ROLE_ID not in {role.id for role in member.roles}:
+                return
+
+            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
+            if isinstance(missing_role, Exception):
+                return
+
+            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
+            if isinstance(temp_role, Exception):
+                return
+
+            await member.remove_roles([missing_role])
+            await member.add_roles([temp_role])
+
+            logger.info(
+                f"Converted member {member.id} from missing to temporary status after message"
+            )
+
+            await self.send_success(
+                None,
+                f"Member {member.mention} has been converted from `{missing_role.name}` to `{temp_role.name}` after sending a message.",
+                log_to_channel=True,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Error converting missing member {author_id} to temporary: {e!r}\n{traceback.format_exc()}"
+            )
+
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
         self.update_roles_based_on_activity.start()
