@@ -815,7 +815,7 @@ class Roles(interactions.Extension):
                 )
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=15)
-            grace_period = datetime.now(timezone.utc) - timedelta(days=1)
+            grace_period = datetime.now(timezone.utc) - timedelta(days=15)
             converted_members = []
 
             text_channels = {
