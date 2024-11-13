@@ -504,14 +504,16 @@ class Roles(interactions.Extension):
         )
 
     def validate_vetting_permissions(self, ctx: interactions.ContextType) -> bool:
-        return self.has_required_roles(ctx, frozenset(self.config.VETTING_ROLE_IDS))
+        return self.has_required_roles(
+            ctx, frozenset(self.vetting_roles.authorized_roles.values())
+        )
 
     def validate_vetting_permissions_with_roles(
         self, ctx: interactions.ContextType, role_ids_to_add: Iterable[int]
     ) -> bool:
         return self.has_required_roles(
             ctx,
-            frozenset(self.config.VETTING_ROLE_IDS),
+            frozenset(self.vetting_roles.authorized_roles.values()),
             frozenset(role_ids_to_add),
             check_assignable=True,
         )
@@ -1605,6 +1607,13 @@ class Roles(interactions.Extension):
         opt_type=interactions.OptionType.STRING,
         autocomplete=True,
     )
+    @interactions.slash_option(
+        name="others",
+        description="其他",
+        required=False,
+        opt_type=interactions.OptionType.STRING,
+        autocomplete=True,
+    )
     @error_handler
     async def assign_vetting_roles(
         self,
@@ -1613,9 +1622,10 @@ class Roles(interactions.Extension):
         ideology: Optional[str] = None,
         domicile: Optional[str] = None,
         status: Optional[str] = None,
+        others: Optional[str] = None,
     ):
         await self.update_vetting_roles(
-            ctx, member, Action.ADD, ideology, domicile, status
+            ctx, member, Action.ADD, ideology, domicile, status, others
         )
 
     @module_group_vetting.subcommand(
@@ -1648,6 +1658,13 @@ class Roles(interactions.Extension):
         opt_type=interactions.OptionType.STRING,
         autocomplete=True,
     )
+    @interactions.slash_option(
+        name="others",
+        description="其他",
+        required=False,
+        opt_type=interactions.OptionType.STRING,
+        autocomplete=True,
+    )
     @error_handler
     async def remove_vetting_roles(
         self,
@@ -1656,9 +1673,10 @@ class Roles(interactions.Extension):
         ideology: Optional[str] = None,
         domicile: Optional[str] = None,
         status: Optional[str] = None,
+        others: Optional[str] = None,
     ):
         await self.update_vetting_roles(
-            ctx, member, Action.REMOVE, ideology, domicile, status
+            ctx, member, Action.REMOVE, ideology, domicile, status, others
         )
 
     async def update_vetting_roles(
@@ -1669,9 +1687,13 @@ class Roles(interactions.Extension):
         ideology: Optional[str] = None,
         domicile: Optional[str] = None,
         status: Optional[str] = None,
+        others: Optional[str] = None,
     ) -> None:
         kwargs = dict(
-            zip(("ideology", "domicile", "status"), (ideology, domicile, status))
+            zip(
+                ("ideology", "domicile", "status", "others"),
+                (ideology, domicile, status, others),
+            )
         )
         role_ids = self.get_role_ids_to_assign(
             dict(
@@ -1698,7 +1720,7 @@ class Roles(interactions.Extension):
             role_types = tuple(k for k, v in kwargs.items() if v is not None)
             await self.send_error(
                 ctx,
-                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, or status'}).",
+                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, status, or others'}).",
             )
             return
 
