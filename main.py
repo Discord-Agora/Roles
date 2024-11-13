@@ -1745,6 +1745,10 @@ class Roles(interactions.Extension):
     async def autocomplete_status_assign(self, ctx: interactions.AutocompleteContext):
         await self.autocomplete_vetting_role(ctx, "status")
 
+    @assign_vetting_roles.autocomplete("others")
+    async def autocomplete_others_assign(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "others")
+
     @remove_vetting_roles.autocomplete("ideology")
     async def autocomplete_ideology_remove(self, ctx: interactions.AutocompleteContext):
         await self.autocomplete_vetting_role(ctx, "ideology")
@@ -1756,6 +1760,10 @@ class Roles(interactions.Extension):
     @remove_vetting_roles.autocomplete("status")
     async def autocomplete_status_remove(self, ctx: interactions.AutocompleteContext):
         await self.autocomplete_vetting_role(ctx, "status")
+
+    @remove_vetting_roles.autocomplete("others")
+    async def autocomplete_others_remove(self, ctx: interactions.AutocompleteContext):
+        await self.autocomplete_vetting_role(ctx, "others")
 
     async def autocomplete_vetting_role(
         self, ctx: interactions.AutocompleteContext, role_category: str
