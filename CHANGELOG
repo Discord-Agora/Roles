@@ -1,3 +1,13 @@
+## 2024-11-15
+
+### Changed
+- Commented out `Message` class and related monitoring functionality
+- Disabled automatic role updates based on activity
+
+### Removed
+- Message monitoring and role automation
+- Unnecessary default parameters
+
 ## 2024-11-11
 
 ### Added
