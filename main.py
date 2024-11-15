@@ -799,6 +799,7 @@ class Roles(interactions.Extension):
         sub_cmd_description="Convert inactive members to missing members",
     )
     @error_handler
+    @interactions.slash_default_member_permission(interactions.Permissions.ADMINISTRATOR)
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
     async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
@@ -1002,6 +1003,7 @@ class Roles(interactions.Extension):
         "conflicts", sub_cmd_description="Check and resolve role conflicts"
     )
     @error_handler
+    @interactions.slash_default_member_permission(interactions.Permissions.ADMINISTRATOR)
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
     async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
         ROLE_PRIORITIES = {
