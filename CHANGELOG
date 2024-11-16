@@ -1,3 +1,14 @@
+## 2024-11-17
+
+### Added
+- Asynchronous channel processing function to streamline the retrieval of member activity across multiple channels
+
+### Changed
+- Updated the role fetching logic to include the electoral role in addition to the temporary and missing roles
+- Improved the member processing logic by combining members from both temporary and electoral roles for activity checks
+- Adjusted batch processing parameters to optimize performance, reducing cooldowns and update intervals.
+- Refactored the last message time retrieval function
+
 ## 2024-11-15
 
 ### Changed
