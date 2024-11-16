@@ -799,7 +799,9 @@ class Roles(interactions.Extension):
         sub_cmd_description="Convert inactive members to missing members",
     )
     @error_handler
-    @interactions.slash_default_member_permission(interactions.Permissions.ADMINISTRATOR)
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
     async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
@@ -813,12 +815,13 @@ class Roles(interactions.Extension):
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
             temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
+            electoral_role = await guild.fetch_role(self.config.ELECTORAL_ROLE_ID)
             missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
 
-            if not all((temp_role, missing_role)):
+            if not all((temp_role, electoral_role, missing_role)):
                 return await self.send_error(
                     ctx,
-                    f"Required roles could not be found. Please verify that both <@&{self.config.TEMPORARY_ROLE_ID}> and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
+                    f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
                 )
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=15)
@@ -837,19 +840,26 @@ class Roles(interactions.Extension):
                 )
             }
 
-            temp_members = list(temp_role.members)
-            total_members = len(temp_members)
-            processed = 0
-            skipped = 0
+            members_to_check: list[interactions.Member] = [
+                *filter(None, (temp_role.members, electoral_role.members))
+            ]
+            members_to_check = [
+                member for member in temp_role.members + electoral_role.members
+            ]
 
-            BATCH_SIZE = 10
+            total_members = len(members_to_check)
+            processed = skipped = 0
+
+            BATCH_SIZE = min(25, total_members)
             REPORT_THRESHOLD = 10
-            BATCH_COOLDOWN = 10.0
-            PROGRESS_UPDATE_INTERVAL = 60.0
+            BATCH_COOLDOWN = 5.0
+            PROGRESS_UPDATE_INTERVAL = 30.0
             last_progress_update = time.monotonic()
 
-            for i in range(0, total_members, BATCH_SIZE):
-                batch = temp_members[i : i + BATCH_SIZE]
+            for batch in (
+                members_to_check[i : i + BATCH_SIZE]
+                for i in range(0, total_members, BATCH_SIZE)
+            ):
                 batch_start = time.monotonic()
 
                 for member in batch:
@@ -859,20 +869,20 @@ class Roles(interactions.Extension):
                         continue
 
                     try:
-                        should_convert = await self.check_member_last_activity(
+                        if await self.check_member_last_activity(
                             member, text_channels, cutoff
-                        )
-
-                        if should_convert:
-                            new_roles = [
-                                role.id for role in member.roles if role != temp_role
-                            ]
-                            new_roles.append(missing_role.id)
+                        ):
+                            new_roles = {
+                                role.id
+                                for role in member.roles
+                                if role not in (temp_role, electoral_role)
+                            } | {missing_role.id}
 
                             await member.edit(
-                                roles=new_roles, reason="Converting inactive member"
+                                roles=list(new_roles),
+                                reason="Converting inactive member",
                             )
-                            await asyncio.sleep(1.0)
+                            await asyncio.sleep(0.5)
 
                             converted_members.append(member.mention)
                             logger.info(f"Updated roles for member {member.id}")
@@ -884,11 +894,10 @@ class Roles(interactions.Extension):
                                 ctx,
                                 f"- Processed: {processed}/{total_members} members\n"
                                 f"- Skipped (grace period): {skipped}\n"
-                                f"- Recently converted members: "
-                                + ", ".join(converted_members),
+                                f"- Recently converted members: {', '.join(converted_members)}",
                             )
-                            converted_members = []
-                            await asyncio.sleep(1.0)
+                            converted_members.clear()
+                            await asyncio.sleep(0.5)
 
                         current_time = time.monotonic()
                         if (
@@ -911,15 +920,15 @@ class Roles(interactions.Extension):
                     await asyncio.sleep(BATCH_COOLDOWN - elapsed)
 
             if converted_members:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 await self.send_success(
                     ctx,
                     f"- Total processed: {processed}/{total_members}\n"
                     f"- Skipped (grace period): {skipped}\n"
-                    f"- Last converted members: " + ", ".join(converted_members),
+                    f"- Last converted members: {', '.join(converted_members)}",
                 )
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
             await self.send_success(
                 ctx,
                 f"- Total members processed: {total_members}\n"
@@ -940,70 +949,152 @@ class Roles(interactions.Extension):
         cutoff: datetime,
     ) -> bool:
         try:
-            last_message_time = await self._get_last_message_time(
+            last_message_time = await self.get_last_message_time(
                 member, text_channels, cutoff
             )
-            if last_message_time and last_message_time.tzinfo is None:
-                last_message_time = last_message_time.replace(tzinfo=timezone.utc)
-            return not last_message_time or last_message_time < cutoff
+            return (
+                not last_message_time
+                or (
+                    last_message_time.replace(tzinfo=timezone.utc)
+                    if last_message_time.tzinfo is None
+                    else last_message_time
+                )
+                < cutoff
+            )
         except Exception as e:
             logger.error(f"Error checking activity for member {member.id}: {e}")
             raise
 
     @staticmethod
-    async def _get_last_message_time(
+    async def get_last_message_time(
         member: interactions.Member,
         text_channels: set[interactions.GuildChannel],
         cutoff: datetime,
     ) -> Optional[datetime]:
-        sem = asyncio.Semaphore(5)
+        message_limit = 100
+        max_retries = 3
+        current_latest_time: datetime = cutoff
+        channel_latest_times: Dict[int, datetime] = {}
 
-        async def check_channel(channel):
-            async with sem:
+        filtered_channels = {
+            c
+            for c in text_channels
+            if isinstance(
+                c,
+                (
+                    interactions.GuildText,
+                    interactions.GuildPublicThread,
+                    interactions.GuildPrivateThread,
+                ),
+            )
+        }
+
+        async def check_channel_history(
+            channel: Union[
+                interactions.GuildText,
+                interactions.GuildPublicThread,
+                interactions.GuildPrivateThread,
+            ],
+        ) -> AsyncGenerator[
+            tuple[Optional[datetime], Optional[datetime], Optional[datetime]], None
+        ]:
+            for retry in range(max_retries):
                 try:
-                    async for message in channel.history(limit=1):
-                        if message.author.id == member.id:
-                            return message.created_at
+                    messages = [
+                        msg async for msg in channel.history(limit=message_limit)
+                    ]
+                    if not messages:
+                        yield None, None, None
+                        return
+
+                    channel_latest = messages[0].created_at
+                    channel_earliest = messages[-1].created_at
+
+                    if (
+                        current_latest_time is not None
+                        and channel_earliest <= current_latest_time
+                    ):
+                        yield None, channel_latest, channel_earliest
+                        return
+
+                    member_time = next(
+                        (m.created_at for m in messages if m.author.id == member.id),
+                        None,
+                    )
+                    yield member_time, channel_latest, channel_earliest
+                    return
                 except Exception as e:
-                    logger.error(f"Error checking channel {channel.id}: {e}")
-                return None
+                    if retry == max_retries - 1:
+                        logger.error(
+                            f"Error checking channel {channel.id} after {max_retries} retries: {e}"
+                        )
+                        yield None, None, None
+                        return
+                    await asyncio.sleep(0.5)
 
-        chunk_size = 15
-        last_times = []
+        total_channels = len(filtered_channels)
+        chunk_size = min(max(8, (os.cpu_count() or 4) * 4), total_channels)
+        found_any_messages = False
 
-        for i in range(0, len(text_channels), chunk_size):
-            channel_chunk = [
-                channel
-                for channel in list(text_channels)[i : i + chunk_size]
-                if isinstance(
-                    channel,
-                    (
-                        interactions.GuildText,
-                        interactions.GuildPublicThread,
-                        interactions.GuildPrivateThread,
-                    ),
-                )
-            ]
-            tasks = [check_channel(channel) for channel in channel_chunk]
+        async def process_channels() -> AsyncGenerator[Optional[datetime], None]:
+            nonlocal current_latest_time, found_any_messages
+            remaining_channels = filtered_channels.copy()
 
-            for task in tasks:
-                try:
-                    result = await task
-                    if isinstance(result, datetime):
-                        if result > cutoff:
-                            return result
-                        last_times.append(result)
-                except Exception as e:
-                    logger.error(f"Error in channel check task: {e}")
-                await asyncio.sleep(0.2)
+            while remaining_channels:
+                current_chunk = set(itertools.islice(remaining_channels, chunk_size))
+                remaining_channels -= current_chunk
 
-        return max(last_times, default=None)
+                for channel in current_chunk:
+                    async for (
+                        member_time,
+                        channel_latest,
+                        channel_earliest,
+                    ) in check_channel_history(channel):
+                        if channel_latest:
+                            channel_latest_times[channel.id] = channel_latest
+
+                        if member_time:
+                            if member_time > cutoff:
+                                yield member_time
+                                return
+
+                            found_any_messages = True
+                            if (
+                                current_latest_time is None
+                                or member_time > current_latest_time
+                            ):
+                                current_latest_time = member_time
+                                yield None
+
+                remaining_channels = {
+                    channel
+                    for channel in remaining_channels
+                    if channel.id not in channel_latest_times
+                    or (
+                        channel_latest_times[channel.id]
+                        and channel_latest_times[channel.id]
+                        > (current_latest_time or cutoff)
+                    )
+                }
+
+                if not remaining_channels:
+                    break
+
+                await asyncio.sleep(0.1)
+
+        async for final_time in process_channels():
+            if final_time is not None:
+                return final_time
+
+        return current_latest_time if found_any_messages else None
 
     @module_group_debug.subcommand(
         "conflicts", sub_cmd_description="Check and resolve role conflicts"
     )
     @error_handler
-    @interactions.slash_default_member_permission(interactions.Permissions.ADMINISTRATOR)
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
     async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
         ROLE_PRIORITIES = {
