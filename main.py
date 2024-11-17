@@ -971,7 +971,7 @@ class Roles(interactions.Extension):
         text_channels: set[interactions.GuildChannel],
         cutoff: datetime,
     ) -> Optional[datetime]:
-        message_limit = 100
+        message_limit = 0
         max_retries = 3
         current_latest_time: datetime = cutoff
         channel_latest_times: Dict[int, datetime] = {}
@@ -983,8 +983,7 @@ class Roles(interactions.Extension):
                 c,
                 (
                     interactions.GuildText,
-                    interactions.GuildPublicThread,
-                    interactions.GuildPrivateThread,
+                    interactions.ThreadChannel,
                 ),
             )
         }
@@ -992,8 +991,7 @@ class Roles(interactions.Extension):
         async def check_channel_history(
             channel: Union[
                 interactions.GuildText,
-                interactions.GuildPublicThread,
-                interactions.GuildPrivateThread,
+                interactions.ThreadChannel,
             ],
         ) -> AsyncGenerator[
             tuple[Optional[datetime], Optional[datetime], Optional[datetime]], None
