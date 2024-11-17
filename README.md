@@ -47,14 +47,7 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
     - `ideology` (string, optional): Specify ideology role
     - `domicile` (string, optional): Specify domicile role
     - `status` (string, optional): Specify status role
-
-- `/roles vetting inactive`: Convert inactive members to missing members
-  - Requires administrator permissions
-  - Automatically identifies and converts inactive members after 15 days
-
-- `/roles vetting conflicts`: Check and resolve role conflicts
-  - Requires administrator permissions
-  - Automatically resolves conflicting role assignments based on role priorities
+    - `others` (string, optional): Specify other roles
 
 - `/roles servant view`: Display a paginated list of all servant roles and their members
 
@@ -70,6 +63,14 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
 - `/roles debug view`: View configuration settings and statistics
   - Options:
     - `config` (string, required): Configuration type to view (vetting/custom/incarcerated/stats/dynamic)
+
+- `/roles debug inactive`: Convert inactive members to missing members
+  - Requires administrator permissions
+  - Automatically identifies and converts inactive members after 15 days
+
+- `/roles debug conflicts`: Check and resolve role conflicts
+  - Requires administrator permissions
+  - Automatically resolves conflicting role assignments based on role priorities
 
 ### Context Menus
 
