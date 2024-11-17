@@ -831,7 +831,9 @@ class Roles(interactions.Extension):
             text_channels = {
                 channel
                 for channel in guild.channels
-                if isinstance(channel, interactions.GuildChannel)
+                if isinstance(
+                    channel, (interactions.GuildText, interactions.ThreadChannel)
+                )
                 and channel.type
                 in (
                     interactions.ChannelType.GUILD_TEXT,
@@ -945,7 +947,9 @@ class Roles(interactions.Extension):
     async def check_member_last_activity(
         self,
         member: interactions.Member,
-        text_channels: set[interactions.GuildChannel],
+        text_channels: set[
+            Union[interactions.ThreadChannel, interactions.GuildText]
+        ],
         cutoff: datetime,
     ) -> bool:
         try:
@@ -968,7 +972,7 @@ class Roles(interactions.Extension):
     @staticmethod
     async def get_last_message_time(
         member: interactions.Member,
-        text_channels: set[interactions.GuildChannel],
+        text_channels: set[Union[interactions.ThreadChannel, interactions.GuildText]],
         cutoff: datetime,
     ) -> Optional[datetime]:
         message_limit = 0
