@@ -1,50 +1,36 @@
+from __future__ import annotations
+
 import asyncio
-import itertools
+import contextlib
+import functools
 import logging
-import math
 import os
 import re
-import time
-import traceback
-from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from functools import lru_cache, partial, wraps
-from itertools import islice
 from logging.handlers import RotatingFileHandler
-from multiprocessing import cpu_count
-from operator import attrgetter
-from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
     Callable,
-    Concatenate,
-    Coroutine,
     DefaultDict,
     Dict,
-    FrozenSet,
-    Generic,
-    Iterable,
+    Generator,
     List,
     Literal,
+    Mapping,
     Optional,
-    ParamSpec,
+    Sequence,
     Set,
     Tuple,
-    Type,
-    TypeVar,
     Union,
-    cast,
 )
 
 import aiofiles
-import cysimdjson
+import aiofiles.os
 import interactions
-import numpy as np
 import orjson
 from cachetools import TTLCache
 from interactions.api.events import (
@@ -53,13 +39,12 @@ from interactions.api.events import (
     MessageCreate,
     NewThreadCreate,
 )
-from interactions.client.errors import NotFound
+from interactions.client.errors import Forbidden, NotFound
 from interactions.ext.paginators import Paginator
-from pydantic import BaseModel, Field
 from yarl import URL
 
-BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE: str = os.path.join(BASE_DIR, "roles.log")
+BASE_DIR: str = os.path.abspath(os.path.dirname(__file__))
+LOG_FILE: str = os.path.join(BASE_DIR, "threads.log")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -73,18 +58,20 @@ file_handler = RotatingFileHandler(
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-
 # Model
 
 
-T = TypeVar("T", bound=Union[BaseModel, Counter, Dict[str, Any]])
-
-P = ParamSpec("P")
-
-
-class Status(Enum):
-    APPROVED = auto()
-    REJECTED = auto()
+class ActionType(Enum):
+    LOCK = auto()
+    UNLOCK = auto()
+    BAN = auto()
+    UNBAN = auto()
+    DELETE = auto()
+    EDIT = auto()
+    PIN = auto()
+    UNPIN = auto()
+    SHARE_PERMISSIONS = auto()
+    REVOKE_PERMISSIONS = auto()
 
 
 class EmbedColor(Enum):
@@ -98,554 +85,621 @@ class EmbedColor(Enum):
     ALL = 0x0063B1
 
 
-class Action(Enum):
-    ADD = "add"
-    REMOVE = "remove"
-    INCARCERATE = "incarcerate"
-    RELEASE = "release"
-
-
-class Data(BaseModel):
-    assigned_roles: Dict[str, Dict[str, int]] = Field(default_factory=dict)
-    authorized_roles: Dict[str, int] = Field(default_factory=dict)
-    assignable_roles: Dict[str, List[str]] = Field(default_factory=dict)
-    incarcerated_members: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
-
-    class Config:
-        json_encoders = {
-            set: list,
-        }
+@dataclass
+class ActionDetails:
+    action: ActionType
+    reason: str
+    post_name: str
+    actor: interactions.Member
+    target: Optional[interactions.Member] = None
+    result: str = "successful"
+    channel: Optional[interactions.GuildForumPost] = None
+    additional_info: Optional[Mapping[str, Any]] = None
 
 
 @dataclass
-class Config:
-    VETTING_FORUM_ID: int = 1164834982737489930
-    VETTING_ROLE_IDS: List[int] = field(default_factory=lambda: [1200066469300551782])
-    ELECTORAL_ROLE_ID: int = 1200043628899356702
-    APPROVED_ROLE_ID: int = 1282944839679344721
-    TEMPORARY_ROLE_ID: int = 1164761892015833129
-    MISSING_ROLE_ID: int = 1289949397362409472
-    INCARCERATED_ROLE_ID: int = 1247284720044085370
-    AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
-        default_factory=lambda: [1213490790341279754]
-    )
-    AUTHORIZED_PENITENTIARY_ROLE_IDS: List[int] = field(
-        default_factory=lambda: [1200097748259717193, 1247144717083476051]
-    )
-    REQUIRED_APPROVALS: int = 3
-    REQUIRED_REJECTIONS: int = 3
-    REJECTION_WINDOW_DAYS: int = 7
-    LOG_CHANNEL_ID: int = 1166627731916734504
-    LOG_FORUM_ID: int = 1159097493875871784
-    LOG_POST_ID: int = 1279118293936111707
-    GUILD_ID: int = 1150630510696075404
+class PostStats:
+    message_count: int = 0
+    last_activity: datetime = datetime.now(timezone.utc)
 
 
-@dataclass
-class Servant:
-    role_name: str
-    members: List[str]
-    member_count: int
-
-
-@dataclass
-class Approval:
-    approval_count: int = 0
-    rejection_count: int = 0
-    reviewers: Set[int] = field(default_factory=set)
-    last_approval_time: Optional[datetime] = None
-
-
-class Model(Generic[T]):
+class Model:
     def __init__(self) -> None:
-        self.base_path: URL = URL(str(Path(__file__).parent))
-        self._data_cache: Dict[str, Any] = {}
-        self.parser: cysimdjson.JSONParser = cysimdjson.JSONParser()
-        self._file_locks: Dict[str, asyncio.Lock] = {}
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=min(cpu_count(), 4)
+        self.banned_users: DefaultDict[str, DefaultDict[str, Set[str]]] = defaultdict(
+            lambda: defaultdict(set)
         )
+        self.thread_permissions: DefaultDict[str, Set[str]] = defaultdict(set)
+        self.ban_cache: Dict[Tuple[str, str, str], Tuple[bool, datetime]] = {}
+        self.CACHE_DURATION: timedelta = timedelta(minutes=5)
+        self.post_stats: Dict[str, PostStats] = {}
+        self.featured_posts: Dict[str, str] = {}
+        self.current_pinned_post: Optional[str] = None
 
-    @staticmethod
-    def async_retry(max_retries: int = 3, delay: float = 1.0) -> Callable:
-        def decorator(func: Callable[..., Coroutine]) -> Callable[..., Coroutine]:
-            @wraps(func)
-            async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                for attempt in range(max_retries):
-                    try:
-                        return await func(*args, **kwargs)
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            raise
-                        logger.warning(
-                            f"Attempt {attempt + 1} failed: {e}. Retrying..."
-                        )
-                        await asyncio.sleep(delay * (2**attempt))
-                return None
-
-            return wrapper
-
-        return decorator
-
-    async def _get_file_lock(self, file_name: str) -> asyncio.Lock:
-        return self._file_locks.setdefault(file_name, asyncio.Lock())
-
-    @asynccontextmanager
-    async def _file_operation(
-        self, file_path: Path, mode: str
-    ) -> AsyncGenerator[Any, None]:
-        lock = await self._get_file_lock(str(file_path))
-        async with lock:
-            try:
-                async with aiofiles.open(str(file_path), mode=mode) as file:
-                    yield file
-            except IOError as e:
-                logger.error(f"IO operation failed for {file_path}: {e}")
-                raise
-
-    @async_retry()
-    async def load_data(self, file_name: str, model: Type[T]) -> T:
-        file_path = self.base_path / file_name
+    async def load_banned_users(self, file_path: str) -> None:
         try:
-            async with self._file_operation(file_path, "rb") as file:
-                content = await file.read()
-
-            loop = asyncio.get_running_loop()
-            try:
-                json_parsed = await loop.run_in_executor(
-                    self._executor, lambda: orjson.loads(content)
-                )
-            except orjson.JSONDecodeError:
-                logger.warning(
-                    f"`orjson` failed to parse {file_name}, using `cysimdjson`"
-                )
-                json_parsed = await loop.run_in_executor(
-                    self._executor, lambda: self.parser.parse(content)
+            async with aiofiles.open(file_path, mode="rb") as file:
+                content: bytes = await file.read()
+                loaded_data: Dict[str, Dict[str, list]] = (
+                    orjson.loads(content) if content.strip() else {}
                 )
 
-            if file_name == "custom.json":
-                instance = {
-                    role: frozenset(members) for role, members in json_parsed.items()
+            self.banned_users.clear()
+            self.banned_users.update(
+                {
+                    channel_id: defaultdict(
+                        set,
+                        {
+                            post_id: set(user_list)
+                            for post_id, user_list in channel_data.items()
+                        },
+                    )
+                    for channel_id, channel_data in loaded_data.items()
                 }
-            elif issubclass(model, BaseModel):
-                instance = await loop.run_in_executor(
-                    self._executor,
-                    lambda: (
-                        model.model_validate_json(content)
-                        if content
-                        else model.model_validate({})
-                    ),
-                )
-            elif model == Counter:
-                instance = Counter(json_parsed)
-                instance = cast(T, instance)
-            else:
-                if issubclass(model, BaseModel):
-                    instance = model.model_validate({})
-                elif model == Counter:
-                    instance = cast(T, Counter())
-                else:
-                    instance = {}
-                await self.save_data(file_name, instance)
-                return cast(T, instance)
-
-            self._data_cache[file_name] = instance
-            logger.info(f"Successfully loaded data from {file_name}")
-            return cast(T, instance)
-
+            )
         except FileNotFoundError:
-            logger.info(f"{file_name} not found. Creating new.")
-            if file_name == "custom.json":
-                instance = {}
-            else:
-                instance = (
-                    model.model_validate({})
-                    if issubclass(model, BaseModel)
-                    else Counter() if model == Counter else {}
-                )
-            await self.save_data(file_name, instance)
-            return cast(T, instance)
-
+            logger.warning(
+                f"Banned users file not found: {file_path}. Creating a new one"
+            )
+            await self.save_banned_users(file_path)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON data: {e}")
         except Exception as e:
-            error_msg = f"Unexpected error loading {file_name}: {e}"
-            logger.error(error_msg)
-            raise ValueError(error_msg) from e
-
-    @async_retry()
-    async def save_data(self, file_name: str, data: T) -> None:
-        file_path = self.base_path / file_name
-        try:
-            loop = asyncio.get_running_loop()
-            json_data = await loop.run_in_executor(
-                self._executor,
-                lambda: orjson.dumps(
-                    (
-                        data.model_dump(mode="json")
-                        if isinstance(data, BaseModel)
-                        else data
-                    ),
-                    option=orjson.OPT_INDENT_2
-                    | orjson.OPT_SERIALIZE_NUMPY
-                    | orjson.OPT_NON_STR_KEYS,
-                ),
+            logger.error(
+                f"Unexpected error loading banned users data: {e}", exc_info=True
             )
 
-            async with self._file_operation(file_path, "wb") as file:
+    async def save_banned_users(self, file_path: str) -> None:
+        try:
+            serializable_banned_users: Dict[str, Dict[str, List[str]]] = {
+                channel_id: {
+                    post_id: list(user_set)
+                    for post_id, user_set in channel_data.items()
+                }
+                for channel_id, channel_data in self.banned_users.items()
+            }
+
+            json_data: bytes = orjson.dumps(
+                serializable_banned_users,
+                option=orjson.OPT_INDENT_2
+                | orjson.OPT_SORT_KEYS
+                | orjson.OPT_SERIALIZE_NUMPY,
+            )
+
+            async with aiofiles.open(file_path, mode="wb") as file:
                 await file.write(json_data)
 
-            self._data_cache[file_name] = data
-            logger.info(f"Successfully saved data to {file_name}")
-
+            logger.info(f"Successfully saved banned users data to {file_path}")
         except Exception as e:
-            logger.error(f"Error saving {file_name}: {e}")
-            raise
+            logger.error(f"Error saving banned users data: {e}", exc_info=True)
 
-    def __del__(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-
-@dataclass
-class Message:
-    message: str
-    user_stats: Dict[str, Any]
-    config: Dict[str, float]
-    validation_flags: Dict[str, bool]
-    _message_length: int = field(init=False, repr=False)
-    _char_frequencies: Counter = field(init=False, repr=False)
-    _is_chinese: bool = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        msg = self.message or ""
-        object.__setattr__(self, "_message_length", len(msg))
-        object.__setattr__(self, "_char_frequencies", Counter(msg))
-        object.__setattr__(
-            self,
-            "_is_chinese",
-            any(
-                ord(c) in range(0x4E00, 0x9FFF + 1)
-                or ord(c) in range(0x3400, 0x4DBF + 1)
-                for c in msg
-            ),
-        )
-
-    def analyze(self) -> frozenset[str]:
-        violations: set[str] = set()
-
-        if self.validation_flags["repetition"]:
-            if self._check_repetition():
-                violations.add("message_repetition")
-
-        if self.validation_flags["digit_ratio"]:
-            if self._check_digit_ratio():
-                violations.add("excessive_digits")
-
-        if self.validation_flags["entropy"]:
-            if self._check_entropy():
-                violations.add("low_entropy")
-
-        if self.validation_flags["feedback"]:
-            self.user_stats["feedback_score"] = max(
-                -5, min(5, self.user_stats.get("feedback_score", 0) - len(violations))
+    async def save_thread_permissions(self, file_path: str) -> None:
+        try:
+            serializable_permissions: Dict[str, List[str]] = {
+                k: list(v) for k, v in self.thread_permissions.items()
+            }
+            json_data: bytes = orjson.dumps(
+                serializable_permissions, option=orjson.OPT_INDENT_2
             )
 
-        return frozenset(violations)
+            async with aiofiles.open(file_path, mode="wb") as file:
+                await file.write(json_data)
 
-    def _check_repetition(self) -> bool:
-        last_msg = self.user_stats.get("last_message", "")
-        if self.message == last_msg:
-            rep_count = self.user_stats.get("repetition_count", 0) + 1
-            self.user_stats["repetition_count"] = rep_count
-            return rep_count >= self.config["MAX_REPEATED_MESSAGES"]
-        self.user_stats.update({"repetition_count": 0, "last_message": self.message})
-        return False
+            logger.info(f"Successfully saved thread permissions to {file_path}")
+        except Exception as e:
+            logger.error(f"Error saving thread permissions: {e}", exc_info=True)
 
-    def _check_digit_ratio(self) -> bool:
-        if not self._message_length:
-            return False
-        threshold = self.config["DIGIT_RATIO_THRESHOLD"] * (
-            1.5 if self._is_chinese else 1.0
+    async def load_thread_permissions(self, file_path: str) -> None:
+        try:
+            async with aiofiles.open(file_path, mode="rb") as file:
+                content: bytes = await file.read()
+                loaded_data: Dict[str, List[str]] = orjson.loads(content)
+
+            self.thread_permissions.clear()
+            self.thread_permissions.update({k: set(v) for k, v in loaded_data.items()})
+
+            logger.info(f"Successfully loaded thread permissions from {file_path}")
+        except FileNotFoundError:
+            logger.warning(
+                f"Thread permissions file not found: {file_path}. Creating a new one"
+            )
+            await self.save_thread_permissions(file_path)
+        except Exception as e:
+            logger.error(f"Error loading thread permissions: {e}", exc_info=True)
+
+    async def load_post_stats(self, file_path: str) -> None:
+        try:
+            async with aiofiles.open(file_path, mode="rb") as file:
+                content: bytes = await file.read()
+                if not content.strip():
+                    loaded_data: Dict[str, Dict[str, Any]] = {}
+                else:
+                    loaded_data: Dict[str, Dict[str, Any]] = orjson.loads(content)
+
+            self.post_stats = {
+                post_id: PostStats(
+                    message_count=data.get("message_count", 0),
+                    last_activity=datetime.fromisoformat(data["last_activity"]),
+                )
+                for post_id, data in loaded_data.items()
+            }
+            logger.info(f"Successfully loaded post stats from {file_path}")
+        except FileNotFoundError:
+            logger.warning(
+                f"Thread stats file not found: {file_path}. Creating a new one"
+            )
+            await self.save_post_stats(file_path)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON data: {e}")
+        except Exception as e:
+            logger.error(
+                f"Unexpected error loading post stats data: {e}", exc_info=True
+            )
+
+    async def save_post_stats(self, file_path: str) -> None:
+        try:
+            serializable_stats: Dict[str, Dict[str, Any]] = {
+                post_id: {
+                    "message_count": stats.message_count,
+                    "last_activity": stats.last_activity.isoformat(),
+                }
+                for post_id, stats in self.post_stats.items()
+            }
+            json_data: bytes = orjson.dumps(
+                serializable_stats,
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            )
+            async with aiofiles.open(file_path, mode="wb") as file:
+                await file.write(json_data)
+            logger.info(f"Successfully saved post stats to {file_path}")
+        except Exception as e:
+            logger.error(f"Error saving post stats data: {e}", exc_info=True)
+
+    async def save_featured_posts(self, file_path: str) -> None:
+        try:
+            json_data = orjson.dumps(
+                self.featured_posts, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS
+            )
+            async with aiofiles.open(file_path, mode="wb") as file:
+                await file.write(json_data)
+            logger.info(f"Successfully saved selected posts to {file_path}")
+        except Exception as e:
+            logger.exception(f"Error saving selected posts to {file_path}: {e}")
+
+    async def load_featured_posts(self, file_path: str) -> None:
+        try:
+            async with aiofiles.open(file_path, mode="rb") as file:
+                content = await file.read()
+                self.featured_posts = orjson.loads(content) if content else {}
+            logger.info(f"Successfully loaded selected posts from {file_path}")
+        except FileNotFoundError:
+            logger.warning(
+                f"Selected posts file not found: {file_path}. Creating a new one"
+            )
+            await self.save_featured_posts(file_path)
+        except orjson.JSONDecodeError as json_err:
+            logger.error(f"JSON decoding error in selected posts: {json_err}")
+        except Exception as e:
+            logger.exception(f"Unexpected error while loading selected posts: {e}")
+
+    def is_user_banned(self, channel_id: str, post_id: str, user_id: str) -> bool:
+        cache_key: Tuple[str, str, str] = (channel_id, post_id, user_id)
+        current_time: datetime = datetime.now(timezone.utc)
+
+        if cache_key in self.ban_cache:
+            is_banned, timestamp = self.ban_cache[cache_key]
+            if current_time - timestamp < self.CACHE_DURATION:
+                return is_banned
+
+        is_banned: bool = user_id in self.banned_users[channel_id][post_id]
+        self.ban_cache[cache_key] = (is_banned, current_time)
+        return is_banned
+
+    async def invalidate_ban_cache(
+        self, channel_id: str, post_id: str, user_id: str
+    ) -> None:
+        self.ban_cache.pop((channel_id, post_id, user_id), None)
+
+    def has_thread_permissions(self, post_id: str, user_id: str) -> bool:
+        return user_id in self.thread_permissions[post_id]
+
+    def get_banned_users(self) -> Generator[Tuple[str, str, str], None, None]:
+        return (
+            (channel_id, post_id, user_id)
+            for channel_id, channel_data in self.banned_users.items()
+            for post_id, user_set in channel_data.items()
+            for user_id in user_set
         )
-        digit_count = sum(1 for c in self.message if c.isdigit())
-        return (digit_count / self._message_length) > threshold
 
-    def _check_entropy(self) -> bool:
-        if not self._message_length:
-            return False
-
-        freqs = np.array(list(self._char_frequencies.values()), dtype=np.float64)
-        probs = freqs / self._message_length
-        entropy = -np.sum(probs * np.log2(probs))
-
-        base_threshold = self.config["MIN_MESSAGE_ENTROPY"] * (
-            0.7 if self._is_chinese else 1.0
-        )
-        length_adjustment = (np.log2(max(self._message_length, 2)) / 10) * (
-            0.8 if self._is_chinese else 1.0
+    def get_thread_permissions(self) -> Generator[Tuple[str, str], None, None]:
+        return (
+            (post_id, user_id)
+            for post_id, user_set in self.thread_permissions.items()
+            for user_id in user_set
         )
 
-        return entropy < max(base_threshold, 2.0 - length_adjustment)
+
+# Decorator
+
+
+def log_action(func):
+    @functools.wraps(func)
+    async def wrapper(self, ctx: interactions.CommandContext, *args, **kwargs):
+        action_details: Optional[ActionDetails] = None
+        try:
+            result = await func(self, ctx, *args, **kwargs)
+            if isinstance(result, ActionDetails):
+                action_details = result
+            else:
+                return result
+        except Exception as e:
+            error_message: str = str(e)
+            await self.send_error(ctx, error_message)
+            action_details = ActionDetails(
+                action=ActionType.DELETE,
+                reason=f"Error: {error_message}",
+                post_name=(
+                    ctx.channel.name
+                    if isinstance(ctx.channel, interactions.GuildForumPost)
+                    else "Unknown"
+                ),
+                actor=ctx.author,
+                result="failed",
+                channel=(
+                    ctx.channel
+                    if isinstance(ctx.channel, interactions.GuildForumPost)
+                    else None
+                ),
+            )
+            raise
+        finally:
+            if action_details:
+                await asyncio.shield(self.log_action_internal(action_details))
+        return result
+
+    return wrapper
 
 
 # Controller
 
 
-class Roles(interactions.Extension):
-    def __init__(self, bot: interactions.Client):
+class Threads(interactions.Extension):
+    def __init__(self, bot: interactions.Client) -> None:
         self.bot: interactions.Client = bot
-        self.config: Config = Config()
-        self.vetting_roles: Data = Data()
-        self.custom_roles: Dict[str, Set[int]] = {}
-        self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
-        self.stats: Counter[str] = Counter()
-        self.processed_thread_ids: Set[int] = set()
-        self.approval_counts: Dict[int, Approval] = {}
-        self.member_role_locks: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
-        self.stats_lock: asyncio.Lock = asyncio.Lock()
-        self.stats_save_task: asyncio.Task | None = None
-        self.message_monitoring_enabled = False
-        self.validation_flags = {
-            "repetition": True,
-            "digit_ratio": True,
-            "entropy": True,
-            "feedback": True,
+        self.model: Model = Model()
+        self.ban_lock: asyncio.Lock = asyncio.Lock()
+        self.BANNED_USERS_FILE: str = os.path.join(
+            os.path.dirname(__file__), "banned_users.json"
+        )
+        self.THREAD_PERMISSIONS_FILE: str = os.path.join(
+            os.path.dirname(__file__), "thread_permissions.json"
+        )
+        self.POST_STATS_FILE: str = os.path.join(BASE_DIR, "post_stats.json")
+        self.FEATURED_POSTS_FILE: str = os.path.join(BASE_DIR, "featured_posts.json")
+        self.LOG_CHANNEL_ID: int = 1166627731916734504
+        self.LOG_FORUM_ID: int = 1159097493875871784
+        self.LOG_POST_ID: int = 1279118293936111707
+        self.POLL_FORUM_ID: int = 1155914521907568740
+        self.TAIWAN_ROLE_ID: int = 1261328929013108778
+        self.THREADS_ROLE_ID: int = 1223635198327914639
+        self.GUILD_ID: int = 1150630510696075404
+        self.CONGRESS_ID: int = 1196707789859459132
+        self.CONGRESS_MEMBER_ROLE: int = 1200254783110525010
+        self.CONGRESS_MOD_ROLE: int = 1300132191883235368
+        self.ROLE_CHANNEL_PERMISSIONS: Dict[int, Tuple[int, ...]] = {
+            1223635198327914639: (
+                1152311220557320202,
+                1168209956802142360,
+                1230197011761074340,
+                1155914521907568740,
+                1169032829548630107,
+                1213345198147637268,
+                1183254117813071922,
+                1250396377540853801,
+            ),
+            1213490790341279754: (1185259262654562355,),
         }
-        self.limit_config: Dict[str, Union[float, int]] = {
-            "MESSAGE_WINDOW_SECONDS": 60.0,
-            "MAX_REPEATED_MESSAGES": 3,
-            "DIGIT_RATIO_THRESHOLD": 0.5,
-            "MIN_MESSAGE_ENTROPY": 1.5,
+        self.ALLOWED_CHANNELS: Tuple[int, ...] = (
+            1152311220557320202,
+            1168209956802142360,
+            1230197011761074340,
+            1155914521907568740,
+            1169032829548630107,
+            1185259262654562355,
+            1183048643071180871,
+            1213345198147637268,
+            1183254117813071922,
+            1196707789859459132,
+            1250396377540853801,
+        )
+        self.FEATURED_CHANNELS: Tuple[int, ...] = (1152311220557320202,)
+        self.TIMEOUT_CHANNEL_IDS: Tuple[int, ...] = (
+            1299458193507881051,
+            1150630511136481322,
+        )
+        self.TIMEOUT_REQUIRED_DIFFERENCE: int = 5
+        self.active_timeout_polls: Dict[int, asyncio.Task] = {}
+        self.TIMEOUT_DURATION: int = 30
+        self.message_count_threshold: int = 200
+        self.rotation_interval: timedelta = timedelta(hours=23)
+        asyncio.create_task(self._initialize_data())
+        self.url_cache: TTLCache = TTLCache(maxsize=1024, ttl=3600)
+        self.last_threshold_adjustment: datetime = datetime.now(
+            timezone.utc
+        ) - timedelta(days=8)
+
+    async def _initialize_data(self) -> None:
+        await asyncio.gather(
+            self.model.load_banned_users(self.BANNED_USERS_FILE),
+            self.model.load_thread_permissions(self.THREAD_PERMISSIONS_FILE),
+            self.model.load_post_stats(self.POST_STATS_FILE),
+            self.model.load_featured_posts(self.FEATURED_POSTS_FILE),
+        )
+
+    # Tag operations
+
+    async def increment_message_count(self, post_id: str) -> None:
+        stats = self.model.post_stats.setdefault(post_id, PostStats())
+        stats.message_count += 1
+        stats.last_activity = datetime.now(timezone.utc)
+        await self.model.save_post_stats(self.POST_STATS_FILE)
+
+    async def update_featured_posts_tags(self) -> None:
+        logger.info(
+            "Updating featured posts tags with threshold: %d",
+            self.message_count_threshold,
+        )
+        logger.debug("Current featured posts: %s", self.model.featured_posts)
+
+        eligible_posts = {
+            post_id
+            for forum_id in self.FEATURED_CHANNELS
+            if (post_id := self.model.featured_posts.get(str(forum_id)))
+            and (stats := self.model.post_stats.get(post_id))
+            and stats.message_count >= self.message_count_threshold
         }
 
-        self.cache = TTLCache(maxsize=100, ttl=300)
-
-        self.base_path: Path = Path(__file__).parent
-        self.model: Model[Any] = Model()
-        self.load_tasks: List[Coroutine] = [
-            self.model.load_data("vetting.json", Data),
-            self.model.load_data("custom.json", dict),
-            self.model.load_data("incarcerated_members.json", dict),
-            self.model.load_data("stats.json", Counter),
-        ]
-
-        asyncio.create_task(self.load_initial_data())
-
-    async def load_initial_data(self):
-        try:
-            results = await asyncio.gather(*self.load_tasks)
-            (
-                self.vetting_roles,
-                self.custom_roles,
-                self.incarcerated_members,
-                self.stats,
-            ) = results
-            logger.info("Initial data loaded successfully")
-        except Exception as e:
-            logger.critical(f"Failed to load critical data: {e}")
-
-    # Decorator
-
-    ContextType = TypeVar("ContextType", bound=interactions.BaseContext)
-
-    def error_handler(
-        func: Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]
-    ) -> Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]:
-        @wraps(func)
-        async def wrapper(
-            self, ctx: interactions.BaseContext, *args: P.args, **kwargs: P.kwargs
-        ) -> T:
+        for post_id in eligible_posts:
             try:
-                result = await func(self, ctx, *args, **kwargs)
-                logger.info(f"`{func.__name__}` completed successfully: {result}")
-                return result
-            except asyncio.CancelledError:
-                logger.warning(f"{func.__name__} was cancelled", exc_info=True)
-                raise
+                await self.add_tag_to_post(post_id)
             except Exception as e:
-                error_msg = f"Error in {func.__name__}: {e!r}\n{traceback.format_exc()}"
-                logger.exception(error_msg)
+                logger.error("Failed to add tag to post %s: %s", post_id, e)
+                continue
+
+        logger.info("Featured posts tags update completed successfully")
+
+    async def add_tag_to_post(self, post_id: str) -> None:
+        try:
+            channel = await self.bot.fetch_channel(int(post_id))
+            forum = await self.bot.fetch_channel(channel.parent_id)
+
+            if not all(
+                (
+                    isinstance(channel, interactions.GuildForumPost),
+                    isinstance(forum, interactions.GuildForum),
+                )
+            ):
+                return
+
+            featured_tag_id = 1275098388718813215
+            current_tags = frozenset(tag.id for tag in channel.applied_tags)
+
+            if featured_tag_id not in current_tags:
+                new_tags = list(current_tags | {featured_tag_id})
+                if len(new_tags) <= 5:
+                    await channel.edit(applied_tags=new_tags)
+                    logger.info(f"Added featured tag to post {post_id}")
+
+        except (ValueError, NotFound, Exception) as e:
+            logger.error(f"Error adding featured tag to post {post_id}: {e}")
+
+    async def pin_featured_post(self, new_post_id: str) -> None:
+        try:
+            new_post = await self.bot.fetch_channel(int(new_post_id))
+            if not isinstance(new_post, interactions.GuildForumPost):
+                return
+
+            forum = await self.bot.fetch_channel(new_post.parent_id)
+            if not isinstance(forum, interactions.GuildForum):
+                return
+
+            posts = await forum.fetch_posts()
+            pinned_posts = [post for post in posts if post.pinned]
+
+            for post in pinned_posts:
                 try:
-                    await asyncio.shield(
-                        self.send_error(ctx, str(e), log_to_channel=True)
-                    )
-                except Exception:
-                    logger.exception("Failed to send error message")
-                raise
+                    await post.unpin(reason="Rotating featured posts.")
+                    await asyncio.sleep(0.25)
+                except Exception as e:
+                    logger.error(f"Failed to unpin post {post.id}: {e}")
+                    return
 
-        return wrapper
+            if not new_post.pinned:
+                await new_post.pin(reason="New featured post.")
+                await asyncio.sleep(0.25)
 
-    # Validators
+                updated_post = await self.bot.fetch_channel(int(new_post_id))
+                if (
+                    isinstance(updated_post, interactions.GuildForumPost)
+                    and updated_post.pinned
+                ):
+                    self.model.current_pinned_post = new_post_id
+                else:
+                    logger.error(f"Failed to pin new post {new_post_id}")
+                    return
+            else:
+                self.model.current_pinned_post = new_post_id
 
-    def get_assignable_role_ids(self) -> frozenset[int]:
-        return frozenset(
-            role_id
-            for roles in self.vetting_roles.assigned_roles.values()
-            for name, role_id in roles.items()
-            if any(
-                name in a_roles
-                for a_roles in self.vetting_roles.assignable_roles.values()
-            )
+            posts = await forum.fetch_posts()
+            final_pinned = [post for post in posts if post.pinned]
+            if len(final_pinned) > 1:
+                logger.warning(f"Multiple posts pinned in channel {new_post.parent_id}")
+
+        except (ValueError, NotFound) as e:
+            logger.error(f"Error pinning post {new_post_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error pinning new post: {e}", exc_info=True)
+
+    async def update_featured_posts_rotation(self) -> None:
+        forum_ids: Sequence[int] = tuple(self.FEATURED_CHANNELS)
+
+        top_posts: list[Optional[str]] = []
+        tasks = [self.get_top_post_id(fid) for fid in forum_ids]
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            top_posts.append(result)
+
+        updates: tuple[tuple[int, str], ...] = tuple(
+            (forum_id, new_post_id)
+            for forum_id, new_post_id in zip(forum_ids, top_posts)
+            if new_post_id
+            and new_post_id != self.model.featured_posts.get(str(forum_id))
         )
 
-    def has_required_roles(
-        self,
-        ctx: interactions.BaseContext,
-        required_role_ids: frozenset[int],
-        role_ids_to_check: frozenset[int] | None = None,
-        check_assignable: bool = False,
-    ) -> bool:
-        has_permission = bool(
-            frozenset(map(attrgetter("id"), getattr(ctx, "author").roles))
-            & required_role_ids
-        )
-        return has_permission and (
-            not check_assignable
-            or (
-                role_ids_to_check is not None
-                and role_ids_to_check <= self.get_assignable_role_ids()
+        if not updates:
+            return
+
+        featured_posts_update = {
+            str(forum_id): new_post_id for forum_id, new_post_id in updates
+        }
+        self.model.featured_posts.update(featured_posts_update)
+
+        for forum_id, new_post_id in updates:
+            current = self.model.featured_posts.get(str(forum_id))
+            logger.info(
+                "".join(
+                    [
+                        "Rotating featured post for forum ",
+                        str(forum_id),
+                        " from ",
+                        str(current),
+                        " to ",
+                        new_post_id,
+                    ]
+                )
             )
+
+        try:
+            await self.model.save_featured_posts(self.FEATURED_POSTS_FILE)
+            await self.update_featured_posts_tags()
+
+            for _, post_id in updates:
+                await self.pin_featured_post(post_id)
+
+            logger.info("Completed featured posts rotation successfully")
+
+        except Exception as e:
+            logger.error(
+                f"Failed to complete featured posts rotation: {e}", exc_info=True
+            )
+            raise
+
+    async def get_top_post_id(self, forum_id: int) -> Optional[str]:
+        try:
+            forum_channel: interactions.GuildChannel = await self.bot.fetch_channel(
+                forum_id
+            )
+            if not isinstance(forum_channel, interactions.GuildForum):
+                logger.warning(f"Channel ID {forum_id} is not a forum channel")
+                return None
+
+            posts: List[interactions.GuildForumPost] = await forum_channel.fetch_posts()
+            stats_dict: Dict[str, PostStats] = self.model.post_stats
+
+            valid_posts: List[interactions.GuildForumPost] = [
+                post for post in posts if str(post.id) in stats_dict
+            ]
+
+            if not valid_posts:
+                return None
+
+            top_post: interactions.GuildForumPost = max(
+                valid_posts, key=(lambda p: stats_dict[str(p.id)].message_count)
+            )
+
+            return str(top_post.id)
+
+        except Exception as e:
+            logger.error(
+                f"Unexpected error fetching top post for forum {forum_id}: {e}",
+                exc_info=True,
+            )
+            return None
+
+    async def adjust_thresholds(self) -> None:
+        current_time: datetime = datetime.now(timezone.utc)
+        post_stats: tuple[PostStats, ...] = tuple(self.model.post_stats.values())
+
+        if not post_stats:
+            logger.info("No posts available to adjust thresholds.")
+            return
+
+        total_posts: int = len(post_stats)
+        total_messages: int = sum(stat.message_count for stat in post_stats)
+        average_messages: float = total_messages / total_posts
+
+        self.message_count_threshold = int(average_messages)
+
+        one_day_ago: datetime = current_time - timedelta(days=1)
+        recent_activity: int = sum(
+            1 for stat in post_stats if stat.last_activity >= one_day_ago
         )
 
-    def validate_vetting_permissions(self, ctx: interactions.BaseContext) -> bool:
-        return self.has_required_roles(
-            ctx, frozenset(self.vetting_roles.authorized_roles.values())
+        self.rotation_interval = (
+            timedelta(hours=12)
+            if recent_activity > 100
+            else timedelta(hours=48) if recent_activity < 10 else timedelta(hours=24)
         )
 
-    def validate_vetting_permissions_with_roles(
-        self, ctx: interactions.BaseContext, role_ids_to_add: Iterable[int]
-    ) -> bool:
-        return self.has_required_roles(
-            ctx,
-            frozenset(self.vetting_roles.authorized_roles.values()),
-            frozenset(role_ids_to_add),
-            check_assignable=True,
+        activity_threshold: int = 50
+        adjustment_period: timedelta = timedelta(days=7)
+        minimum_threshold: int = 10
+
+        if (
+            average_messages < activity_threshold
+            and (current_time - self.last_threshold_adjustment) > adjustment_period
+        ):
+            self.rotation_interval = timedelta(hours=12)
+            self.message_count_threshold = max(
+                minimum_threshold, self.message_count_threshold >> 1
+            )
+            self.last_threshold_adjustment = current_time
+
+            logger.info(
+                f"Standards not met for over a week. Adjusted thresholds: message_count_threshold={self.message_count_threshold}, rotation_interval={self.rotation_interval}"
+            )
+
+        logger.info(
+            f"Threshold adjustment complete: message_count_threshold={self.message_count_threshold}, rotation_interval={self.rotation_interval}"
         )
-
-    def validate_custom_permissions(self, ctx: interactions.BaseContext) -> bool:
-        return self.has_required_roles(
-            ctx, frozenset(self.config.AUTHORIZED_CUSTOM_ROLE_IDS)
-        )
-
-    def validate_penitentiary_permissions(self, ctx: interactions.BaseContext) -> bool:
-        return self.has_required_roles(
-            ctx, frozenset(self.config.AUTHORIZED_PENITENTIARY_ROLE_IDS)
-        )
-
-    @lru_cache()
-    def _get_category_role_ids(
-        self, category: str, *, _cache: dict[str, frozenset[int]] | None = None
-    ) -> frozenset[int]:
-        key = f"category_role_ids_{category}"
-        if _cache is None:
-            return frozenset(
-                self.vetting_roles.assigned_roles.get(category, {}).values()
-            )
-        if key not in _cache:
-            _cache[key] = frozenset(
-                self.vetting_roles.assigned_roles.get(category, {}).values()
-            )
-        return _cache[key]
-
-    async def check_role_assignment_conflicts(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        role_ids_to_add: Iterable[int],
-    ) -> bool:
-        member_roles = frozenset(map(attrgetter("id"), member.roles))
-        roles_to_add = frozenset(role_ids_to_add)
-
-        conflicts = [
-            (
-                member_roles & category_roles,
-                roles_to_add & category_roles,
-            )
-            for category, category_roles in (
-                (cat, self._get_category_role_ids(cat))
-                for cat in self.vetting_roles.assigned_roles
-            )
-            if bool(member_roles & category_roles)
-            and bool(roles_to_add & category_roles)
-            and len((member_roles & category_roles) | (roles_to_add & category_roles))
-            > 1
-        ]
-
-        if conflicts:
-            existing, adding = conflicts[0]
-            await self.send_error(
-                ctx,
-                f"Conflicting roles detected in the category. "
-                f"Member already has {len(existing)} role(s) "
-                f"and is attempting to add {len(adding)} role(s).",
-            )
-            return True
-
-        return False
 
     # View methods
 
-    @staticmethod
     async def create_embed(
-        title: str, description: str = "", color: EmbedColor = EmbedColor.INFO
-    ) -> interactions.Embed:
-        return interactions.Embed(
-            title=title,
-            description=description,
-            color=color.value,
-            timestamp=datetime.now(timezone.utc),
-        ).set_footer(text="鍵政大舞台")
-
-    async def notify_vetting_reviewers(
         self,
-        reviewer_role_ids: List[int],
-        thread: interactions.GuildPublicThread,
-        timestamp: str,
-    ) -> None:
-        if not (guild := await self.bot.fetch_guild(thread.guild.id)):
-            error_msg = f"Guild with ID {thread.guild.id} could not be fetched."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+        title: str,
+        description: str = "",
+        color: Union[EmbedColor, int] = EmbedColor.INFO,
+    ) -> interactions.Embed:
+        color_value: int = color.value if isinstance(color, EmbedColor) else color
 
-        embed = await self.create_embed(
-            title=f"Voter Identity Approval #{timestamp}",
-            description=f"[Click to jump: {thread.name}](https://discord.com/channels/{thread.guild.id}/{thread.id})",
+        embed: interactions.Embed = interactions.Embed(
+            title=title, description=description, color=color_value
         )
 
-        async def process_role(role_id: int) -> None:
-            try:
-                if not (role := await guild.fetch_role(role_id)):
-                    logger.error(f"Reviewer role with ID {role_id} not found.")
-                    return
+        guild: Optional[interactions.Guild] = await self.bot.fetch_guild(self.GUILD_ID)
+        if guild and guild.icon:
+            embed.set_footer(text=guild.name, icon_url=guild.icon.url)
 
-                for member in role.members:
-                    await self.send_direct_message(member, embed)
+        embed.timestamp = datetime.now(timezone.utc)
+        embed.set_footer(text="鍵政大舞台")
+        return embed
 
-                logger.info(
-                    f"Notifications sent to role ID {role_id} in thread {thread.id}"
-                )
-            except Exception as e:
-                logger.error(f"Error processing role {role_id}: {e}")
-
-        for role_id in reviewer_role_ids:
-            await process_role(role_id)
-
-        logger.info(f"All reviewer notifications sent for thread {thread.id}")
-
-    @staticmethod
-    async def send_direct_message(
-        member: interactions.Member, embed: interactions.Embed
-    ) -> None:
-        try:
-            await member.send(embed=embed)
-            logger.debug(f"Sent notification to member {member.id}")
-        except Exception as e:
-            logger.error(f"Failed to send embed to {member.id}: {e}")
-
-    @lru_cache(maxsize=1)
+    @functools.lru_cache(maxsize=1)
     def _get_log_channels(self) -> tuple[int, int, int]:
         return (
-            self.config.LOG_CHANNEL_ID,
-            self.config.LOG_POST_ID,
-            self.config.LOG_FORUM_ID,
+            self.LOG_CHANNEL_ID,
+            self.LOG_POST_ID,
+            self.LOG_FORUM_ID,
         )
 
     async def send_response(
@@ -742,2180 +796,1828 @@ class Roles(interactions.Extension):
             ]
         ],
         message: str,
-        log_to_channel: bool = True,
+        log_to_channel: bool = False,
     ) -> None:
         await self.send_response(
             ctx, "Success", message, EmbedColor.INFO, log_to_channel
         )
 
-    async def create_review_components(
-        self,
-        thread: interactions.GuildPublicThread,
-    ) -> Tuple[interactions.Embed, List[interactions.Button]]:
-        approval_info: Approval = self.approval_counts.get(thread.id, Approval())
-        approval_count: int = approval_info.approval_count
+    async def log_action_internal(self, details: ActionDetails) -> None:
+        logger.debug(f"log_action_internal called for action: {details.action}")
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        action_name = details.action.name.capitalize()
 
-        reviewers_text: str = (
-            ",".join(f"<@{rid}>" for rid in sorted(approval_info.reviewers, key=int))
-            if approval_info.reviewers
-            else "No approvals yet."
+        log_embed = await self.create_embed(
+            title=f"Action Log: {action_name}",
+            color=self.get_action_color(details.action),
+        )
+
+        fields = [
+            ("Actor", details.actor.mention if details.actor else "Unknown", True),
+            (
+                "Thread",
+                f"{details.channel.mention if details.channel else 'Unknown'}",
+                True,
+            ),
+            ("Time", f"<t:{timestamp}:F> (<t:{timestamp}:R>)", True),
+            *(
+                [
+                    (
+                        "Target",
+                        details.target.mention if details.target else "Unknown",
+                        True,
+                    )
+                ]
+                if details.target
+                else []
+            ),
+            ("Result", details.result.capitalize(), True),
+            ("Reason", details.reason, False),
+        ] + (
+            [
+                (
+                    "Additional Info",
+                    self.format_additional_info(details.additional_info),
+                    False,
+                )
+            ]
+            if details.additional_info
+            else []
+        )
+        for name, value, inline in fields:
+            log_embed.add_field(name=name, value=value, inline=inline)
+
+        log_channel = await self.bot.fetch_channel(self.LOG_CHANNEL_ID)
+        log_forum = await self.bot.fetch_channel(self.LOG_FORUM_ID)
+        log_post = await log_forum.fetch_post(self.LOG_POST_ID)
+
+        log_key = f"{details.action}_{details.post_name}_{timestamp}"
+        if getattr(self, "_last_log_key", None) == log_key:
+            logger.warning(f"Duplicate log detected: {log_key}")
+            return
+        self._last_log_key = log_key
+
+        if log_post.archived:
+            await log_post.edit(archived=False)
+
+        await log_post.send(embeds=[log_embed])
+        await log_channel.send(embeds=[log_embed])
+
+        if details.target and not details.target.bot:
+            dm_embed = await self.create_embed(
+                title=f"{action_name} Notification",
+                description=self.get_notification_message(details),
+                color=self.get_action_color(details.action),
+            )
+            components = (
+                [
+                    interactions.Button(
+                        style=interactions.ButtonStyle.URL,
+                        label="Appeal",
+                        url="https://discord.com/channels/1150630510696075404/1230132503273013358",
+                    )
+                ]
+                if details.action == ActionType.LOCK
+                else []
+            )
+            actions_set = {
+                ActionType.LOCK,
+                ActionType.UNLOCK,
+                ActionType.DELETE,
+                ActionType.BAN,
+                ActionType.UNBAN,
+                ActionType.SHARE_PERMISSIONS,
+                ActionType.REVOKE_PERMISSIONS,
+            }
+            if details.action in actions_set:
+                await self.send_dm(details.target, dm_embed, components)
+
+    @staticmethod
+    def get_action_color(action: ActionType) -> int:
+        color_mapping: Dict[ActionType, EmbedColor] = {
+            ActionType.LOCK: EmbedColor.WARN,
+            ActionType.BAN: EmbedColor.ERROR,
+            ActionType.DELETE: EmbedColor.WARN,
+            ActionType.UNLOCK: EmbedColor.INFO,
+            ActionType.UNBAN: EmbedColor.INFO,
+            ActionType.EDIT: EmbedColor.INFO,
+            ActionType.SHARE_PERMISSIONS: EmbedColor.INFO,
+            ActionType.REVOKE_PERMISSIONS: EmbedColor.WARN,
+        }
+        return color_mapping.get(action, EmbedColor.DEBUG).value
+
+    @staticmethod
+    async def send_dm(
+        target: interactions.Member,
+        embed: interactions.Embed,
+        components: List[interactions.Button],
+    ) -> None:
+        try:
+            await target.send(embeds=[embed], components=components)
+        except Exception:
+            logger.warning(f"Failed to send DM to {target.mention}", exc_info=True)
+
+    @staticmethod
+    def get_notification_message(details: ActionDetails) -> str:
+        cm = details.channel.mention if details.channel else "the thread"
+        a = details.action
+
+        base_messages = {
+            ActionType.LOCK: f"{cm} has been locked.",
+            ActionType.UNLOCK: f"{cm} has been unlocked.",
+            ActionType.DELETE: f"Your message has been deleted from {cm}.",
+            ActionType.BAN: f"You have been banned from {cm}. If you continue to attempt to post, your comments will be deleted.",
+            ActionType.UNBAN: f"You have been unbanned from {cm}.",
+            ActionType.SHARE_PERMISSIONS: f"You have been granted permissions to {cm}.",
+            ActionType.REVOKE_PERMISSIONS: f"Your permissions for {cm} have been revoked.",
+        }
+
+        if a == ActionType.EDIT:
+            if details.additional_info and "tag_updates" in details.additional_info:
+                updates = details.additional_info["tag_updates"]
+                actions = [
+                    f"{update['Action']}ed tag '{update['Tag']}'" for update in updates
+                ]
+                return f"Tags have been modified in {cm}: {', '.join(actions)}."
+            return f"Changes have been made to {cm}."
+
+        m = base_messages.get(
+            a, f"An action ({a.name.lower()}) has been performed in {cm}."
+        )
+
+        if a not in {
+            ActionType.BAN,
+            ActionType.UNBAN,
+            ActionType.SHARE_PERMISSIONS,
+            ActionType.REVOKE_PERMISSIONS,
+        }:
+            m += f" Reason: {details.reason}"
+
+        return m
+
+    @staticmethod
+    def format_additional_info(info: Mapping[str, Any]) -> str:
+        return "\n".join(
+            (
+                f"**{k.replace('_', ' ').title()}**:\n"
+                + "\n".join(f"- {ik}: {iv}" for d in v for ik, iv in d.items())
+                if isinstance(v, list) and v and isinstance(v[0], dict)
+                else f"**{k.replace('_', ' ').title()}**: {v}"
+            )
+            for k, v in info.items()
+        )
+
+    # Base commands
+
+    module_base: interactions.SlashCommand = interactions.SlashCommand(
+        name="threads", description="Threads commands"
+    )
+
+    # Top commands
+
+    @module_base.subcommand("top", sub_cmd_description="Return to the top")
+    async def navigate_to_top_post(self, ctx: interactions.SlashContext) -> None:
+        thread: Union[interactions.GuildText, interactions.ThreadChannel] = ctx.channel
+        if message_url := await self.fetch_oldest_message_url(thread):
+            await self.send_success(
+                ctx,
+                f"Here's the link to the top of the thread: [Click here]({message_url}).",
+            )
+        else:
+            await self.send_error(
+                ctx,
+                "Unable to find the top message in this thread. This could happen if the thread is empty or if there was an error accessing the message history. Please try again later or contact a moderator if the issue persists.",
+            )
+
+    @staticmethod
+    async def fetch_oldest_message_url(
+        channel: Union[interactions.GuildText, interactions.ThreadChannel]
+    ) -> Optional[str]:
+        try:
+            async for message in channel.history(limit=1):
+                url = URL(message.jump_url)
+                return str(url.with_path(url.path.rsplit("/", 1)[0] + "/0"))
+        except Exception as e:
+            logger.error(f"Error fetching oldest message: {e}")
+        return None
+
+    # Lock commands
+
+    @module_base.subcommand("lock", sub_cmd_description="Lock the current thread")
+    @interactions.slash_option(
+        name="reason",
+        description="Reason for locking the thread",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+    )
+    @log_action
+    async def lock_post(
+        self, ctx: interactions.SlashContext, reason: str
+    ) -> ActionDetails:
+        return await self.toggle_post_lock(ctx, ActionType.LOCK, reason)
+
+    @module_base.subcommand("unlock", sub_cmd_description="Unlock the current thread")
+    @interactions.slash_option(
+        name="reason",
+        description="Reason for unlocking the thread",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+    )
+    @log_action
+    async def unlock_post(
+        self, ctx: interactions.SlashContext, reason: str
+    ) -> ActionDetails:
+        return await self.toggle_post_lock(ctx, ActionType.UNLOCK, reason)
+
+    @log_action
+    async def toggle_post_lock(
+        self, ctx: interactions.SlashContext, action: ActionType, reason: str
+    ) -> Optional[ActionDetails]:
+        if not await self.validate_channel(ctx):
+            await self.send_error(
+                ctx,
+                "This command can only be used in threads. Please navigate to a thread channel and try again.",
+            )
+            return None
+
+        thread = ctx.channel
+        desired_state = action == ActionType.LOCK
+        action_name = action.name.lower()
+        action_past_tense: Literal["locked", "unlocked"] = (
+            "locked" if desired_state else "unlocked"
+        )
+
+        async def check_conditions() -> Optional[str]:
+            if thread.archived:
+                return f"Unable to {action_name} {thread.mention} because it is archived. Please unarchive the thread first."
+            if thread.locked == desired_state:
+                return f"This thread is already {action_name}ed. No changes were made."
+            permissions_check, error_message = await self.check_permissions(ctx)
+            return error_message if not permissions_check else None
+
+        if error_message := await check_conditions():
+            await self.send_error(ctx, error_message)
+            return None
+
+        try:
+            await asyncio.wait_for(thread.edit(locked=desired_state), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout while trying to {action_name} thread {thread.id}")
+            await self.send_error(
+                ctx,
+                f"The request to {action_name} the thread timed out. Please try again. If the issue persists, contact a moderator.",
+            )
+            return None
+        except Exception as e:
+            logger.exception(f"Failed to {action_name} thread {thread.id}")
+            await self.send_error(
+                ctx,
+                f"Failed to {action_name} the thread due to an error: {str(e)}. Please try again or contact a moderator if the issue persists.",
+            )
+            return None
+
+        await self.send_success(
+            ctx,
+            f"Thread has been successfully {action_past_tense}. All members will be notified of this change.",
+        )
+
+        return ActionDetails(
+            action=action,
+            reason=reason,
+            post_name=thread.name,
+            actor=ctx.author,
+            channel=thread,
+            additional_info={
+                "previous_state": "Unlocked" if action == ActionType.LOCK else "Locked",
+                "new_state": "Locked" if action == ActionType.LOCK else "Unlocked",
+            },
+        )
+
+    # Message commands
+
+    @interactions.message_context_menu(name="Message in Thread")
+    @log_action
+    async def message_actions(
+        self, ctx: interactions.ContextMenuContext
+    ) -> Optional[ActionDetails]:
+        if not isinstance(ctx.channel, interactions.ThreadChannel):
+            await self.send_error(
+                ctx,
+                "This command can only be used in threads. Please try this action in a thread channel instead.",
+            )
+            return None
+
+        post: interactions.ThreadChannel = ctx.channel
+        message: interactions.Message = ctx.target
+
+        if not await self.can_manage_message(post, ctx.author, message):
+            await self.send_error(
+                ctx,
+                "You don't have sufficient permissions to manage this message. You need to be either a moderator or the message author.",
+            )
+            return None
+
+        options: Tuple[interactions.StringSelectOption, ...] = (
+            interactions.StringSelectOption(
+                label="Delete Message",
+                value="delete",
+                description="Delete this message",
+            ),
+            interactions.StringSelectOption(
+                label=f"{'Unpin' if message.pinned else 'Pin'} Message",
+                value=f"{'unpin' if message.pinned else 'pin'}",
+                description=f"{'Unpin' if message.pinned else 'Pin'} this message",
+            ),
+        )
+
+        select_menu: interactions.StringSelectMenu = interactions.StringSelectMenu(
+            *options,
+            placeholder="Select action for message",
+            custom_id=f"message_action:{message.id}",
         )
 
         embed: interactions.Embed = await self.create_embed(
-            title="Voter Identity Approval",
-            description=f"- Approvals: {approval_count}/{self.config.REQUIRED_APPROVALS}\n- Reviewers: {reviewers_text}",
+            title="Message Actions",
+            description="Select an action to perform on this message.",
         )
 
-        return embed, [
-            interactions.Button(style=s, label=l, custom_id=c)
-            for s, l, c in (
-                (interactions.ButtonStyle.SUCCESS, "Approve", "approve"),
-                (interactions.ButtonStyle.DANGER, "Reject", "reject"),
+        await ctx.send(embeds=[embed], components=[select_menu], ephemeral=True)
+        return None
+
+    # Tags commands
+
+    @interactions.message_context_menu(name="Tags in Post")
+    @log_action
+    async def manage_post_tags(self, ctx: interactions.ContextMenuContext) -> None:
+        logger.info(f"manage_post_tags called for post {ctx.channel.id}")
+
+        if not isinstance(ctx.channel, interactions.GuildForumPost):
+            logger.warning(f"Invalid channel for manage_post_tags: {ctx.channel.id}")
+            await self.send_error(ctx, "This command can only be used in forum posts.")
+            return
+
+        has_perm, error_message = await self.check_permissions(
+            interactions.SlashContext(ctx)
+        )
+        if not has_perm:
+            logger.warning(f"Insufficient permissions for user {ctx.author.id}")
+            await self.send_error(ctx, error_message)
+            return
+
+        post: interactions.GuildForumPost = ctx.channel
+        try:
+            available_tags: Tuple[interactions.ThreadTag, ...] = (
+                await self.fetch_available_tags(post.parent_id)
             )
-        ]
+            if not available_tags:
+                logger.warning(f"No available tags found for forum {post.parent_id}")
+                await self.send_error(ctx, "No tags are available for this forum.")
+                return
 
-    # Command groups
+            logger.info(f"Available tags for post {post.id}: {available_tags}")
+        except Exception as e:
+            logger.error(f"Error fetching available tags: {e}", exc_info=True)
+            await self.send_error(
+                ctx, "An error occurred while fetching available tags."
+            )
+            return
 
-    module_base = interactions.SlashCommand(
-        name="roles", description="Role management commands"
+        current_tag_ids: Set[int] = {tag.id for tag in post.applied_tags}
+        logger.info(f"Current tag IDs for post {post.id}: {current_tag_ids}")
+
+        options: Tuple[interactions.StringSelectOption, ...] = tuple(
+            interactions.StringSelectOption(
+                label=f"{'Remove' if tag.id in current_tag_ids else 'Add'}: {tag.name}",
+                value=f"{'remove' if tag.id in current_tag_ids else 'add'}:{tag.id}",
+                description=f"{'Currently applied' if tag.id in current_tag_ids else 'Not applied'}",
+            )
+            for tag in available_tags
+        )
+        logger.info(f"Created {len(options)} options for select menu")
+
+        select_menu: interactions.StringSelectMenu = interactions.StringSelectMenu(
+            *options,
+            placeholder="Select tags to add or remove",
+            custom_id=f"manage_tags:{post.id}",
+            max_values=len(options),
+        )
+        logger.info(f"Created select menu with custom_id: manage_tags:{post.id}")
+
+        embed: interactions.Embed = await self.create_embed(
+            title="Tags in Post",
+            description="Select tags to add or remove from this post. You can select multiple tags at once.",
+        )
+
+        try:
+            await ctx.send(
+                embeds=[embed],
+                components=[select_menu],
+                ephemeral=True,
+            )
+            logger.info(f"Sent tag management menu for post {post.id}")
+        except Exception as e:
+            logger.error(f"Error sending tag management menu: {e}", exc_info=True)
+            await self.send_error(
+                ctx, "An error occurred while creating the tag management menu."
+            )
+
+    async def fetch_available_tags(
+        self, parent_id: int
+    ) -> tuple[interactions.ThreadTag, ...]:
+        try:
+            channel: interactions.GuildChannel = await self.bot.fetch_channel(parent_id)
+            if not isinstance(channel, interactions.GuildForum):
+                logger.warning(f"Channel {parent_id} is not a forum channel")
+                return tuple()
+
+            return tuple(channel.available_tags or ())
+        except Exception as e:
+            logger.error(f"Error fetching available tags for channel {parent_id}: {e}")
+            return tuple()
+
+    # User commands
+
+    @interactions.user_context_menu(name="User in Thread")
+    @log_action
+    async def manage_user_in_forum_post(
+        self, ctx: interactions.ContextMenuContext
+    ) -> None:
+        if not await self.validate_channel(ctx):
+            await self.send_error(
+                ctx,
+                "This command can only be used in specific forum threads. Please try this command in a valid thread.",
+            )
+            return
+
+        thread = ctx.channel
+        target_user = ctx.target
+
+        if target_user.id == self.bot.user.id:
+            await self.send_error(
+                ctx,
+                "You cannot manage the bot's permissions or status in threads.",
+            )
+            return
+
+        if target_user.id == ctx.author.id and self.CONGRESS_MEMBER_ROLE not in {
+            role.id for role in ctx.author.roles
+        }:
+            await self.send_error(
+                ctx,
+                f"Only <@&{self.CONGRESS_MEMBER_ROLE}> have permission to manage their own status in threads. Please contact a <@&{self.CONGRESS_MEMBER_ROLE}> for assistance.",
+            )
+            return
+
+        if not await self.can_manage_post(thread, ctx.author):
+            await self.send_error(
+                ctx,
+                "You do not have the required permissions to manage users in this thread. Please ensure you have the correct role or permissions.",
+            )
+            return
+
+        channel_id, thread_id, user_id = map(
+            str, (thread.parent_id, thread.id, target_user.id)
+        )
+        is_banned = await self.is_user_banned(channel_id, thread_id, user_id)
+        has_permissions = self.model.has_thread_permissions(thread_id, user_id)
+
+        options = (
+            interactions.StringSelectOption(
+                label=f"{'Unban' if is_banned else 'Ban'} User",
+                value=f"{'unban' if is_banned else 'ban'}",
+                description=f"Currently {'banned' if is_banned else 'not banned'}",
+            ),
+            interactions.StringSelectOption(
+                label=f"{'Revoke' if has_permissions else 'Share'} Permissions",
+                value=f"{'revoke_permissions' if has_permissions else 'share_permissions'}",
+                description=f"Currently has {'shared' if has_permissions else 'no special'} permissions",
+            ),
+        )
+
+        select_menu: interactions.StringSelectMenu = interactions.StringSelectMenu(
+            *options,
+            placeholder="Select action for user",
+            custom_id=f"manage_user:{channel_id}:{thread_id}:{user_id}",
+        )
+
+        embed: interactions.Embed = await self.create_embed(
+            title="User in Thread",
+            description=f"Select action for {target_user.mention}:\n"
+            f"Current status: {'Banned' if is_banned else 'Not banned'} in this thread.\n"
+            f"Permissions: {'Shared' if has_permissions else 'Not shared'}",
+        )
+
+        await ctx.send(embeds=[embed], components=[select_menu], ephemeral=True)
+
+    # Timeout commands
+
+    @module_base.subcommand(
+        "timeout", sub_cmd_description="Start a timeout poll for a user"
     )
-    module_group_custom: interactions.SlashCommand = module_base.group(
-        name="custom", description="Custom roles management"
+    @interactions.slash_option(
+        name="user",
+        description="The user to timeout",
+        required=True,
+        opt_type=interactions.OptionType.USER,
     )
-    module_group_vetting: interactions.SlashCommand = module_base.group(
-        name="vetting", description="Vetting management"
+    @interactions.slash_option(
+        name="reason",
+        description="Reason for timeout",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
     )
-    module_group_servant: interactions.SlashCommand = module_base.group(
-        name="servant", description="Servants management"
+    @interactions.slash_option(
+        name="duration",
+        description="Timeout duration in minutes (max 10)",
+        required=True,
+        opt_type=interactions.OptionType.INTEGER,
+        min_value=1,
+        max_value=10,
     )
-    module_group_penitentiary: interactions.SlashCommand = module_base.group(
-        name="penitentiary", description="Penitentiary management"
+    async def timeout_poll(
+        self,
+        ctx: interactions.SlashContext,
+        user: Union[
+            interactions.PermissionOverwrite, interactions.Role, interactions.User
+        ],
+        reason: str,
+        duration: int,
+    ) -> None:
+        if not isinstance(user, interactions.Member):
+            await self.send_error(ctx, "Invalid user type provided.")
+            return
+
+        if any(
+            [
+                ctx.channel.id not in self.TIMEOUT_CHANNEL_IDS,
+                await self.has_admin_permissions(user),
+                user.id in self.active_timeout_polls,
+            ]
+        ):
+            await self.send_error(
+                ctx,
+                next(
+                    filter(
+                        None,
+                        [
+                            (
+                                "This command can only be used in the designated timeout channels."
+                                if ctx.channel.id not in self.TIMEOUT_CHANNEL_IDS
+                                else None
+                            ),
+                            (
+                                "You cannot start a timeout poll for administrators."
+                                if await self.has_admin_permissions(user)
+                                else None
+                            ),
+                            (
+                                f"There is already an active timeout poll for {user.mention}."
+                                if user.id in self.active_timeout_polls
+                                else None
+                            ),
+                        ],
+                    )
+                ),
+            )
+            return
+
+        embed = await self.create_embed(title="Timeout Poll", color=EmbedColor.WARN)
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.add_field(name="Duration", value=f"{duration} minutes", inline=True)
+        embed.add_field(
+            name="Required difference",
+            value=f"{self.TIMEOUT_REQUIRED_DIFFERENCE} votes",
+            inline=True,
+        )
+
+        end_time = int((datetime.now(timezone.utc) + timedelta(minutes=1)).timestamp())
+        embed.add_field(
+            name="Poll duration", value=f"Ends <t:{end_time}:R>", inline=True
+        )
+
+        message = await ctx.send(embeds=[embed])
+        await message.add_reaction("👍")
+        await message.add_reaction("👎")
+
+        task = asyncio.create_task(
+            self.handle_timeout_poll(ctx, message, user, reason, duration)
+        )
+        self.active_timeout_polls[user.id] = task
+
+        await asyncio.sleep(60)
+        await self.active_timeout_polls.pop(user.id, None)
+
+    async def handle_timeout_poll(
+        self,
+        ctx: interactions.SlashContext,
+        message: interactions.Message,
+        target: Union[
+            interactions.PermissionOverwrite, interactions.Role, interactions.User
+        ],
+        reason: str,
+        duration: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(60)
+            reactions = (await ctx.channel.fetch_message(message.id)).reactions
+
+            votes = {
+                r.emoji.name: r.count - 1
+                for r in reactions
+                if r.emoji.name in ("👍", "👎")
+            }
+            vote_diff = votes.get("👍", 0) - votes.get("👎", 0)
+
+            channel = ctx.channel
+            end_time = int(
+                (datetime.now(timezone.utc) + timedelta(minutes=duration)).timestamp()
+            )
+
+            if vote_diff >= self.TIMEOUT_REQUIRED_DIFFERENCE:
+                try:
+                    deny_perms = [
+                        interactions.Permissions.SEND_MESSAGES,
+                        interactions.Permissions.SEND_MESSAGES_IN_THREADS,
+                        interactions.Permissions.SEND_TTS_MESSAGES,
+                        interactions.Permissions.SEND_VOICE_MESSAGES,
+                        interactions.Permissions.ADD_REACTIONS,
+                        interactions.Permissions.ATTACH_FILES,
+                        interactions.Permissions.CREATE_INSTANT_INVITE,
+                        interactions.Permissions.MENTION_EVERYONE,
+                        interactions.Permissions.MANAGE_MESSAGES,
+                        interactions.Permissions.MANAGE_THREADS,
+                        interactions.Permissions.MANAGE_CHANNELS,
+                    ]
+
+                    forum_perms = [interactions.Permissions.CREATE_POSTS, *deny_perms]
+
+                    try:
+                        if hasattr(channel, "parent_channel"):
+                            target_channel = channel.parent_channel
+                            perms = forum_perms
+                        else:
+                            target_channel = channel
+                            perms = deny_perms
+
+                        reason_str = f"Member {target.display_name}({target.id}) timeout until <t:{end_time}:f> in Channel {target_channel.name} reason:{reason[:50] if len(reason) > 51 else reason}"
+                        await target_channel.add_permission(
+                            target, deny=perms, reason=reason_str
+                        )
+
+                    except Forbidden:
+                        await self.send_error(
+                            ctx,
+                            "The bot needs to have enough permissions! Please contact technical support!",
+                        )
+                        return
+
+                    asyncio.create_task(
+                        self.restore_permissions(target_channel, target, duration)
+                    )
+
+                    result_embed = await self.create_embed(title="Timeout Poll Result")
+                    result_embed.add_field(
+                        name="Status",
+                        value=f"{target.mention} has been timed out until <t:{end_time}:R>.",
+                        inline=True,
+                    )
+                    result_embed.add_field(
+                        name="Yes Votes", value=str(votes.get("👍", 0)), inline=True
+                    )
+                    result_embed.add_field(
+                        name="No Votes", value=str(votes.get("👎", 0)), inline=True
+                    )
+
+                    await self.send_success(
+                        ctx,
+                        f"{target.mention} has been timed out until <t:{end_time}:R>.\n"
+                        f"- Yes Votes: {votes.get('👍', 0)}\n"
+                        f"- No Votes: {votes.get('👎', 0)}",
+                        log_to_channel=True
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to apply timeout: {e}")
+                    await self.send_error(
+                        ctx, f"Failed to apply timeout to {target.mention}"
+                    )
+            else:
+                result_embed = await self.create_embed(title="Timeout Poll Result")
+                result_embed.add_field(
+                    name="Status",
+                    value=f"Timeout poll for {target.mention} failed.",
+                    inline=True,
+                )
+                result_embed.add_field(
+                    name="Yes Votes", value=str(votes.get("👍", 0)), inline=True
+                )
+                result_embed.add_field(
+                    name="No Votes", value=str(votes.get("👎", 0)), inline=True
+                )
+                result_embed.add_field(
+                    name="Required difference",
+                    value=f"{self.TIMEOUT_REQUIRED_DIFFERENCE} votes",
+                    inline=True,
+                )
+
+            await ctx.channel.send(embeds=[result_embed])
+
+        except Exception as e:
+            logger.error(f"Error handling timeout poll: {e}", exc_info=True)
+            await self.send_error(
+                ctx, "An error occurred while processing the timeout poll."
+            )
+
+    async def restore_permissions(
+        self,
+        channel: Union[interactions.GuildChannel, interactions.ThreadChannel],
+        member: Union[
+            interactions.PermissionOverwrite, interactions.Role, interactions.User
+        ],
+        duration: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(duration * 60)
+            channel = getattr(channel, "parent_channel", channel)
+
+            end_time = int(datetime.now(timezone.utc).timestamp())
+            await channel.delete_permission(
+                member, reason=f"Timeout expired at <t:{end_time}:f>"
+            )
+
+            embed = await self.create_embed(title="Timeout Expired")
+            embed.add_field(
+                name="Status",
+                value=f"{member.mention}'s timeout has expired at <t:{end_time}:f>.",
+                inline=True,
+            )
+            await channel.send(embeds=[embed])
+
+        except Exception as e:
+            logger.error(f"Error restoring permissions: {e}", exc_info=True)
+
+    # List commands
+
+    @module_base.subcommand(
+        "list", sub_cmd_description="List information for current thread"
     )
-    module_group_debug: interactions.SlashCommand = module_base.group(
-        name="debug", description="Debug commands"
+    @interactions.slash_option(
+        name="type",
+        description="Type of information to list",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+        choices=[
+            interactions.SlashCommandChoice(name="Banned Users", value="banned"),
+            interactions.SlashCommandChoice(
+                name="Thread Permissions", value="permissions"
+            ),
+            interactions.SlashCommandChoice(name="Post Statistics", value="stats"),
+        ],
     )
+    async def list_thread_info(self, ctx: interactions.SlashContext, type: str) -> None:
+        if not await self.validate_channel(ctx):
+            await self.send_error(
+                ctx,
+                "This command can only be used in threads. Please navigate to a thread channel and try again.",
+            )
+            return
+
+        if not await self.can_manage_post(ctx.channel, ctx.author):
+            await self.send_error(
+                ctx,
+                "You don't have permission to view information in this thread. Please contact a thread owner or moderator for access.",
+            )
+            return
+
+        channel_id, post_id = str(ctx.channel.parent_id), str(ctx.channel.id)
+
+        match type:
+            case "banned":
+                banned_users = self.model.banned_users[channel_id][post_id]
+
+                if not banned_users:
+                    await self.send_success(
+                        ctx,
+                        "There are currently no banned users in this thread. The thread is open to all permitted users.",
+                    )
+                    return
+
+                embeds = []
+                current_embed = await self.create_embed(
+                    title=f"Banned Users in <#{post_id}>"
+                )
+
+                for user_id in banned_users:
+                    try:
+                        user = await self.bot.fetch_user(int(user_id))
+                        current_embed.add_field(
+                            name="Banned User",
+                            value=f"- User: {user.mention if user else user_id}",
+                            inline=True,
+                        )
+
+                        if len(current_embed.fields) >= 5:
+                            embeds.append(current_embed)
+                            current_embed = await self.create_embed(
+                                title=f"Banned Users in <#{post_id}>"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error fetching user {user_id}: {e}")
+                        continue
+
+                if current_embed.fields:
+                    embeds.append(current_embed)
+
+                await self._send_paginated_response(
+                    ctx, embeds, "No banned users were found in this thread."
+                )
+
+            case "permissions":
+                users_with_permissions = self.model.thread_permissions[post_id]
+
+                if not users_with_permissions:
+                    await self.send_success(
+                        ctx,
+                        "No users currently have special permissions in this thread. Only default access rules apply.",
+                    )
+                    return
+
+                embeds = []
+                current_embed = await self.create_embed(
+                    title=f"Users with Permissions in <#{post_id}>"
+                )
+
+                for user_id in users_with_permissions:
+                    try:
+                        user = await self.bot.fetch_user(int(user_id))
+                        current_embed.add_field(
+                            name="User with Permissions",
+                            value=f"- User: {user.mention if user else user_id}",
+                            inline=True,
+                        )
+
+                        if len(current_embed.fields) >= 5:
+                            embeds.append(current_embed)
+                            current_embed = await self.create_embed(
+                                title=f"Users with Permissions in <#{post_id}>"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error fetching user {user_id}: {e}")
+                        continue
+
+                if current_embed.fields:
+                    embeds.append(current_embed)
+
+                await self._send_paginated_response(
+                    ctx,
+                    embeds,
+                    "No users with special permissions were found in this thread.",
+                )
+
+            case "stats":
+                stats = self.model.post_stats.get(post_id)
+
+                if not stats:
+                    await self.send_success(
+                        ctx,
+                        "No statistics are currently available for this thread. This may be a new thread or statistics tracking may be disabled.",
+                    )
+                    return
+
+                embed = await self.create_embed(
+                    title=f"Statistics for <#{post_id}>",
+                    description=(
+                        f"- Message Count: {stats.message_count}\n"
+                        f"- Last Activity: {stats.last_activity.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                        f"- Post Created: <t:{int(ctx.channel.created_at.timestamp())}:F>"
+                    ),
+                )
+
+                await ctx.send(embeds=[embed])
 
     # Debug commands
 
-    @module_group_debug.subcommand(
-        "inactive",
-        sub_cmd_description="Convert inactive members to missing members",
-    )
-    @error_handler
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
-    )
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
-        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
-            await self.send_error(
-                ctx, "You need Administrator permission to use this command."
-            )
-            return
+    async def has_threads_role(ctx: interactions.BaseContext) -> bool:
+        return any(
+            role.id == ctx.command.extension.THREADS_ROLE_ID
+            for role in ctx.author.roles
+        )
 
-        await ctx.defer()
-
-        try:
-            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
-            electoral_role = await guild.fetch_role(self.config.ELECTORAL_ROLE_ID)
-            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
-
-            if not all((temp_role, electoral_role, missing_role)):
-                return await self.send_error(
-                    ctx,
-                    f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
-                )
-
-            cutoff = datetime.now(timezone.utc) - timedelta(days=15)
-            grace_period = datetime.now(timezone.utc) - timedelta(days=15)
-            converted_members = []
-
-            text_channels = {
-                channel
-                for channel in guild.channels
-                if isinstance(
-                    channel, (interactions.GuildText, interactions.ThreadChannel)
-                )
-                and channel.type
-                in (
-                    interactions.ChannelType.GUILD_TEXT,
-                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
-                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
-                )
-            }
-
-            members_to_check: list[interactions.Member] = [
-                *filter(None, (temp_role.members, electoral_role.members))
-            ]
-            members_to_check = [
-                member for member in temp_role.members + electoral_role.members
-            ]
-
-            total_members = len(members_to_check)
-            processed = skipped = 0
-
-            BATCH_SIZE = min(25, total_members)
-            REPORT_THRESHOLD = 10
-            BATCH_COOLDOWN = 5.0
-            PROGRESS_UPDATE_INTERVAL = 30.0
-            last_progress_update = time.monotonic()
-
-            for batch in (
-                members_to_check[i : i + BATCH_SIZE]
-                for i in range(0, total_members, BATCH_SIZE)
-            ):
-                batch_start = time.monotonic()
-
-                for member in batch:
-                    if member.joined_at and member.joined_at > grace_period:
-                        skipped += 1
-                        processed += 1
-                        continue
-
-                    try:
-                        if await self.check_member_last_activity(
-                            member, text_channels, cutoff
-                        ):
-                            new_roles = {
-                                role.id
-                                for role in member.roles
-                                if role not in (temp_role, electoral_role)
-                            } | {missing_role.id}
-
-                            await member.edit(
-                                roles=list(new_roles),
-                                reason="Converting inactive member",
-                            )
-                            await asyncio.sleep(0.5)
-
-                            converted_members.append(member.mention)
-                            logger.info(f"Updated roles for member {member.id}")
-
-                        processed += 1
-
-                        if len(converted_members) >= REPORT_THRESHOLD:
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}\n"
-                                f"- Recently converted members: {', '.join(converted_members)}",
-                            )
-                            converted_members.clear()
-                            await asyncio.sleep(0.5)
-
-                        current_time = time.monotonic()
-                        if (
-                            current_time - last_progress_update
-                            >= PROGRESS_UPDATE_INTERVAL
-                        ):
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}",
-                            )
-                            last_progress_update = current_time
-
-                    except Exception as e:
-                        logger.error(f"Error processing member {member.id}: {e}")
-                        continue
-
-                elapsed = time.monotonic() - batch_start
-                if elapsed < BATCH_COOLDOWN:
-                    await asyncio.sleep(BATCH_COOLDOWN - elapsed)
-
-            if converted_members:
-                await asyncio.sleep(0.5)
-                await self.send_success(
-                    ctx,
-                    f"- Total processed: {processed}/{total_members}\n"
-                    f"- Skipped (grace period): {skipped}\n"
-                    f"- Last converted members: {', '.join(converted_members)}",
-                )
-
-            await asyncio.sleep(0.5)
-            await self.send_success(
-                ctx,
-                f"- Total members processed: {total_members}\n"
-                f"- Members skipped (grace period): {skipped}\n"
-                f"- Members converted: {processed - skipped}",
-            )
-
-        except Exception as e:
-            logger.error(f"Error in process_inactive_members: {e}")
-            await self.send_error(
-                ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
-            )
-
-    async def check_member_last_activity(
-        self,
-        member: interactions.Member,
-        text_channels: set[Union[interactions.ThreadChannel, interactions.GuildText]],
-        cutoff: datetime,
-    ) -> bool:
-        try:
-            last_message_time = await self.get_last_message_time(
-                member, text_channels, cutoff
-            )
-            return (
-                not last_message_time
-                or (
-                    last_message_time.replace(tzinfo=timezone.utc)
-                    if last_message_time.tzinfo is None
-                    else last_message_time
-                )
-                < cutoff
-            )
-        except Exception as e:
-            logger.error(f"Error checking activity for member {member.id}: {e}")
-            raise
-
-    @staticmethod
-    async def get_last_message_time(
-        member: interactions.Member,
-        text_channels: set[Union[interactions.ThreadChannel, interactions.GuildText]],
-        cutoff: datetime,
-    ) -> Optional[datetime]:
-        message_limit = 0
-        max_retries = 3
-        current_latest_time: datetime = cutoff
-        channel_latest_times: Dict[int, datetime] = {}
-
-        filtered_channels = {
-            c
-            for c in text_channels
-            if isinstance(
-                c,
-                (
-                    interactions.GuildText,
-                    interactions.ThreadChannel,
-                ),
-            )
-        }
-
-        async def check_channel_history(
-            channel: Union[
-                interactions.GuildText,
-                interactions.ThreadChannel,
-            ],
-        ) -> AsyncGenerator[
-            tuple[Optional[datetime], Optional[datetime], Optional[datetime]], None
-        ]:
-            for retry in range(max_retries):
-                try:
-                    messages = [
-                        msg async for msg in channel.history(limit=message_limit)
-                    ]
-                    if not messages:
-                        yield None, None, None
-                        return
-
-                    channel_latest = messages[0].created_at
-                    channel_earliest = messages[-1].created_at
-
-                    if (
-                        current_latest_time is not None
-                        and channel_earliest <= current_latest_time
-                    ):
-                        yield None, channel_latest, channel_earliest
-                        return
-
-                    member_time = next(
-                        (m.created_at for m in messages if m.author.id == member.id),
-                        None,
-                    )
-                    yield member_time, channel_latest, channel_earliest
-                    return
-                except Exception as e:
-                    if retry == max_retries - 1:
-                        logger.error(
-                            f"Error checking channel {channel.id} after {max_retries} retries: {e}"
-                        )
-                        yield None, None, None
-                        return
-                    await asyncio.sleep(0.5)
-
-        total_channels = len(filtered_channels)
-        chunk_size = min(max(8, (os.cpu_count() or 4) * 4), total_channels)
-        found_any_messages = False
-
-        async def process_channels() -> AsyncGenerator[Optional[datetime], None]:
-            nonlocal current_latest_time, found_any_messages
-            remaining_channels = filtered_channels.copy()
-
-            while remaining_channels:
-                current_chunk = set(itertools.islice(remaining_channels, chunk_size))
-                remaining_channels -= current_chunk
-
-                for channel in current_chunk:
-                    async for (
-                        member_time,
-                        channel_latest,
-                        channel_earliest,
-                    ) in check_channel_history(channel):
-                        if channel_latest:
-                            channel_latest_times[channel.id] = channel_latest
-
-                        if member_time:
-                            if member_time > cutoff:
-                                yield member_time
-                                return
-
-                            found_any_messages = True
-                            if (
-                                current_latest_time is None
-                                or member_time > current_latest_time
-                            ):
-                                current_latest_time = member_time
-                                yield None
-
-                remaining_channels = {
-                    channel
-                    for channel in remaining_channels
-                    if channel.id not in channel_latest_times
-                    or (
-                        channel_latest_times[channel.id]
-                        and channel_latest_times[channel.id]
-                        > (current_latest_time or cutoff)
-                    )
-                }
-
-                if not remaining_channels:
-                    break
-
-                await asyncio.sleep(0.1)
-
-        async for final_time in process_channels():
-            if final_time is not None:
-                return final_time
-
-        return current_latest_time if found_any_messages else None
-
-    @module_group_debug.subcommand(
-        "conflicts", sub_cmd_description="Check and resolve role conflicts"
-    )
-    @error_handler
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
-    )
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
-        ROLE_PRIORITIES = {
-            self.config.MISSING_ROLE_ID: 1,
-            self.config.INCARCERATED_ROLE_ID: 2,
-            self.config.ELECTORAL_ROLE_ID: 3,
-            self.config.APPROVED_ROLE_ID: 4,
-            self.config.TEMPORARY_ROLE_ID: 5,
-        }
-        BATCH_SIZE = 8
-        ROLE_CHANGE_INTERVAL = 1.0
-        REPORT_INTERVAL = 5.0
-
-        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
-            await self.send_error(
-                ctx,
-                "You need Administrator permission to check role conflicts.",
-            )
-            return
-
-        await ctx.defer()
-
-        try:
-            processed, conflicts = 0, 0
-            log_buffer = []
-            last_report_time = time.monotonic()
-
-            member_chunks = [
-                list(ctx.guild.members)[i : i + BATCH_SIZE]
-                for i in range(0, len(ctx.guild.members), BATCH_SIZE)
-            ]
-
-            for chunk in member_chunks:
-                chunk_start = time.monotonic()
-
-                for member in chunk:
-                    try:
-                        member_role_ids = {role.id for role in member.roles}
-                        priority_roles = {
-                            role_id: prio
-                            for role_id, prio in ROLE_PRIORITIES.items()
-                            if role_id in member_role_ids
-                        }
-
-                        if len(priority_roles) > 1:
-                            highest_prio = min(priority_roles.values())
-                            roles_to_remove = {
-                                role_id
-                                for role_id, prio in priority_roles.items()
-                                if prio > highest_prio
-                            }
-
-                            if roles_to_remove:
-                                roles_to_keep = [
-                                    role.id
-                                    for role in member.roles
-                                    if role.id not in roles_to_remove
-                                ]
-                                await member.edit(
-                                    roles=roles_to_keep,
-                                    reason="Resolving role priority conflicts",
-                                )
-                                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-
-                                conflicts += 1
-                                log_buffer.append(
-                                    f"- Member: {member.mention}\n- Removed roles: {len(roles_to_remove)}"
-                                )
-
-                                current_time = time.monotonic()
-                                if current_time - last_report_time >= REPORT_INTERVAL:
-                                    if log_buffer:
-                                        await self.send_success(
-                                            None, "\n".join(log_buffer)
-                                        )
-                                        log_buffer = []
-                                        last_report_time = current_time
-                                        await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing member {member.id}: {str(e)}\n"
-                            f"{traceback.format_exc()}"
-                        )
-
-                    processed += 1
-
-                elapsed = time.monotonic() - chunk_start
-                if elapsed < REPORT_INTERVAL:
-                    await asyncio.sleep(REPORT_INTERVAL - elapsed)
-
-            if log_buffer:
-                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(None, "\n".join(log_buffer))
-
-            if conflicts:
-                await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(
-                    None,
-                    f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
-                )
-
-            logger.info(
-                f"- Members processed: {processed}\n- Conflicts resolved: {conflicts}"
-            )
-
-        except Exception as e:
-            error_msg = f"Critical error in role conflict check:\n{str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            await self.send_error(None, error_msg, log_to_channel=True)
-
-    @module_group_debug.subcommand(
-        "view", sub_cmd_description="View configuration files"
-    )
+    @module_base.subcommand("view", sub_cmd_description="View configuration files")
     @interactions.slash_option(
-        name="config",
+        name="type",
         description="Configuration type to view",
-        opt_type=interactions.OptionType.STRING,
         required=True,
+        opt_type=interactions.OptionType.STRING,
         choices=[
-            *(
-                interactions.SlashCommandChoice(name=n, value=v)
-                for n, v in {
-                    "Vetting Roles": "vetting",
-                    "Custom Roles": "custom",
-                    "Incarcerated Members": "incarcerated",
-                    "Stats": "stats",
-                    "Config": "dynamic",
-                }.items()
-            )
+            interactions.SlashCommandChoice(name="Banned Users", value="banned"),
+            interactions.SlashCommandChoice(
+                name="Thread Permissions", value="permissions"
+            ),
+            interactions.SlashCommandChoice(name="Post Statistics", value="stats"),
+            interactions.SlashCommandChoice(name="Featured Threads", value="featured"),
         ],
     )
-    @error_handler
-    async def view_config(self, ctx: interactions.SlashContext, config: str) -> None:
-        await ctx.defer()
+    @interactions.check(has_threads_role)
+    async def list_debug_info(self, ctx: interactions.SlashContext, type: str) -> None:
+        match type:
+            case "banned":
+                banned_users = await self._get_merged_banned_users()
+                embeds = await self._create_banned_user_embeds(banned_users)
+                await self._send_paginated_response(
+                    ctx, embeds, "No banned users found."
+                )
+            case "permissions":
+                permissions = await self._get_merged_permissions()
+                permissions_dict = defaultdict(set)
+                for thread_id, user_id in permissions:
+                    permissions_dict[thread_id].add(user_id)
+                embeds = await self._create_permission_embeds(permissions_dict)
+                await self._send_paginated_response(
+                    ctx, embeds, "No thread permissions found."
+                )
+            case "stats":
+                stats = await self._get_merged_stats()
+                embeds = await self._create_stats_embeds(stats)
+                await self._send_paginated_response(
+                    ctx, embeds, "No post statistics found."
+                )
+            case "featured":
+                featured_posts = await self._get_merged_featured_posts()
+                stats = await self._get_merged_stats()
+                embeds = await self._create_featured_embeds(featured_posts, stats)
+                await self._send_paginated_response(
+                    ctx, embeds, "No featured threads found."
+                )
+
+    async def _get_merged_banned_users(self) -> Set[Tuple[str, str, str]]:
         try:
-            if not (config_data := await self._get_config_data(config)):
-                return await self.send_error(
-                    ctx,
-                    f"Unable to find data for the `{config}` configuration. Please verify that the configuration exists and try again. Try using a different configuration type from the dropdown menu.",
-                )
-
-            if not (embeds := await self._generate_embeds(config, config_data)):
-                return await self.send_error(
-                    ctx,
-                    f"The `{config}` configuration exists but contains no displayable data. This may indicate an empty or corrupted configuration file.",
-                )
-
-            await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
-
+            await self.model.load_banned_users(self.BANNED_USERS_FILE)
+            return {
+                (channel_id, post_id, user_id)
+                for channel_id, channel_data in self.model.banned_users.items()
+                for post_id, user_set in channel_data.items()
+                for user_id in user_set
+            }
         except Exception as e:
-            logger.error(f"Error in view_config: {e}\n{traceback.format_exc()}")
-            await self.send_error(
-                ctx,
-                f"An unexpected error occurred while viewing the configuration: {str(e)}",
-            )
+            logger.error(f"Error loading banned users: {e}", exc_info=True)
+            return set()
 
-    async def _get_config_data(self, config: str) -> Optional[Any]:
-        return (
-            self.limit_config
-            if config == "dynamic"
-            else (
-                await self.model.load_data(
-                    *next(
-                        (
-                            (f, t)
-                            for c, (f, t) in {
-                                "vetting": ("vetting.json", Data),
-                                "custom": ("custom.json", dict),
-                                "incarcerated": ("incarcerated_members.json", dict),
-                                "stats": ("stats.json", Counter),
-                            }.items()
-                            if c == config
-                        ),
-                        (None, None),
-                    )
-                )
-                if config != "dynamic"
-                else None
-            )
-        )
+    async def _get_merged_permissions(self) -> Set[Tuple[str, str]]:
+        try:
+            await self.model.load_thread_permissions(self.THREAD_PERMISSIONS_FILE)
+            return {
+                (thread_id, user_id)
+                for thread_id, users in self.model.thread_permissions.items()
+                for user_id in users
+            }
+        except Exception as e:
+            logger.error(f"Error loading thread permissions: {e}", exc_info=True)
+            return set()
 
-    async def _generate_embeds(
-        self, config: str, config_data: Any
+    async def _get_merged_stats(self) -> Dict[str, PostStats]:
+        try:
+            await self.model.load_post_stats(self.POST_STATS_FILE)
+            return self.model.post_stats
+        except Exception as e:
+            logger.error(f"Error loading post stats: {e}", exc_info=True)
+            return {}
+
+    async def _get_merged_featured_posts(self) -> Dict[str, str]:
+        try:
+            await self.model.load_featured_posts(self.FEATURED_POSTS_FILE)
+            return self.model.featured_posts
+        except Exception as e:
+            logger.error(f"Error loading featured posts: {e}", exc_info=True)
+            return {}
+
+    async def _create_banned_user_embeds(
+        self, banned_users: Set[Tuple[str, str, str]]
     ) -> List[interactions.Embed]:
         embeds: List[interactions.Embed] = []
-        current_embed = await self.create_embed(
-            title=f"{config.title()} Configuration Details",
-            description="Below are the detailed settings and configurations.",
-        )
-        field_count = 0
-        max_fields = 25
-        total_chars = len(current_embed.title or "") + len(
-            current_embed.description or ""
-        )
+        current_embed = await self.create_embed(title="Banned Users List")
 
-        async def add_field(name: str, value: str, inline: bool = True) -> None:
-            nonlocal current_embed, field_count, total_chars
-            name = name[:256]
+        for channel_id, post_id, user_id in banned_users:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+                post = await self.bot.fetch_channel(int(post_id))
+                user = await self.bot.fetch_user(int(user_id))
 
-            if len(value) > 1024:
-                chunks = [value[i : i + 1024] for i in range(0, len(value), 1024)]
-                for i, chunk in enumerate(chunks):
-                    field_name = f"{name} (Part {i+1})"[:256]
-                    field_value = (
-                        chunk or "*No data is currently available for this field*"
-                    )
+                field_value = []
+                if post:
+                    field_value.append(f"- Thread: <#{post_id}>")
+                else:
+                    field_value.append(f"- Thread ID: {post_id}")
 
-                    field_chars = len(field_name) + len(field_value)
-                    if total_chars + field_chars > 6000 or field_count >= max_fields:
-                        embeds.append(current_embed)
-                        current_embed = await self.create_embed(
-                            title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
-                            description="Continued configuration details.",
-                            color=EmbedColor.INFO,
-                        )
-                        field_count = 0
-                        total_chars = len(current_embed.title or "") + len(
-                            current_embed.description or ""
-                        )
+                if user:
+                    field_value.append(f"- User: {user.mention}")
+                else:
+                    field_value.append(f"- User ID: {user_id}")
 
-                    current_embed.add_field(
-                        name=field_name,
-                        value=field_value,
-                        inline=inline,
-                    )
-                    field_count += 1
-                    total_chars += field_chars
-            else:
-                field_name = name[:256]
-                field_value = (
-                    value[:1024] or "*No data is currently available for this field*"
-                )
-                field_chars = len(field_name) + len(field_value)
-
-                if total_chars + field_chars > 6000 or field_count >= max_fields:
-                    embeds.append(current_embed)
-                    current_embed = await self.create_embed(
-                        title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
-                        description="Continued configuration details.",
-                    )
-                    field_count = 0
-                    total_chars = len(current_embed.title or "") + len(
-                        current_embed.description or ""
-                    )
+                if channel:
+                    field_value.append(f"- Channel: <#{channel_id}>")
+                else:
+                    field_value.append(f"- Channel ID: {channel_id}")
 
                 current_embed.add_field(
-                    name=field_name,
-                    value=field_value,
-                    inline=inline,
-                )
-                field_count += 1
-                total_chars += field_chars
-
-        match config:
-            case "vetting":
-                overview = [
-                    f"**{category.title()}**: {len(roles)} configured roles"
-                    for category, roles in config_data.assigned_roles.items()
-                    if category in ("ideology", "domicile", "status")
-                ]
-
-                await add_field(
-                    "Configuration Overview",
-                    "\n".join(overview)
-                    or "*No roles have been configured yet. Use the configuration commands to set up roles.*",
+                    name="Ban Entry",
+                    value="\n".join(field_value),
+                    inline=True,
                 )
 
-                for category, roles in config_data.assigned_roles.items():
-                    await add_field(
-                        f"{category.title()} Configured Roles",
-                        "\n".join(
-                            f"- <@&{role_id}> (`{role}`)"
-                            for role, role_id in sorted(roles.items())
-                        )
-                        or "*No roles have been configured for this category yet*",
-                    )
+                if len(current_embed.fields) >= 5:
+                    embeds.append(current_embed)
+                    current_embed = await self.create_embed(title="Banned Users List")
 
-                for category, assignable_roles in config_data.assignable_roles.items():
-                    await add_field(
-                        f"Available {category.title()} Roles",
-                        "\n".join(
-                            f"- `{role}` (Available for assignment)"
-                            for role in sorted(assignable_roles)
-                        )
-                        or "*No assignable roles configured for this category*",
-                    )
+            except Exception as e:
+                logger.error(f"Error fetching ban info: {e}", exc_info=True)
+                current_embed.add_field(
+                    name="Ban Entry",
+                    value=(
+                        f"- Channel: <#{channel_id}>\n"
+                        f"- Post: <#{post_id}>\n"
+                        f"- User: {user_id}\n"
+                        "(Unable to fetch complete information)"
+                    ),
+                    inline=True,
+                )
 
-            case "custom":
-                for role_name, members in config_data.items():
-                    await add_field(
-                        f"Custom Role: {role_name}",
-                        "\n".join(f"- <@{member_id}>" for member_id in members)
-                        or "*No members currently have this role*",
-                    )
-
-            case "incarcerated":
-                for member_id, info in config_data.items():
-                    try:
-                        release_time = int(float(info["release_time"]))
-                        roles_str = (
-                            ", ".join(
-                                f"<@&{role_id}>"
-                                for role_id in info.get("original_roles", [])
-                            )
-                            or "*No previous roles recorded*"
-                        )
-                        await add_field(
-                            f"Restricted Member: <@{member_id}>",
-                            f"- Release Scheduled: <t:{release_time}:F>\n- Previous Roles: {roles_str}",
-                        )
-                    except (ValueError, KeyError) as e:
-                        logger.error(f"Error processing member {member_id}: {str(e)}")
-                        continue
-
-            case "stats":
-                for member_id, stats in config_data.items():
-                    formatted_stats = []
-
-                    for key, value in stats.items():
-                        match key:
-                            case "message_timestamps":
-                                formatted_stats.append(
-                                    f"- **Total Messages**: {len(value)}"
-                                )
-
-                            case "last_message":
-                                formatted_stats.append(
-                                    f"- **Last Message Content**: {str(value)[:50]}"
-                                )
-
-                            case "last_threshold_adjustment":
-                                formatted_stats.append(
-                                    f"- **Last Threshold Update**: <t:{int(float(value))}:R>"
-                                )
-
-                            case _:
-                                if isinstance(value, (int, float)):
-                                    formatted_stats.append(
-                                        f"- **{key.replace('_', ' ').title()}**: {value:.2f}"
-                                    )
-                                else:
-                                    formatted_stats.append(
-                                        f"- **{key.replace('_', ' ').title()}**: {value}"
-                                    )
-
-                    await add_field(
-                        f"Member Activity: <@{member_id}>",
-                        "\n".join(formatted_stats)
-                        or "*No activity statistics available for this member*",
-                    )
-
-            case "dynamic":
-                for config_name, value in config_data.items():
-                    await add_field(f"{config_name}", f"```py\n{value}```")
-
-        if field_count:
+        if current_embed.fields:
             embeds.append(current_embed)
 
         return embeds
 
-    # Custom roles commands
+    async def _create_permission_embeds(
+        self, permissions: DefaultDict[str, Set[str]]
+    ) -> List[interactions.Embed]:
+        embeds: List[interactions.Embed] = []
+        current_embed = await self.create_embed(title="Thread Permissions List")
 
-    @module_group_custom.subcommand(
-        "configure", sub_cmd_description="Configure custom roles"
-    )
-    @interactions.slash_option(
-        name="roles",
-        description="Enter role names separated by commas",
-        opt_type=interactions.OptionType.STRING,
-        required=True,
-    )
-    @interactions.slash_option(
-        name="action",
-        description="Choose whether to add or remove the specified roles",
-        opt_type=interactions.OptionType.STRING,
-        required=True,
-        choices=[
-            interactions.SlashCommandChoice(name="Add", value="add"),
-            interactions.SlashCommandChoice(name="Remove", value="remove"),
-        ],
-    )
-    @error_handler
-    async def configure_custom_roles(
-        self, ctx: interactions.SlashContext, roles: str, action: str
-    ) -> None:
-        if not self.validate_custom_permissions(ctx):
-            return await self.send_error(
-                ctx,
-                "You don't have sufficient permissions to configure custom roles.",
-            )
-        role_set = {role.strip() for role in roles.split(",")}
-        updated_roles = (
-            {role for role in role_set if role not in self.custom_roles}
-            if action == "add"
-            else {role for role in role_set if role in self.custom_roles}
-        )
-
-        if action == "add":
-            self.custom_roles.update({role: set() for role in updated_roles})
-        else:
-            for role in updated_roles:
-                self.custom_roles.pop(role, None)
-
-        if updated_roles:
-            await self.save_custom_roles()
-            await self.send_success(
-                ctx,
-                f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}. Use `/custom mention` to mention members with these roles.",
-                log_to_channel=False,
-            )
-        else:
-            await self.send_error(
-                ctx,
-                f"No changes were made because the specified roles {'already exist' if action == 'add' else '''don't exist'''}. Please check the role names and try again.",
-            )
-
-    @interactions.user_context_menu(name="Custom Roles")
-    @error_handler
-    async def custom_roles_context_menu(
-        self, ctx: interactions.ContextMenuContext
-    ) -> None:
-        try:
-            logger.info(f"Context menu triggered for user: {ctx.target.id}")
-
-            if not self.validate_custom_permissions(ctx):
-                logger.warning(
-                    f"User {ctx.author.id} lacks permission for custom roles menu"
-                )
-                return await self.send_error(
-                    ctx,
-                    "You don't have sufficient permissions to manage custom roles.",
-                )
-
-            components = interactions.StringSelectMenu(
-                custom_id=f"manage_roles_menu_{(member := ctx.target).id}",
-                placeholder="Select action (Add/Remove roles)",
-                *(
-                    interactions.StringSelectOption(label=label, value=value)
-                    for label, value in (("Add", "add"), ("Remove", "remove"))
-                ),
-            )
-
-            await ctx.send(
-                f"Please select whether you want to add or remove custom roles for {member.mention}. After selecting an action, you'll be able to choose specific roles.",
-                components=components,
-                ephemeral=True,
-            )
-            logger.info(f"Context menu response sent for user: {ctx.target.id}")
-
-        except Exception as e:
-            logger.error(f"Error in custom_roles_context_menu: {str(e)}")
-            logger.error(traceback.format_exc())
-            await self.send_error(
-                ctx,
-                f"An unexpected error occurred while managing custom roles. Our team has been notified: {str(e)}",
-            )
-
-    @module_group_custom.subcommand(
-        "mention", sub_cmd_description="Mention custom role members"
-    )
-    @interactions.slash_option(
-        name="roles",
-        description="Roles",
-        opt_type=interactions.OptionType.STRING,
-        required=True,
-        autocomplete=True,
-    )
-    @error_handler
-    async def mention_custom_roles(
-        self, ctx: interactions.SlashContext, roles: str
-    ) -> None:
-        if not self.validate_custom_permissions(ctx):
-            return await self.send_error(
-                ctx,
-                "You don't have permission to use this command.",
-            )
-
-        role_set: frozenset[str] = frozenset(map(str.strip, roles.split(",")))
-        custom_roles_set: frozenset[str] = frozenset(self.custom_roles)
-
-        found_roles: frozenset[str] = role_set & custom_roles_set
-        not_found_roles: frozenset[str] = role_set - custom_roles_set
-
-        mentioned_users: frozenset[str] = frozenset(
-            f"<@{uid}>" for role in found_roles for uid in self.custom_roles[role]
-        )
-
-        if mentioned_users:
-            await ctx.send(
-                f"Successfully found users with the following roles: {', '.join(found_roles)}. Here are the users: {' '.join(mentioned_users)}"
-            )
-            return
-
-        if not_found_roles:
-            await self.send_error(
-                ctx,
-                f"Unable to find the following roles: {', '.join(not_found_roles)}. Please check the role names and try again. You can use the autocomplete feature to see available roles.",
-            )
-            return
-
-        await self.send_error(
-            ctx,
-            f"No users currently have the roles: {roles}. The roles exist, but no users are assigned to them at the moment.",
-        )
-
-    @mention_custom_roles.autocomplete("roles")
-    async def autocomplete_custom_roles(
-        self, ctx: interactions.AutocompleteContext
-    ) -> None:
-        user_input: str = ctx.input_text.lower()
-        choices = (
-            interactions.SlashCommandChoice(name=role, value=role)
-            for role in self.custom_roles
-            if user_input in role.lower()
-        )
-        await ctx.send(tuple(itertools.islice(choices, 25)))
-
-    # Vetting commands
-
-    @module_group_vetting.subcommand(
-        "toggle",
-        sub_cmd_description="Configure message monitoring and validation settings",
-    )
-    @interactions.slash_option(
-        name="type",
-        argument_name="setting_type",
-        description="Type of setting to configure",
-        opt_type=interactions.OptionType.STRING,
-        required=True,
-        choices=[
-            *(
-                interactions.SlashCommandChoice(
-                    name=n.replace("_", " ").title(), value=v
-                )
-                for n, v in (
-                    ("Message Monitoring", "monitoring"),
-                    ("Message Repetition", "repetition"),
-                    ("Digit Ratio", "digit_ratio"),
-                    ("Message Entropy", "entropy"),
-                    ("Feedback System", "feedback"),
-                )
-            )
-        ],
-    )
-    @interactions.slash_option(
-        name="state",
-        description="Enable or disable this setting",
-        opt_type=interactions.OptionType.STRING,
-        required=True,
-        choices=[
-            *(
-                interactions.SlashCommandChoice(name=n, value=v)
-                for n, v in (("Enable", "enable"), ("Disable", "disable"))
-            )
-        ],
-    )
-    @error_handler
-    async def toggle_settings(
-        self, ctx: interactions.SlashContext, setting_type: str, state: str
-    ) -> None:
-        if not self.validate_vetting_permissions(ctx):
-            return await self.send_error(
-                ctx, "You do not have the required permissions to use this command."
-            )
-
-        enabled = state == "enable"
-
-        if setting_type == "monitoring":
-            self.message_monitoring_enabled = enabled
-            setting_name = "Message monitoring"
-        else:
-            self.validation_flags[setting_type] = enabled
-            setting_name = setting_type.replace("_", " ").title()
-
-        await self.send_success(
-            ctx,
-            f"`{setting_name}` has been {'enabled' if enabled else 'disabled'}.",
-        )
-
-    @module_group_vetting.subcommand(
-        "assign", sub_cmd_description="Add roles to a member"
-    )
-    @interactions.slash_option(
-        name="member",
-        description="Member",
-        required=True,
-        opt_type=interactions.OptionType.USER,
-    )
-    @interactions.slash_option(
-        name="ideology",
-        description="倾向",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="domicile",
-        description="区位",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="status",
-        description="民权",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="others",
-        description="其他",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @error_handler
-    async def assign_vetting_roles(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        ideology: Optional[str] = None,
-        domicile: Optional[str] = None,
-        status: Optional[str] = None,
-        others: Optional[str] = None,
-    ):
-        await self.update_vetting_roles(
-            ctx, member, Action.ADD, ideology, domicile, status, others
-        )
-
-    @module_group_vetting.subcommand(
-        "remove", sub_cmd_description="Remove roles from a member"
-    )
-    @interactions.slash_option(
-        name="member",
-        description="Member",
-        required=True,
-        opt_type=interactions.OptionType.USER,
-    )
-    @interactions.slash_option(
-        name="ideology",
-        description="倾向",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="domicile",
-        description="区位",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="status",
-        description="民权",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @interactions.slash_option(
-        name="others",
-        description="其他",
-        opt_type=interactions.OptionType.STRING,
-        autocomplete=True,
-    )
-    @error_handler
-    async def remove_vetting_roles(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        ideology: Optional[str] = None,
-        domicile: Optional[str] = None,
-        status: Optional[str] = None,
-        others: Optional[str] = None,
-    ):
-        await self.update_vetting_roles(
-            ctx, member, Action.REMOVE, ideology, domicile, status, others
-        )
-
-    async def update_vetting_roles(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        action: Action,
-        ideology: Optional[str] = None,
-        domicile: Optional[str] = None,
-        status: Optional[str] = None,
-        others: Optional[str] = None,
-    ) -> None:
-        kwargs = dict(
-            zip(
-                ("ideology", "domicile", "status", "others"),
-                (ideology, domicile, status, others),
-            )
-        )
-        role_ids = self.get_role_ids_to_assign(
-            dict(
-                filter(
-                    lambda x: isinstance(x, tuple) and x[1] is not None, kwargs.items()
-                )
-            )
-        )
-
-        if not self.validate_vetting_permissions(ctx):
-            await self.send_error(
-                ctx, "You do not have the required permissions to use this command."
-            )
-            return
-
-        if not self.validate_vetting_permissions_with_roles(ctx, role_ids):
-            await self.send_error(
-                ctx,
-                "Some of the roles you're trying to manage are restricted. You can only manage roles that are within your permission level.",
-            )
-            return
-
-        if not role_ids:
-            role_types = tuple(k for k, v in kwargs.items() if v is not None)
-            await self.send_error(
-                ctx,
-                f"No valid roles found to {action.value.lower()}. Please specify at least one valid role type ({', '.join(role_types) if role_types else 'ideology, domicile, status, or others'}).",
-            )
-            return
-
-        if action == Action.ADD and await self.check_role_assignment_conflicts(
-            ctx, member, role_ids
-        ):
-            return
-        if action == Action.ADD:
-            await self.assign_roles_to_member(ctx, member, list(role_ids))
-        else:
-            await self.remove_roles_from_member(ctx, member, role_ids)
-
-    @assign_vetting_roles.autocomplete("ideology")
-    async def autocomplete_ideology_assign(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "ideology")
-
-    @assign_vetting_roles.autocomplete("domicile")
-    async def autocomplete_domicile_assign(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "domicile")
-
-    @assign_vetting_roles.autocomplete("status")
-    async def autocomplete_status_assign(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "status")
-
-    @assign_vetting_roles.autocomplete("others")
-    async def autocomplete_others_assign(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "others")
-
-    @remove_vetting_roles.autocomplete("ideology")
-    async def autocomplete_ideology_remove(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "ideology")
-
-    @remove_vetting_roles.autocomplete("domicile")
-    async def autocomplete_domicile_remove(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "domicile")
-
-    @remove_vetting_roles.autocomplete("status")
-    async def autocomplete_status_remove(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "status")
-
-    @remove_vetting_roles.autocomplete("others")
-    async def autocomplete_others_remove(self, ctx: interactions.AutocompleteContext):
-        await self.autocomplete_vetting_role(ctx, "others")
-
-    async def autocomplete_vetting_role(
-        self, ctx: interactions.AutocompleteContext, role_category: str
-    ) -> None:
-        if not (roles := getattr(self, "vetting_roles", None)) or role_category not in (
-            assigned := roles.assigned_roles
-        ):
-            await ctx.send([])
-            return
-
-        user_input = ctx.input_text.casefold()
-        await ctx.send(
-            tuple(
-                interactions.SlashCommandChoice(name=name, value=name)
-                for name in itertools.islice(
-                    filter(
-                        lambda x: user_input in x.casefold(), assigned[role_category]
-                    ),
-                    25,
-                )
-            )
-        )
-
-    def get_role_ids_to_assign(self, kwargs: Dict[str, str]) -> Set[int]:
-        filtered_items: List[Tuple[str, str]] = [
-            (k, v) for k, v in kwargs.items() if isinstance(v, str) and v is not None
-        ]
-        return {
-            role_id
-            for param, value in filtered_items
-            if value
-            and (role_id := self.vetting_roles.assigned_roles.get(param, {}).get(value))
-        }
-
-    async def assign_roles_to_member(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        role_ids_to_add: List[int],
-    ) -> None:
-        roles_to_add: List[interactions.Role] = [
-            *filter(None, (ctx.guild.get_role(rid) for rid in role_ids_to_add))
-        ]
-
-        if not roles_to_add:
-            return await self.send_error(
-                ctx,
-                "No valid roles were found to add. Please check that the role IDs are correct and that the bot has permission to manage these roles.",
-            )
-
-        try:
-            await member.add_roles(roles_to_add)
-            await self.send_success(
-                ctx,
-                f"Moderator {ctx.author.mention} added roles to {member.mention}: {', '.join(r.name for r in roles_to_add)}.",
-            )
-        except Exception as e:
-            await self.send_error(
-                ctx,
-                f"Failed to add roles due to the following error: {e!s}. This may be due to missing permissions or role hierarchy issues. Please ensure the bot's role is higher than the roles being assigned.",
-            )
-
-    async def remove_roles_from_member(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        role_ids_to_remove: Set[int],
-    ) -> None:
-        roles_to_remove: frozenset = frozenset(
-            role for role in ctx.guild.roles if role.id in role_ids_to_remove
-        )
-
-        if not roles_to_remove:
-            await self.send_error(ctx, "No valid roles were found to remove.")
-            return
-
-        try:
-            role_names: str = ", ".join(map(lambda r: f"`{r.name}`", roles_to_remove))
-
-            await member.remove_roles([*roles_to_remove])
-            await self.send_success(
-                ctx,
-                f"Moderator {ctx.author.mention} removed roles from {member.mention}: {role_names}.",
-            )
-
-        except Exception as e:
-            error_message: str = str(e)
-            await self.send_error(
-                ctx,
-                f"Failed to remove roles due to the following error: {error_message}.",
-            )
-            logger.exception(
-                "Failed to remove roles from member %d (%s): %s",
-                member.id,
-                member.user.username,
-                error_message,
-            )
-
-    @interactions.component_callback("approve")
-    @error_handler
-    async def on_approve_member(
-        self, ctx: interactions.ComponentContext
-    ) -> Optional[str]:
-        return await self.process_approval_status_change(ctx, Status.APPROVED)
-
-    @interactions.component_callback("reject")
-    @error_handler
-    async def on_reject_member(
-        self, ctx: interactions.ComponentContext
-    ) -> Optional[str]:
-        return await self.process_approval_status_change(ctx, Status.REJECTED)
-
-    @asynccontextmanager
-    async def member_lock(self, member_id: int) -> AsyncGenerator[None, None]:
-        now = datetime.now(timezone.utc)
-        lock_info = self.member_role_locks.setdefault(
-            member_id, {"lock": asyncio.Lock(), "last_used": now}
-        )
-        lock_info["last_used"] = now
-        try:
-            if isinstance(lock_info["lock"], asyncio.Lock):
-                async with lock_info["lock"]:
-                    yield
-            else:
-                yield
-        finally:
-            current_time: datetime = datetime.now(timezone.utc)
-            self.member_role_locks = {
-                mid: info
-                for mid, info in self.member_role_locks.items()
-                if isinstance(info["lock"], asyncio.Lock)
-                and not info["lock"].locked()
-                and isinstance(info["last_used"], datetime)
-                and (current_time - cast(datetime, info["last_used"])).total_seconds()
-                <= 3600
-            }
-
-    async def process_approval_status_change(
-        self, ctx: interactions.ComponentContext, status: Status
-    ) -> Optional[str]:
-        if not (await self.validate_context(ctx)):
-            return None
-
-        if not isinstance(
-            thread := await self.bot.fetch_channel(ctx.channel_id),
-            interactions.GuildPublicThread,
-        ):
-            raise ValueError("Invalid context: Must be used in threads")
-
-        guild = await self.bot.fetch_guild(thread.guild.id)
-        if not (member := await guild.fetch_member(thread.owner_id)):
-            await self.send_error(ctx, "Member not found in server")
-            return None
-
-        async with self.member_lock(member.id):
+        for post_id, user_ids in permissions.items():
             try:
-                if not self.validate_roles(
-                    roles := await self.fetch_required_roles(guild)
-                ):
-                    await self.send_error(ctx, "Required roles configuration invalid")
-                    return None
+                post = await self.bot.fetch_channel(int(post_id))
+                if not post:
+                    logger.warning(f"Could not fetch channel {post_id}")
+                    continue
 
-                current_roles = frozenset(map(lambda r: r.id, member.roles))
-                thread_approvals = self.get_thread_approvals(thread.id)
+                for user_id in user_ids:
+                    try:
+                        user = await self.bot.fetch_user(int(user_id))
+                        if not user:
+                            continue
 
-                if not await self.validate_reviewer(ctx, thread_approvals):
-                    return None
+                        current_embed.add_field(
+                            name="Permission Entry",
+                            value=(
+                                f"- Thread: <#{post_id}>\n" f"- User: {user.mention}"
+                            ),
+                            inline=True,
+                        )
 
-                handler = {
-                    Status.APPROVED: self.process_approval,
-                    Status.REJECTED: self.process_rejection,
-                }.get(status)
-
-                if not handler:
-                    await self.send_error(ctx, "Invalid status")
-                    return None
-
-                return await handler(
-                    ctx=ctx,
-                    member=member,
-                    roles=roles,
-                    current_roles=current_roles,
-                    thread_approvals=thread_approvals,
-                    thread=thread,
-                )
+                        if len(current_embed.fields) >= 5:
+                            embeds.append(current_embed)
+                            current_embed = await self.create_embed(
+                                title="Thread Permissions List"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error fetching user {user_id}: {e}")
+                        continue
 
             except Exception as e:
-                logger.exception(f"Status change failed: {e}")
-                await self.send_error(ctx, "Processing error occurred")
-                return None
-            finally:
-                await self.update_review_components(ctx, thread)
-
-    async def validate_context(self, ctx: interactions.ComponentContext) -> bool:
-        if not self.validate_vetting_permissions(ctx):
-            await self.send_error(ctx, "Insufficient permissions")
-            return False
-        return True
-
-    async def validate_reviewer(
-        self, ctx: interactions.ComponentContext, thread_approvals: Approval
-    ) -> bool:
-        if ctx.author.id in thread_approvals.reviewers:
-            await self.send_error(ctx, "Duplicate vote detected")
-            return False
-        return True
-
-    @staticmethod
-    def validate_roles(roles: Dict[str, Optional[interactions.Role]]) -> bool:
-        return all(roles.values())
-
-    async def update_review_components(
-        self, ctx: interactions.ComponentContext, thread: interactions.GuildPublicThread
-    ) -> None:
-        try:
-            embed, buttons = await self.create_review_components(thread)
-            await ctx.message.edit(embed=embed, components=buttons)
-        except Exception as e:
-            logger.error(f"Failed to update message: {repr(e)}")
-
-    async def process_approval(
-        self,
-        ctx: interactions.ComponentContext,
-        member: interactions.Member,
-        roles: Dict[str, interactions.Role],
-        current_roles: FrozenSet[int],
-        thread_approvals: Approval,
-        thread: interactions.GuildPublicThread,
-    ) -> str:
-        logger.info(
-            f"Starting approval process for member {member.id} | Roles: {current_roles}"
-        )
-
-        electoral_id = roles["electoral"].id
-        if electoral_id in current_roles:
-            await self.send_error(
-                ctx,
-                f"{member.mention} already has the electoral role and cannot be approved again.",
-            )
-            logger.info(f"Member {member.id} already has electoral role")
-            return "Approval aborted: Already approved"
-
-        thread_approvals = Approval(
-            approval_count=min(
-                thread_approvals.approval_count + 1, self.config.REQUIRED_APPROVALS
-            ),
-            reviewers=thread_approvals.reviewers | {ctx.author.id},
-            last_approval_time=thread_approvals.last_approval_time,
-        )
-        self.approval_counts[thread.id] = thread_approvals
-
-        if thread_approvals.approval_count == self.config.REQUIRED_APPROVALS:
-            thread_approvals.last_approval_time = datetime.now(timezone.utc)
-            await self.update_member_roles(
-                member, roles["electoral"], roles["approved"], current_roles
-            )
-            await self.send_approval_notification(ctx, member, thread_approvals)
-            self.cleanup_approval_data(thread.id)
-            return f"Approved {member.mention} with role updates"
-
-        remaining = self.config.REQUIRED_APPROVALS - thread_approvals.approval_count
-        await self.send_success(
-            ctx,
-            f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS} approvals needed. Waiting for {remaining} more approval(s).",
-            log_to_channel=False,
-        )
-        return "Approval registered"
-
-    async def process_rejection(
-        self,
-        ctx: interactions.ComponentContext,
-        member: interactions.Member,
-        roles: Dict[str, interactions.Role],
-        current_roles: FrozenSet[int],
-        thread_approvals: Approval,
-        thread: interactions.GuildPublicThread,
-    ) -> str:
-        electoral_id: int = roles["electoral"].id
-        if electoral_id not in current_roles:
-            await self.send_error(
-                ctx,
-                f"Unable to reject {member.mention} as they have not yet been approved. Members must first be approved before they can be rejected.",
-            )
-            return "Rejection aborted: Not approved"
-
-        if thread_approvals.last_approval_time and self.is_rejection_window_closed(
-            thread_approvals
-        ):
-            await self.send_error(
-                ctx,
-                f"The rejection window for {member.mention} has expired. Rejections must be submitted within {self.config.REJECTION_WINDOW_DAYS} days of approval. Please contact an administrator if you believe this is in error.",
-            )
-            return "Rejection aborted: Window closed"
-
-        thread_approvals = Approval(
-            approval_count=thread_approvals.approval_count,
-            rejection_count=min(
-                thread_approvals.rejection_count + 1, self.config.REQUIRED_REJECTIONS
-            ),
-            reviewers=thread_approvals.reviewers | {ctx.author.id},
-            last_approval_time=thread_approvals.last_approval_time,
-        )
-        self.approval_counts[thread.id] = thread_approvals
-
-        if thread_approvals.rejection_count == self.config.REQUIRED_REJECTIONS:
-            await self.update_member_roles(
-                member, roles["approved"], roles["electoral"], current_roles
-            )
-            await self.send_rejection_notification(ctx, member, thread_approvals)
-            self.cleanup_approval_data(thread.id)
-            return f"Rejected {member.mention} with role updates"
-
-        remaining: int = (
-            self.config.REQUIRED_REJECTIONS - thread_approvals.rejection_count
-        )
-        await self.send_success(
-            ctx,
-            f"Your rejection vote for {member.mention} has been registered. Current status: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
-            log_to_channel=False,
-        )
-        return "Rejection registered"
-
-    def is_rejection_window_closed(self, thread_approvals: Approval) -> bool:
-        if not thread_approvals.last_approval_time:
-            return False
-        time_diff = datetime.now(timezone.utc) - thread_approvals.last_approval_time
-        return time_diff.total_seconds() > self.config.REJECTION_WINDOW_DAYS * 86400
-
-    def cleanup_approval_data(self, thread_id: int) -> None:
-        self.approval_counts.pop(thread_id, None)
-        self.processed_thread_ids.discard(thread_id)
-
-    async def fetch_required_roles(
-        self, guild: interactions.Guild
-    ) -> Dict[str, Optional[interactions.Role]]:
-        return {
-            "electoral": await guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
-            "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
-        }
-
-    def get_thread_approvals(self, thread_id: int) -> Approval:
-        return self.approval_counts.get(thread_id, Approval())
-
-    @staticmethod
-    async def update_member_roles(
-        member: interactions.Member,
-        role_to_add: interactions.Role,
-        role_to_remove: interactions.Role,
-        current_roles: FrozenSet[int],
-    ) -> bool:
-        async def verify_roles(member_to_check: interactions.Member) -> set[int]:
-            return {
-                role.id
-                for role in (
-                    await member_to_check.guild.fetch_member(member_to_check.id)
-                ).roles
-            }
-
-        async def execute_role_updates(
-            target: interactions.Member,
-            *,
-            to_add: interactions.Role | None = None,
-            to_remove: interactions.Role | None = None,
-        ) -> None:
-            if to_remove and to_remove.id in {role.id for role in target.roles}:
-                logger.info(f"Removing role {to_remove.id} from member {target.id}")
-                await target.remove_roles([to_remove])
-            if to_add and to_add.id not in {role.id for role in target.roles}:
-                logger.info(f"Adding role {to_add.id} to member {target.id}")
-                await target.add_roles([to_add])
-
-        logger.info(
-            f"Initiating role update for member {member.id}. Current roles: {current_roles}. Role to add: {role_to_add.id}, Role to remove: {role_to_remove.id}"
-        )
-
-        try:
-            updates = (
-                (
-                    ("remove", role_to_remove)
-                    if role_to_remove.id in current_roles
-                    else None
-                ),
-                ("add", role_to_add) if role_to_add.id not in current_roles else None,
-            )
-            updates_needed = [u for u in updates if u]
-
-            if updates_needed:
-                for action, role in updates_needed:
-                    await execute_role_updates(
-                        member,
-                        to_add=role if action == "add" else None,
-                        to_remove=role if action == "remove" else None,
-                    )
-
-            MAX_RETRIES = 3
-            backoff = (0.5, 1.0, 2.0)
-
-            for attempt in range(MAX_RETRIES):
-                final_roles = await verify_roles(member)
-                logger.info(
-                    f"Verification attempt {attempt + 1} - Current roles: {final_roles}"
+                logger.error(f"Error fetching thread {post_id}: {e}")
+                current_embed.add_field(
+                    name="Permission Entry",
+                    value=(
+                        f"- Thread: <#{post_id}>\n"
+                        "(Unable to fetch complete information)"
+                    ),
+                    inline=True,
                 )
 
-                if (
-                    role_to_add.id in final_roles
-                    and role_to_remove.id not in final_roles
-                ):
-                    logger.info("Role update successful and verified")
-                    return True
-
-                if attempt < MAX_RETRIES - 1:
-                    logger.warning(
-                        f"Role verification failed on attempt {attempt + 1}, retrying. Expected: +{role_to_add.id}, -{role_to_remove.id}. Current: {final_roles}"
-                    )
-                    await execute_role_updates(
-                        member,
-                        to_add=(
-                            role_to_add if role_to_add.id not in final_roles else None
-                        ),
-                        to_remove=(
-                            role_to_remove if role_to_remove.id in final_roles else None
-                        ),
-                    )
-                    await asyncio.sleep(backoff[attempt])
-
-            logger.error("Role update failed after all retry attempts")
-            return False
-
-        except Exception as e:
-            logger.error(
-                f"Critical error during role update for member {member.id}: {type(e).__name__}: {str(e)}"
-            )
-            return False
-
-    async def send_approval_notification(
-        self,
-        ctx: (
-            interactions.SlashContext
-            | interactions.InteractionContext
-            | interactions.ComponentContext
-            | None
-        ),
-        member: interactions.Member,
-        thread_approvals: Approval,
-    ) -> None:
-        if not ctx:
-            return
-
-        reviewers_list = sorted(thread_approvals.reviewers)
-        reviewers_text = (
-            f"<@{reviewers_list[0]}>"
-            if len(reviewers_list) == 1
-            else ", ".join(f"<@{rid}>" for rid in reviewers_list[:-1])
-            + f" and <@{reviewers_list[-1]}>"
-        )
-
-        await self.send_success(
-            ctx,
-            f"{member.mention} has been approved by {reviewers_text}. The request has been successfully processed and the member's roles will be updated accordingly.",
-            log_to_channel=False,
-        )
-
-    async def send_rejection_notification(
-        self,
-        ctx: (
-            interactions.SlashContext
-            | interactions.InteractionContext
-            | interactions.ComponentContext
-            | None
-        ),
-        member: interactions.Member,
-        thread_approvals: Approval,
-    ) -> None:
-        if not ctx:
-            return
-
-        reviewers_list = sorted(thread_approvals.reviewers)
-        reviewers_text = (
-            f"<@{reviewers_list[0]}>"
-            if len(reviewers_list) == 1
-            else ", ".join(f"<@{rid}>" for rid in reviewers_list[:-1])
-            + f" and <@{reviewers_list[-1]}>"
-        )
-
-        await self.send_success(
-            ctx,
-            f"{member.mention} has been rejected by {reviewers_text}. The request has been denied.",
-            log_to_channel=False,
-        )
-
-    # Servant commands
-
-    @module_group_servant.subcommand("view", sub_cmd_description="Servant Directory")
-    async def view_servant_roles(self, ctx: interactions.SlashContext) -> None:
-        await ctx.defer()
-
-        filtered_roles = self.filter_roles(tuple(ctx.guild.roles))
-        role_members_list = self.extract_role_members_list(filtered_roles)
-
-        if not role_members_list:
-            await self.send_error(ctx, "No matching roles found.")
-            return
-
-        total_members = sum(rm.member_count for rm in role_members_list)
-
-        title = f"Servant Directory ({total_members} members)"
-
-        embeds = []
-        current_embed = await self.create_embed(title=title)
-        field_count = 0
-
-        for role_member in role_members_list:
-            members_str = "\n".join([f"- {m}" for m in role_member.members])
-
-            if not members_str:
-                continue
-
-            if field_count >= 25:
-                embeds.append(current_embed)
-                current_embed = await self.create_embed(title=title)
-                field_count = 0
-
-            current_embed.add_field(
-                name=f"{role_member.role_name} ({role_member.member_count} members)",
-                value=members_str,
-                inline=True,
-            )
-            field_count += 1
-
-        if field_count:
+        if current_embed.fields:
             embeds.append(current_embed)
 
-        await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
+        return embeds
 
-    @staticmethod
-    @lru_cache(maxsize=256)
-    def filter_roles(
-        roles: Tuple[interactions.Role, ...]
-    ) -> Tuple[interactions.Role, ...]:
-        return (
-            ()
-            if not roles
-            else tuple(
-                itertools.islice(
-                    filter(
-                        lambda r: not r.name.startswith(("——", "══"))
-                        and not r.bot_managed,
-                        sorted(roles, key=attrgetter("position"), reverse=True),
-                    ),
-                    next(
-                        (
-                            i
-                            for i, r in enumerate(
-                                sorted(roles, key=attrgetter("position"), reverse=True)
-                            )
-                            if r.name == "═════･[Bot身份组]･═════"
-                        ),
-                        len(roles),
-                    ),
-                )
-            )
+    async def _create_stats_embeds(
+        self, stats: Dict[str, PostStats]
+    ) -> List[interactions.Embed]:
+        embeds: List[interactions.Embed] = []
+        current_embed = await self.create_embed(title="Post Statistics")
+
+        sorted_stats = sorted(
+            stats.items(), key=lambda item: item[1].message_count, reverse=True
         )
 
-    @staticmethod
-    @lru_cache()
-    def extract_role_members_list(
-        roles: Tuple[interactions.Role, ...]
-    ) -> List[Servant]:
-        return [
-            Servant(
-                role_name=role.name,
-                members=[member.mention for member in role.members],
-                member_count=len(role.members),
-            )
-            for role in roles
-            if role.members
-        ]
-
-    # Penitentiary commands
-
-    @module_group_penitentiary.subcommand(
-        "incarcerate", sub_cmd_description="Incarcerate"
-    )
-    @interactions.slash_option(
-        name="member",
-        description="Member",
-        required=True,
-        opt_type=interactions.OptionType.USER,
-    )
-    @interactions.slash_option(
-        name="duration",
-        description="Incarceration duration (e.g.: 1d 2h 30m)",
-        required=True,
-        opt_type=interactions.OptionType.STRING,
-    )
-    @error_handler
-    async def incarcerate_member(
-        self,
-        ctx: interactions.SlashContext,
-        member: interactions.Member,
-        duration: str,
-    ) -> None:
-        if not self.validate_penitentiary_permissions(ctx):
-            return await self.send_error(
-                ctx,
-                "You don't have permission to use this command.",
-            )
-
-        try:
-            incarceration_duration = await asyncio.to_thread(
-                lambda: self.parse_duration(duration)
-            )
-        except ValueError as e:
-            return await self.send_error(ctx, str(e))
-
-        return await self.manage_penitentiary_status(
-            ctx=ctx,
-            member=member,
-            action=Action.INCARCERATE,
-            duration=incarceration_duration,
-        )
-
-    @staticmethod
-    def parse_duration(duration: str) -> timedelta:
-        _UNIT_MAP: dict[str, int] = {"d": 86400, "h": 3600, "m": 60}
-
-        try:
-            total: int = sum(
-                int(match.group(1)) * _UNIT_MAP[match.group(2).lower()]
-                for match in re.finditer(r"(\d+)([dhm])", duration, re.IGNORECASE)
-            )
-            if total <= 0:
-                raise ValueError
-            return timedelta(seconds=total)
-        except (AttributeError, KeyError):
-            raise ValueError(
-                "Invalid duration format. Use combinations of `d` (days), `h` (hours), and `m` (minutes)."
-            )
-        except ValueError:
-            raise ValueError("Incarceration time must be greater than zero.")
-
-    @module_group_penitentiary.subcommand("release", sub_cmd_description="Release")
-    @interactions.slash_option(
-        name="member",
-        description="Member",
-        required=True,
-        opt_type=interactions.OptionType.USER,
-        autocomplete=True,
-    )
-    @error_handler
-    async def release_member(
-        self, ctx: interactions.SlashContext, member: interactions.Member
-    ) -> None:
-        if not self.validate_penitentiary_permissions(ctx):
-            return await self.send_error(
-                ctx,
-                "You don't have permission to use this command.",
-            )
-
-        await self.manage_penitentiary_status(ctx, member, Action.RELEASE)
-
-    @release_member.autocomplete("member")
-    async def autocomplete_incarcerated_member(
-        self, ctx: interactions.AutocompleteContext
-    ) -> None:
-        user_input: str = ctx.input_text.casefold()
-        guild: interactions.Guild = ctx.guild
-
-        choices = list(
-            islice(
-                (
-                    interactions.SlashCommandChoice(
-                        name=member.user.username, value=str(member.id)
-                    )
-                    for member in guild.members
-                    if user_input in member.user.username.casefold()
-                ),
-                25,
-            )
-        )
-
-        await ctx.send(choices)
-
-    async def manage_penitentiary_status(
-        self,
-        ctx: Optional[interactions.SlashContext],
-        member: interactions.Member,
-        action: Action,
-        **kwargs: Any,
-    ) -> None:
-        guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-        roles = await self.fetch_penitentiary_roles(guild)
-
-        if not all(roles.values()):
-            error_msg = "Required roles not found."
-            if ctx:
-                return await self.send_error(ctx, error_msg)
-            else:
-                logger.error(
-                    f"Required roles not found for penitentiary action: {error_msg}"
-                )
-                return
-
-        action_map: Dict[Action, Callable] = {
-            Action.INCARCERATE: partial(self.perform_member_incarceration, **kwargs),
-            Action.RELEASE: self.perform_member_release,
-        }
-        try:
-            await action_map[action](member, roles, ctx)
-        except KeyError:
-            error_msg = f"Invalid penitentiary action specified: {action}"
-            if ctx:
-                await self.send_error(ctx, error_msg)
-            else:
-                logger.error(error_msg)
-
-    @lru_cache(maxsize=1)
-    def _get_role_ids(self) -> Dict[str, int]:
-        return {
-            "incarcerated": self.config.INCARCERATED_ROLE_ID,
-            "electoral": self.config.ELECTORAL_ROLE_ID,
-            "approved": self.config.APPROVED_ROLE_ID,
-            "temporary": self.config.TEMPORARY_ROLE_ID,
-        }
-
-    async def perform_member_incarceration(
-        self,
-        member: interactions.Member,
-        roles: Dict[str, Optional[interactions.Role]],
-        ctx: Optional[interactions.SlashContext],
-        duration: timedelta,
-    ) -> None:
-        try:
-            incarcerated_role = roles["incarcerated"]
-            role_ids = self._get_role_ids()
-            member_role_ids = {role.id for role in member.roles}
-
-            roles_to_remove = [
-                roles.get(role_key)
-                for role_key, role_id in role_ids.items()
-                if role_key != "incarcerated"
-                and roles.get(role_key) is not None
-                and role_id in member_role_ids
-            ]
-
-            original_roles = tuple(
-                role_id
-                for role_id in (
-                    role_ids["electoral"],
-                    role_ids["approved"],
-                    role_ids["temporary"],
-                )
-                if role_id in member_role_ids
-            )
-
-            if roles_to_remove:
-                await member.remove_roles(roles_to_remove)
-                logger.info(
-                    f"Removed roles {[r.id for r in roles_to_remove]} from {member}"
-                )
-
-            if incarcerated_role:
-                await member.add_roles((incarcerated_role,))
-                logger.info(
-                    f"Added incarcerated role {incarcerated_role.id} to {member}"
-                )
-
-        except Exception as e:
-            logger.error(f"Error assigning roles during incarceration: {e}")
-            return
-
-        release_time = int(time.time() + duration.total_seconds())
-        self.incarcerated_members[str(member.id)] = {
-            "release_time": str(release_time),
-            "original_roles": original_roles,
-        }
-        await self.save_incarcerated_members()
-
-        executor = getattr(ctx, "author", None)
-        log_message = (
-            f"{member.mention} has been incarcerated until <t:{release_time}:F> "
-            f"(<t:{release_time}:R>) by {executor.mention if executor else 'the system'}."
-        )
-        await self.send_success(ctx, log_message)
-
-    async def perform_member_release(
-        self,
-        member: interactions.Member,
-        roles: Dict[str, Optional[interactions.Role]],
-        ctx: Optional[interactions.SlashContext],
-    ) -> None:
-        member_id_str = str(member.id)
-        member_data = self.incarcerated_members.get(member_id_str, {})
-        original_role_ids = frozenset(member_data.get("original_roles", []))
-        current_role_ids = {role.id for role in member.roles}
-
-        roles_to_add = tuple(
-            role
-            for role in member.guild.roles
-            if role.id in original_role_ids and role.id not in current_role_ids
-        )
-
-        if (incarcerated_role := roles.get("incarcerated")) in member.roles:
-            await member.remove_roles((incarcerated_role,))
-            logger.info(f"Removed incarcerated role from {member}")
-
-        if roles_to_add:
-            await member.add_roles(roles_to_add)
-            logger.info(
-                f"Restored roles {tuple(r.id for r in roles_to_add)} to {member}"
-            )
-
-        del self.incarcerated_members[member_id_str]
-        await self.save_incarcerated_members()
-
-        executor = getattr(ctx, "author", None) if ctx else None
-        release_time = int(float(member_data.get("release_time", 0)))
-        current_time = int(time.time())
-        log_message = f"{member.mention} has been released by {executor.mention if executor else 'the system'} at <t:{current_time}:F>. Scheduled: <t:{release_time}:F>."
-        await self.send_success(ctx, log_message)
-
-    async def schedule_release(
-        self, member_id: str, data: Dict[str, Any], delay: float
-    ) -> None:
-        try:
-            await asyncio.wait_for(asyncio.sleep(delay), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            await self.release_prisoner(member_id, data)
-
-    async def release_prisoner(self, member_id: str, data: Dict[str, Any]) -> None:
-        release_time: int = int(float(data.get("release_time", 0)))
-
-        try:
-            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            member = await guild.fetch_member(int(member_id))
-        except Exception as e:
-            error_msg = f"Error fetching guild/member {member_id}: {e!r}. Release time: <t:{release_time}:F>"
-            logger.error(error_msg)
-            await self.send_error(None, error_msg)
-            return
-
-        try:
-            if member:
-                await self.manage_penitentiary_status(None, member, Action.RELEASE)
-            else:
-                log_message = f"Member {member_id} not found. Scheduled release: <t:{release_time}:F>."
-                await self.send_error(None, log_message)
-        except Exception as e:
-            error_msg = f"Release failed for {member_id}: {e!r}. Scheduled: <t:{release_time}:F>."
-            logger.error(error_msg)
-            await self.send_error(None, error_msg)
-        finally:
-            self.incarcerated_members.pop(member_id, None)
-            await self.save_incarcerated_members()
-
-    async def fetch_penitentiary_roles(
-        self, guild: interactions.Guild
-    ) -> Dict[str, Optional[interactions.Role]]:
-        role_ids = self._get_role_ids()
-        roles: Dict[str, Optional[interactions.Role]] = {}
-
-        for key, role_id in role_ids.items():
+        for post_id, post_stats in sorted_stats:
             try:
-                role = await guild.fetch_role(role_id)
-                logger.info(f"Successfully fetched {key} role: {role.id}")
-                roles[key] = role
+                last_active = post_stats.last_activity.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                current_embed.add_field(
+                    name="Post Stats",
+                    value=(
+                        f"- Post: <#{post_id}>\n"
+                        f"- Messages: {post_stats.message_count}\n"
+                        f"- Last Active: {last_active}"
+                    ),
+                    inline=True,
+                )
+
+                if len(current_embed.fields) >= 5:
+                    embeds.append(current_embed)
+                    current_embed = await self.create_embed(title="Post Statistics")
+
             except Exception as e:
-                logger.error(f"Failed to fetch {key} role (ID: {role_id}): {e}")
+                logger.error(f"Error fetching post stats: {e}", exc_info=True)
                 continue
 
-        return roles
+        if current_embed.fields:
+            embeds.append(current_embed)
 
-    # Events
+        return embeds
 
-    @interactions.listen(MessageCreate)
-    async def on_message_create(self, event: MessageCreate) -> None:
-        if (
-            not self.message_monitoring_enabled
-            or event.message.author.bot
-            or not event.message.guild
-        ):
+    async def _create_featured_embeds(
+        self, featured_posts: Dict[str, str], stats: Dict[str, PostStats]
+    ) -> List[interactions.Embed]:
+        embeds: List[interactions.Embed] = []
+        current_embed: interactions.Embed = await self.create_embed(
+            title="Featured Posts"
+        )
+
+        for forum_id, post_id in featured_posts.items():
+            try:
+                post_stats = stats.get(post_id, PostStats())
+                timestamp = post_stats.last_activity.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                field_value = (
+                    f"- Forum: <#{forum_id}>\n"
+                    f"- Post: <#{post_id}>\n"
+                    f"- Messages: {post_stats.message_count}\n"
+                    f"- Last Active: {timestamp}"
+                )
+
+                current_embed.add_field(
+                    name="Featured Post", value=field_value, inline=True
+                )
+
+                if len(current_embed.fields) >= 5:
+                    embeds.append(current_embed)
+                    current_embed = await self.create_embed(title="Featured Posts")
+
+            except Exception as e:
+                logger.error(f"Error fetching featured post info: {e}", exc_info=True)
+                continue
+
+        if current_embed.fields:
+            embeds.append(current_embed)
+
+        return embeds
+
+    async def _send_paginated_response(
+        self,
+        ctx: interactions.SlashContext,
+        embeds: List[interactions.Embed],
+        empty_message: str,
+    ) -> None:
+        if not embeds:
+            await self.send_success(ctx, empty_message)
             return
 
-        guild = event.message.guild
-        author_id = event.message.author.id
+        paginator = Paginator.create_from_embeds(self.bot, *embeds, timeout=120)
+        await paginator.send(ctx)
+
+    # Serve
+
+    @log_action
+    async def share_revoke_permissions(
+        self,
+        ctx: interactions.ContextMenuContext,
+        member: interactions.Member,
+        action: ActionType,
+    ) -> Optional[ActionDetails]:
+        if not await self.validate_channel(ctx):
+            await self.send_error(
+                ctx,
+                "This command can only be used in threads. Please navigate to a thread channel and try again.",
+            )
+            return None
+
+        thread = ctx.channel
+        author = ctx.author
+
+        if thread.parent_id != self.CONGRESS_ID and thread.owner_id != author.id:
+            await self.send_error(
+                ctx,
+                "Only the thread owner can manage thread permissions. If you need to modify permissions, please contact the thread owner.",
+            )
+            return None
+
+        if thread.parent_id == self.CONGRESS_ID:
+            author_roles = {role.id for role in author.roles}
+
+            if self.CONGRESS_MEMBER_ROLE in author_roles:
+                await self.send_error(
+                    ctx,
+                    f"Members with the <@&{self.CONGRESS_MEMBER_ROLE}> role cannot manage thread permissions. This is a restricted action.",
+                )
+                return None
+
+            if self.CONGRESS_MOD_ROLE not in author_roles:
+                await self.send_error(
+                    ctx,
+                    f"You need the <@&{self.CONGRESS_MOD_ROLE}> role to manage thread permissions in this forum. Please contact a moderator for assistance.",
+                )
+                return None
+        else:
+            if not await self.can_manage_post(thread, author):
+                await self.send_error(
+                    ctx,
+                    f"You can only {action.name.lower()} permissions for threads you manage. Please ensure you have the correct permissions or contact a moderator.",
+                )
+                return None
+
+        thread_id = str(thread.id)
+        user_id = str(member.id)
+
+        match action:
+            case ActionType.SHARE_PERMISSIONS:
+                self.model.thread_permissions.setdefault(thread_id, set()).add(user_id)
+                action_name = "shared"
+            case ActionType.REVOKE_PERMISSIONS:
+                if thread_id in self.model.thread_permissions:
+                    self.model.thread_permissions[thread_id].discard(user_id)
+                action_name = "revoked"
+            case _:
+                await self.send_error(
+                    ctx,
+                    "Invalid action type detected. Please try again with a valid permission action.",
+                )
+                return None
+
+        await self.model.save_thread_permissions(self.THREAD_PERMISSIONS_FILE)
+        await self.send_success(
+            ctx,
+            f"Permissions have been {action_name} successfully for {member.mention}. They will be notified of this change.",
+        )
+
+        return ActionDetails(
+            action=action,
+            reason=f"Permissions {action_name} by {author.mention}",
+            post_name=thread.name,
+            actor=author,
+            target=member,
+            channel=thread,
+            additional_info={
+                "action_type": f"{action_name.capitalize()} permissions",
+                "affected_user": str(member),
+                "affected_user_id": member.id,
+            },
+        )
+
+    manage_user_regex_pattern = re.compile(r"manage_user:(\d+):(\d+):(\d+)")
+
+    @interactions.component_callback(manage_user_regex_pattern)
+    @log_action
+    async def on_manage_user(
+        self, ctx: interactions.ComponentContext
+    ) -> Optional[ActionDetails]:
+        logger.info(f"on_manage_user called with custom_id: {ctx.custom_id}")
+
+        if not (match := self.manage_user_regex_pattern.match(ctx.custom_id)):
+            logger.warning(f"Invalid custom ID format: {ctx.custom_id}")
+            await self.send_error(
+                ctx,
+                "There was an issue processing your request due to an invalid format. Please try the action again, or contact a moderator if the issue persists.",
+            )
+            return None
+
+        channel_id, post_id, user_id = match.groups()
+        logger.info(
+            f"Parsed IDs - channel: {channel_id}, post: {post_id}, user: {user_id}"
+        )
+
+        if not ctx.values:
+            logger.warning("No action selected")
+            await self.send_error(
+                ctx,
+                "No action was selected from the menu. Please select an action (ban/unban or share/revoke permissions) and try again.",
+            )
+            return None
 
         try:
-            member = await guild.fetch_member(author_id)
-        except Exception:
-            return
+            action = ActionType[ctx.values[0].upper()]
+        except KeyError:
+            logger.warning(f"Invalid action: {ctx.values[0]}")
+            await self.send_error(
+                ctx,
+                f"The selected action `{ctx.values[0]}` is not valid. Please select a valid action from the menu and try again.",
+            )
+            return None
 
-        if not any(role.id == self.config.TEMPORARY_ROLE_ID for role in member.roles):
-            return
+        try:
+            member = await ctx.guild.fetch_member(int(user_id))
+        except NotFound:
+            logger.warning(f"User with ID {user_id} not found in the server")
+            await self.send_error(
+                ctx,
+                "Unable to find the user in the server. They may have left or been removed. Please verify the user is still in the server before trying again.",
+            )
+            return None
+        except ValueError:
+            logger.warning(f"Invalid user ID: {user_id}")
+            await self.send_error(
+                ctx,
+                "There was an error processing the user information. Please try the action again, or contact a moderator if the issue persists.",
+            )
+            return None
 
-        current_time = time.monotonic()
-        message_content = event.message.content.strip()
+        match action:
+            case ActionType.BAN | ActionType.UNBAN:
+                return await self.ban_unban_user(ctx, member, action)
+            case ActionType.SHARE_PERMISSIONS | ActionType.REVOKE_PERMISSIONS:
+                return await self.share_revoke_permissions(ctx, member, action)
+            case _:
+                await self.send_error(
+                    ctx,
+                    "The selected action is not supported. Please choose either ban/unban or share/revoke permissions from the menu.",
+                )
+                return None
 
-        async with self.stats_lock:
-            stats = self.stats.setdefault(
-                str(author_id),
-                {
-                    "message_timestamps": [],
-                    "invalid_message_count": 0,
-                    "feedback_score": 0.0,
-                    "recovery_streaks": 0,
-                    "last_threshold_adjustment": 0.0,
+    @log_action
+    async def ban_unban_user(
+        self,
+        ctx: interactions.ContextMenuContext,
+        member: interactions.Member,
+        action: ActionType,
+    ) -> Optional[ActionDetails]:
+        if not await self.validate_channel(ctx):
+            await self.send_error(
+                ctx,
+                "This command can only be used in threads. Please navigate to a thread channel and try again.",
+            )
+            return None
+
+        thread = ctx.channel
+        author_roles, member_roles = map(
+            lambda x: {role.id for role in x.roles}, (ctx.author, member)
+        )
+        if any(
+            role_id in member_roles and thread.parent_id in channels
+            for role_id, channels in self.ROLE_CHANNEL_PERMISSIONS.items()
+        ):
+            await self.send_error(
+                ctx,
+                "Unable to ban users with management permissions. These users have special privileges that prevent them from being banned.",
+            )
+            return None
+
+        if thread.parent_id == self.CONGRESS_ID:
+            if self.CONGRESS_MEMBER_ROLE in author_roles:
+                if action is ActionType.BAN or (
+                    action is ActionType.UNBAN and member.id != ctx.author.id
+                ):
+                    await self.send_error(
+                        ctx,
+                        f"<@&{self.CONGRESS_MEMBER_ROLE}> members can only unban themselves.",
+                    )
+                    return None
+            elif self.CONGRESS_MOD_ROLE not in author_roles:
+                await self.send_error(
+                    ctx,
+                    f"You need to be a <@&{self.CONGRESS_MOD_ROLE}> to manage bans in this forum.",
+                )
+                return None
+        elif not await self.can_manage_post(thread, ctx.author):
+            await self.send_error(
+                ctx,
+                f"You can only {action.name.lower()} users from threads you manage.",
+            )
+            return None
+
+        if member.id == thread.owner_id:
+            await self.send_error(
+                ctx,
+                "Thread owners cannot be banned from their own threads. This is a built-in protection for thread creators.",
+            )
+            return None
+
+        channel_id, thread_id, user_id = map(
+            str, (thread.parent_id, thread.id, member.id)
+        )
+
+        async with self.ban_lock:
+            banned_users = self.model.banned_users
+            thread_users = banned_users.setdefault(
+                channel_id, defaultdict(set)
+            ).setdefault(thread_id, set())
+
+            match action:
+                case ActionType.BAN:
+                    thread_users.add(user_id)
+                case ActionType.UNBAN:
+                    thread_users.discard(user_id)
+                case _:
+                    await self.send_error(
+                        ctx,
+                        "Invalid action requested. Please select either ban or unban and try again.",
+                    )
+                    return None
+
+            if not thread_users:
+                del banned_users[channel_id][thread_id]
+                if not banned_users[channel_id]:
+                    del banned_users[channel_id]
+            await self.model.save_banned_users(self.BANNED_USERS_FILE)
+
+        await self.model.invalidate_ban_cache(channel_id, thread_id, user_id)
+
+        action_name = "banned" if action is ActionType.BAN else "unbanned"
+        await self.send_success(
+            ctx,
+            f"User has been successfully {action_name}. {'They will no longer be able to participate in this thread.' if action is ActionType.BAN else 'They can now participate in this thread again.'}",
+        )
+
+        return ActionDetails(
+            action=action,
+            reason=f"{action_name.capitalize()} by {ctx.author.mention}",
+            post_name=thread.name,
+            actor=ctx.author,
+            target=member,
+            channel=thread,
+            additional_info={
+                "action_type": action_name.capitalize(),
+                "affected_user": str(member),
+                "affected_user_id": member.id,
+            },
+        )
+
+    message_action_regex_pattern = re.compile(r"message_action:(\d+)")
+
+    @interactions.component_callback(message_action_regex_pattern)
+    @log_action
+    async def on_message_action(
+        self, ctx: interactions.ComponentContext
+    ) -> Optional[ActionDetails]:
+        if not (match := self.message_action_regex_pattern.match(ctx.custom_id)):
+            await self.send_error(
+                ctx,
+                "The message action format is invalid. Please ensure you're using the correct command format.",
+            )
+            return None
+
+        message_id: int = int(match.group(1))
+        action: str = ctx.values[0].lower()
+
+        try:
+            message = await ctx.channel.fetch_message(message_id)
+        except NotFound:
+            await self.send_error(
+                ctx,
+                "The message could not be found. It may have been deleted or you may not have permission to view it.",
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching message {message_id}: {e}", exc_info=True)
+            await self.send_error(
+                ctx,
+                "Unable to retrieve the message. This could be due to a temporary issue or insufficient permissions. Please try again later.",
+            )
+            return None
+
+        if not isinstance(ctx.channel, interactions.ThreadChannel):
+            await self.send_error(
+                ctx,
+                "This action can only be performed within threads. Please ensure you're in a thread channel before using this command.",
+            )
+            return None
+
+        post = ctx.channel
+
+        match action:
+            case "delete":
+                return await self.delete_message_action(ctx, post, message)
+            case "pin" | "unpin":
+                return await self.pin_message_action(
+                    ctx, post, message, action == "pin"
+                )
+            case _:
+                await self.send_error(
+                    ctx,
+                    "The selected action is not valid. Available actions are: delete, pin, and unpin. Please choose one of these options.",
+                )
+                return None
+
+    async def delete_message_action(
+        self,
+        ctx: interactions.ComponentContext,
+        post: interactions.ThreadChannel,
+        message: interactions.Message,
+    ) -> Optional[ActionDetails]:
+        try:
+            await message.delete()
+            await self.send_success(
+                ctx, f"Message successfully deleted from thread `{post.name}`."
+            )
+
+            return ActionDetails(
+                action=ActionType.DELETE,
+                reason=f"User-initiated message deletion by {ctx.author.mention}",
+                post_name=post.name,
+                actor=ctx.author,
+                channel=post,
+                target=message.author,
+                additional_info={
+                    "deleted_message_id": str(message.id),
+                    "deleted_message_content": (
+                        message.content[:1000] if message.content else "N/A"
+                    ),
+                    "deleted_message_attachments": (
+                        [a.url for a in message.attachments]
+                        if message.attachments
+                        else []
+                    ),
                 },
             )
-
-            if not isinstance(stats, dict):
-                stats = stats.copy()
-            self.stats[str(author_id)] = stats
-
-            timestamps = stats["message_timestamps"]
-            cutoff = current_time - 7200
-            stats["message_timestamps"] = [
-                t for t in [*timestamps, current_time] if t > cutoff
-            ]
-
-            is_valid = not Message(
-                message_content, stats, self.limit_config, self.validation_flags
-            ).analyze()
-
-            invalid_count = stats["invalid_message_count"]
-            recovery_streaks = stats["recovery_streaks"]
-            feedback_score = stats["feedback_score"]
-
-            stats.update(
-                {
-                    "invalid_message_count": (
-                        invalid_count - (1 if invalid_count > 0 else 0)
-                        if is_valid
-                        else invalid_count + 1
-                    ),
-                    "recovery_streaks": (recovery_streaks + 1 if is_valid else 0),
-                    "feedback_score": (
-                        min(5.0, feedback_score + 0.5)
-                        if is_valid
-                        else max(-5.0, feedback_score - 1.0)
-                    ),
-                }
-            )
-
-            if not is_valid:
-                logger.warning(f"Invalid message from user {author_id}")
-
-            await self._adjust_thresholds(stats)
-            self.stats_save_task and self.stats_save_task.cancel()
-            self.stats_save_task = asyncio.create_task(self._save_stats())
-
-    async def _adjust_thresholds(self, user_stats: Dict[str, Any]) -> None:
-        if not self.message_monitoring_enabled or not self.validation_flags.get(
-            "feedback"
-        ):
-            return
-
-        feedback = user_stats.get("feedback_score", 0.0)
-        last_adj = user_stats.get("last_threshold_adjustment", 0.0)
-        time_delta = (now := time.time()) - last_adj
-
-        adj = 0.01 * feedback * math.tanh(abs(feedback) / 5)
-        decay = math.exp(-time_delta / 3600)
-
-        threshold_map = {}
-
-        if self.validation_flags.get("digit_ratio"):
-            threshold_map["DIGIT_RATIO_THRESHOLD"] = (0.1, 1.0, 0.5)
-
-        if self.validation_flags.get("entropy"):
-            threshold_map["MIN_MESSAGE_ENTROPY"] = (0.0, 4.0, 1.5)
-
-        if threshold_map:
-            self.limit_config.update(
-                {
-                    name: min(
-                        max(
-                            self.limit_config[name]
-                            + adj
-                            + (default - self.limit_config[name]) * (1 - decay),
-                            min_v,
-                        ),
-                        max_v,
-                    )
-                    for name, (min_v, max_v, default) in threshold_map.items()
-                }
-            )
-
-            user_stats["last_threshold_adjustment"] = now
-
-            logger.debug(
-                f"Thresholds adjusted - Feedback: {feedback:.2f}, Adjustment: {adj:.4f}, Decay: {decay:.4f}"
-            )
-
-    async def _save_stats(self) -> None:
-        try:
-            await asyncio.sleep(5.0)
-            async with self.stats_lock:
-                await self.save_stats_roles()
-        except asyncio.CancelledError:
-            pass
         except Exception as e:
-            logger.error(f"Failed to save stats: {e}")
-        finally:
-            self.stats_save_task = None
+            logger.error(f"Failed to delete message {message.id}: {e}", exc_info=True)
+            await self.send_error(ctx, "Unable to delete the message.")
+            return None
 
-    @interactions.listen(MessageCreate)
-    async def on_missing_member_message(self, event: MessageCreate) -> None:
-        if any((event.message.author.bot, not event.message.guild)):
-            return
-
-        guild, author_id = event.message.guild, event.message.author.id
-
+    async def pin_message_action(
+        self,
+        ctx: interactions.ComponentContext,
+        post: interactions.ThreadChannel,
+        message: interactions.Message,
+        pin: bool,
+    ) -> Optional[ActionDetails]:
         try:
-            member = await guild.fetch_member(author_id)
-            if self.config.MISSING_ROLE_ID not in {role.id for role in member.roles}:
-                return
-
-            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
-            if isinstance(missing_role, Exception):
-                return
-
-            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
-            if isinstance(temp_role, Exception):
-                return
-
-            await member.remove_roles([missing_role])
-            await member.add_roles([temp_role])
-
-            logger.info(
-                f"Converted member {member.id} from missing to temporary status after message"
+            action_type, action_desc = (
+                (ActionType.PIN, "pinned") if pin else (ActionType.UNPIN, "unpinned")
             )
+            await message.pin() if pin else await message.unpin()
 
             await self.send_success(
-                None,
-                f"Member {member.mention} has been converted from `{missing_role.name}` to `{temp_role.name}` after sending a message.",
+                ctx, f"Message has been successfully {action_desc}."
             )
+
+            return ActionDetails(
+                action=action_type,
+                reason=f"User-initiated message {action_desc} by {ctx.author.mention}",
+                post_name=post.name,
+                actor=ctx.author,
+                channel=post,
+                target=message.author,
+                additional_info={
+                    f"{action_desc}_message_id": str(message.id),
+                    f"{action_desc}_message_content": (
+                        message.content[:10] if message.content else "N/A"
+                    ),
+                },
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to {'pin' if pin else 'unpin'} message {message.id}: {e}",
+                exc_info=True,
+            )
+            await self.send_error(ctx, f"Unable to {action_desc} the message.")
+            return None
+
+    manage_tags_regex_pattern = re.compile(r"manage_tags:(\d+)")
+
+    @interactions.component_callback(manage_tags_regex_pattern)
+    @log_action
+    async def on_manage_tags(
+        self, ctx: interactions.ComponentContext
+    ) -> Optional[ActionDetails]:
+        logger.info(f"on_manage_tags invoked with custom_id: {ctx.custom_id}")
+        if not (match := self.manage_tags_regex_pattern.match(ctx.custom_id)):
+            logger.warning(f"Invalid custom ID format: {ctx.custom_id}")
+            await self.send_error(ctx, "Invalid custom ID format.")
+            return None
+        post_id = int(match.group(1))
+        try:
+            post = await self.bot.fetch_channel(post_id)
+            parent_forum = await self.bot.fetch_channel(ctx.channel.parent_id)
+        except Exception as e:
+            logger.error(
+                f"Channel fetch error for post_id {post_id}: {e}", exc_info=True
+            )
+            await self.send_error(ctx, "Failed to retrieve necessary channels.")
+            return None
+        if not isinstance(post, interactions.GuildForumPost):
+            logger.warning(f"Channel {post_id} is not a GuildForumPost.")
+            await self.send_error(ctx, "Invalid forum post.")
+            return None
+        tag_updates = {
+            action: frozenset(
+                int(value.split(":")[1])
+                for value in ctx.values
+                if value.startswith(f"{action}:")
+            )
+            for action in ("add", "remove")
+        }
+        logger.info(f"Processing tag updates for post {post_id}: {tag_updates}")
+        current_tags = frozenset(tag.id for tag in post.applied_tags)
+        new_tags = (current_tags | tag_updates["add"]) - tag_updates["remove"]
+
+        if new_tags == current_tags:
+            await self.send_success(ctx, "No tag changes detected.")
+            return None
+
+        if len(new_tags) > 5:
+            await self.send_error(ctx, "A post can have a maximum of 5 tags.")
+            return None
+
+        try:
+            await post.edit(applied_tags=list(new_tags))
+            logger.info(f"Tags successfully updated for post {post_id}.")
+        except Exception as e:
+            logger.exception(f"Failed to edit tags for post {post_id}: {e}")
+            await self.send_error(ctx, "Error updating tags. Please try again later.")
+            return None
+
+        tag_names = {tag.id: tag.name for tag in parent_forum.available_tags}
+        updates = [
+            f"Tag `{tag_names.get(str(tag_id), 'Unknown')}` {'added to' if action == 'add' else 'removed from'} the post."
+            for action, tag_ids in tag_updates.items()
+            if tag_ids
+            for tag_id in tag_ids
+        ]
+
+        await self.send_success(ctx, "\n".join(updates))
+        return ActionDetails(
+            action=ActionType.EDIT,
+            reason="Tags modified in the post",
+            post_name=post.name,
+            actor=ctx.author,
+            channel=post,
+            additional_info={
+                "tag_updates": [
+                    {
+                        "Action": action.capitalize(),
+                        "Tag": tag_names.get(str(tag_id), "Unknown"),
+                    }
+                    for action, tag_ids in tag_updates.items()
+                    if tag_ids
+                    for tag_id in tag_ids
+                ]
+            },
+        )
+
+    @staticmethod
+    async def process_new_post(thread: interactions.GuildPublicThread) -> None:
+        try:
+            timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M")
+            new_title = f"[{timestamp}] {thread.name}"
+            await thread.edit(name=new_title)
+
+            poll = interactions.Poll.create(
+                question="您对此请愿持何意见？What is your position regarding this petition?",
+                duration=48,
+                answers=["正  In Favor", "反  Opposed", "无  Abstain"],
+            )
+            await thread.send(poll=poll)
 
         except Exception as e:
             logger.error(
-                f"Error converting missing member {author_id} to temporary: {e!r}\n{traceback.format_exc()}"
+                f"Error processing thread {thread.id}: {str(e)}", exc_info=True
             )
+
+    async def process_link(self, event: MessageCreate) -> None:
+        if not self.should_process_link(event):
+            return
+
+        msg_content = event.message.content
+        if (
+            not (new_content := await self.transform_links(msg_content))
+            or new_content == msg_content
+        ):
+            return
+
+        await asyncio.gather(
+            self.send_warning(event.message.author, self.get_warning_message()),
+            self.replace_message(event, new_content),
+        )
+
+    async def send_warning(self, user: interactions.Member, message: str) -> None:
+        embed: interactions.Embed = await self.create_embed(
+            title="Warning", description=message, color=EmbedColor.WARN
+        )
+        try:
+            await user.send(embeds=[embed])
+        except Exception as e:
+            logger.warning(f"Failed to send warning DM to {user.mention}: {e}")
+
+    @contextlib.asynccontextmanager
+    async def create_temp_webhook(
+        self,
+        channel: Union[interactions.GuildText, interactions.ThreadChannel],
+        name: str,
+    ) -> AsyncGenerator[interactions.Webhook, None]:
+        webhook: interactions.Webhook = await channel.create_webhook(name=name)
+        try:
+            yield webhook
+        finally:
+            with contextlib.suppress(Exception):
+                await webhook.delete()
+
+    async def replace_message(self, event: MessageCreate, new_content: str) -> None:
+        channel: Union[interactions.GuildText, interactions.ThreadChannel] = (
+            event.message.channel
+        )
+        async with self.create_temp_webhook(channel, "Temp Webhook") as webhook:
+            try:
+                await webhook.send(
+                    content=new_content,
+                    username=event.message.author.display_name,
+                    avatar_url=event.message.author.avatar_url,
+                )
+                await event.message.delete()
+            except Exception as e:
+                logger.exception(f"Failed to replace message: {str(e)}")
+                raise
+
+    @functools.lru_cache(maxsize=1024)
+    def sanitize_url(
+        self, url_str: str, preserve_params: frozenset[str] = frozenset({"p"})
+    ) -> str:
+        u = URL(url_str)
+        query_params = frozenset(u.query.keys())
+        return str(
+            u.with_query({k: u.query[k] for k in preserve_params & query_params})
+        )
+
+    @functools.lru_cache(maxsize=1)
+    def get_link_transformations(self) -> list[tuple[re.Pattern, Callable[[str], str]]]:
+        return [
+            (
+                re.compile(
+                    r"https?://(?:www\.)?(?:b23\.tv|bilibili\.com/video/(?:BV\w+|av\d+))",
+                    re.IGNORECASE,
+                ),
+                lambda url: (
+                    self.sanitize_url(url)
+                    if "bilibili.com" in url.lower()
+                    else str(URL(url).with_host("b23.tf"))
+                ),
+            )
+        ]
+
+    async def transform_links(self, content: str) -> str:
+        patterns = self.get_link_transformations()
+        return await asyncio.to_thread(
+            lambda: re.sub(
+                r"https?://\S+",
+                lambda m: next(
+                    (
+                        transform(str(m.group(0)))
+                        for pattern, transform in patterns
+                        if pattern.match(str(m.group(0)))
+                    ),
+                    m.group(0),
+                ),
+                content,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @functools.lru_cache(maxsize=1)
+    def get_warning_message(self) -> str:
+        return "The link you sent may expose your ID. To protect the privacy of members, sending such links is prohibited."
+
+    # Task methods
+
+    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
+    async def rotate_featured_posts_periodically(self) -> None:
+        try:
+            while True:
+                try:
+                    await self.adjust_thresholds()
+                    await self.update_featured_posts_rotation()
+                except Exception as e:
+                    logger.error(
+                        f"Error in rotating selected posts: {e}", exc_info=True
+                    )
+                await asyncio.sleep(self.rotation_interval.total_seconds())
+        except asyncio.CancelledError:
+            logger.info("Featured posts rotation task cancelled")
+            raise
+        except Exception as e:
+            logger.error(
+                f"Fatal error in featured posts rotation task: {e}", exc_info=True
+            )
+            raise
+
+    # Event methods
 
     @interactions.listen(ExtensionLoad)
     async def on_extension_load(self, event: ExtensionLoad) -> None:
-        self.update_roles_based_on_activity.start()
-        self.cleanup_old_locks.start()
-        self.check_incarcerated_members.start()
-        self.cleanup_stats.start()
+        self.rotate_featured_posts_periodically.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
-        tasks_to_stop: tuple = (
-            self.update_roles_based_on_activity,
-            self.cleanup_old_locks,
-            self.check_incarcerated_members,
-            self.cleanup_stats,
-        )
+        tasks_to_stop: tuple = (self.rotate_featured_posts_periodically,)
         for task in tasks_to_stop:
             task.stop()
 
@@ -2923,450 +2625,220 @@ class Roles(interactions.Extension):
             task for task in asyncio.all_tasks() if task.get_name().startswith("Task-")
         ]
         await asyncio.gather(
-            *map(partial(asyncio.wait_for, timeout=10.0), pending_tasks),
+            *map(functools.partial(asyncio.wait_for, timeout=10.0), pending_tasks),
             return_exceptions=True,
         )
 
+    @interactions.listen(MessageCreate)
+    async def on_message_create_for_stats(self, event: MessageCreate) -> None:
+        if not event.message.guild:
+            return
+        if not isinstance(event.message.channel, interactions.GuildForumPost):
+            return
+        if event.message.channel.parent_id not in self.FEATURED_CHANNELS:
+            return
+
+        await self.increment_message_count("{}".format(event.message.channel.id))
+
+    @interactions.listen(MessageCreate)
+    async def on_message_create_for_message_actions(self, event: MessageCreate) -> None:
+        msg = event.message
+        if not all(
+            (
+                msg.guild,
+                msg.message_reference,
+                isinstance(msg.channel, interactions.ThreadChannel),
+            )
+        ):
+            return
+
+        action = {
+            "del": "delete",
+            "pin": "pin",
+            "unpin": "unpin",
+        }.get(msg.content.casefold().strip())
+
+        if not action:
+            return
+
+        try:
+            if not (referenced_message := await msg.fetch_referenced_message()):
+                return
+
+            if not await self.can_manage_message(
+                msg.channel, msg.author, referenced_message
+            ):
+                return
+
+            await msg.delete()
+
+            await (
+                self.delete_message_action(msg, msg.channel, referenced_message)
+                if action == "delete"
+                else self.pin_message_action(
+                    msg, msg.channel, referenced_message, action == "pin"
+                )
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing message action: {e}", exc_info=True)
+
+    @interactions.listen(MessageCreate)
+    async def on_message_create_for_processing(self, event: MessageCreate) -> None:
+        if not event.message.guild:
+            return
+
+        link_task = (
+            asyncio.create_task(self.process_link(event))
+            if self.should_process_link(event)
+            else None
+        )
+
+        if self.should_process_message(event):
+            channel_id, post_id, author_id = map(
+                str,
+                (
+                    event.message.channel.parent_id,
+                    event.message.channel.id,
+                    event.message.author.id,
+                ),
+            )
+
+            if await self.is_user_banned(channel_id, post_id, author_id):
+                await event.message.delete()
+
+        if link_task:
+            await link_task
+
     @interactions.listen(NewThreadCreate)
-    async def on_new_thread_create(self, event: NewThreadCreate) -> None:
-        if not isinstance(thread := event.thread, interactions.GuildPublicThread) or (
-            (thread.parent_id != self.config.VETTING_FORUM_ID)
-            | (thread.id in self.processed_thread_ids)
-            | (thread.owner_id is None)
+    async def on_new_thread_create_for_processing(self, event: NewThreadCreate) -> None:
+        if not (
+            isinstance(event.thread, interactions.GuildPublicThread)
+            and event.thread.parent_id == self.POLL_FORUM_ID
+            and (owner_id := event.thread.owner_id) is not None
+            and (
+                owner := await (await self.bot.fetch_guild(self.GUILD_ID)).fetch_member(
+                    owner_id
+                )
+            )
+            and not owner.bot
+        ):
+            return
+        await self.process_new_post(event.thread)
+
+    @interactions.listen(MessageCreate)
+    async def on_message_create_for_banned_users(self, event: MessageCreate) -> None:
+        if not (
+            event.message.guild
+            and isinstance(event.message.channel, interactions.ThreadChannel)
         ):
             return
 
-        try:
-            await self.handle_new_thread(thread)
-        finally:
-            self.processed_thread_ids.add(thread.id)
-
-    # Tasks
-
-    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
-    async def cleanup_stats(self) -> None:
-        try:
-            guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            processed = removed = 0
-            members_to_remove = set()
-            temp_role_id = self.config.TEMPORARY_ROLE_ID
-            approved_role_id = self.config.APPROVED_ROLE_ID
-
-            for member_batch in (
-                tuple(islice(self.stats, i, i + 100))
-                for i in range(0, len(self.stats), 100)
-            ):
-                for member_id in member_batch:
-                    processed += 1
-                    try:
-                        member = await guild.fetch_member(int(member_id))
-                        if member:
-                            member_role_ids = frozenset(
-                                role.id for role in member.roles
-                            )
-                            if not (
-                                temp_role_id in member_role_ids
-                                and approved_role_id not in member_role_ids
-                            ):
-                                members_to_remove.add(member_id)
-                                removed += 1
-                        else:
-                            members_to_remove.add(member_id)
-                            removed += 1
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing member {member_id} during stats cleanup: {e!r}"
-                        )
-
-            if members_to_remove:
-                self.stats = Counter(
-                    {k: v for k, v in self.stats.items() if k not in members_to_remove}
-                )
-                await self.save_stats_roles()
-                logger.info(
-                    f"Stats cleanup completed - Processed: {processed}, Removed: {removed} members"
-                )
-            else:
-                logger.info(
-                    f"Stats cleanup completed - No members needed removal (Processed: {processed})"
-                )
-
-        except Exception as e:
-            logger.error(
-                f"Critical error in stats cleanup task: {e!r}\n{traceback.format_exc()}"
-            )
-            raise
-
-    @interactions.Task.create(interactions.IntervalTrigger(days=7))
-    async def cleanup_old_locks(self) -> None:
-        current_time: datetime = datetime.now(timezone.utc)
-        threshold: timedelta = timedelta(days=7)
-        self.member_role_locks = {
-            k: v
-            for k, v in self.member_role_locks.items()
-            if not (
-                isinstance(v["lock"], asyncio.Lock)
-                and not v["lock"].locked()
-                and isinstance(v["last_used"], datetime)
-                and isinstance(current_time, datetime)
-                and (current_time - cast(datetime, v["last_used"])).total_seconds()
-                > threshold.total_seconds()
-            )
-        }
-        removed: int = len(self.member_role_locks) - len(self.member_role_locks)
-        logger.info(f"Cleaned up {removed} old locks.")
-
-    @interactions.Task.create(interactions.IntervalTrigger(seconds=30))
-    async def check_incarcerated_members(self) -> None:
-        self.incarcerated_members = await self.model.load_data(
-            "incarcerated_members.json", dict
+        channel_id, post_id, author_id = map(
+            str,
+            (
+                event.message.channel.parent_id,
+                event.message.channel.id,
+                event.message.author.id,
+            ),
         )
-        now: float = time.time()
-        release_times: Dict[str, float] = {
-            str(member_id): (
-                float(data["release_time"]) if isinstance(data, dict) else 0.0
-            )
-            for member_id, data in self.incarcerated_members.items()
-        }
 
-        release_map: Dict[str, Dict[str, Any]] = {
-            str(member_id): data if isinstance(data, dict) else {"release_time": 0.0}
-            for member_id, data in dict(
-                itertools.compress(
-                    self.incarcerated_members.items(),
-                    (t <= now for t in release_times.values()),
-                )
-            ).items()
-        }
+        await self.is_user_banned(
+            channel_id, post_id, author_id
+        ) and event.message.delete()
 
-        schedule_map: Dict[str, Dict[str, Any]] = {
-            str(member_id): data if isinstance(data, dict) else {"release_time": 0.0}
-            for member_id, data in dict(
-                itertools.compress(
-                    self.incarcerated_members.items(),
-                    (0 < t - now <= 60 for t in release_times.values()),
-                )
-            ).items()
-        }
+    # Check methods
 
-        tasks = (
-            asyncio.create_task(
-                self.schedule_release(
-                    member_id, data, max(0.0, float(data["release_time"]) - now)
-                ),
-                name=f"release_{member_id}",
-            )
-            for member_id, data in schedule_map.items()
-        )
-        tuple(tasks)
+    async def can_manage_post(
+        self,
+        thread: interactions.ThreadChannel,
+        user: interactions.Member,
+    ) -> bool:
+        user_roles = {role.id for role in user.roles}
+        user_id = user.id
+        thread_parent = thread.parent_id
 
-        exceptions: List[Exception] = []
-        for member_id, data in release_map.items():
-            try:
-                await self.release_prisoner(member_id, data)
-            except Exception as e:
-                exceptions.append(e)
-                logger.error(f"Error releasing prisoner: {e}", exc_info=True)
-
-        if release_map:
-            logger.info(
-                f"Released {len(release_map)} prisoners"
-                f"{f' with {len(exceptions)} errors' if exceptions else ''}"
-            )
-        else:
-            logger.debug("No prisoners to release at this time")
-
-    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
-    async def update_roles_based_on_activity(self) -> None:
-        try:
-            guild: interactions.Guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            roles: Dict[str, interactions.Role] = {
-                name: await guild.fetch_role(id_)
-                for name, id_ in (
-                    ("approved", self.config.APPROVED_ROLE_ID),
-                    ("temporary", self.config.TEMPORARY_ROLE_ID),
-                    ("electoral", self.config.ELECTORAL_ROLE_ID),
-                )
-            }
-
-            role_updates: Dict[str, DefaultDict[int, List[interactions.Role]]] = {
-                op: defaultdict(list) for op in ("remove", "add")
-            }
-            log_messages: List[str] = []
-            members_to_update: Set[int] = set()
-
-            filtered_stats = {
-                mid: stats
-                for mid, stats in self.stats.items()
-                if isinstance(stats, dict)
-                and (
-                    len(stats.get("message_timestamps", []))
-                    - stats.get("invalid_message_count", 0)
-                )
-                >= 50
-            }
-
-            for member_id, stats in filtered_stats.items():
-                if not (member := await guild.fetch_member(int(member_id))):
-                    logger.warning(f"Member {member_id} not found during processing")
-                    continue
-                member_role_ids: Set[int] = {role.id for role in member.roles}
-                stats_dict = cast(Dict[str, Any], stats)
-                valid_messages = len(
-                    stats_dict.get("message_timestamps", [])
-                ) - stats_dict.get("invalid_message_count", 0)
-
-                if all(
-                    (
-                        roles["temporary"].id in member_role_ids,
-                        roles["approved"].id not in member_role_ids,
-                        roles["electoral"].id not in member_role_ids,
-                        valid_messages >= 5,
-                    )
-                ):
-                    member_id_int = int(member_id)
-                    role_updates["remove"][member_id_int].append(roles["temporary"])
-                    role_updates["add"][member_id_int].append(roles["approved"])
-                    members_to_update.add(member_id_int)
-                    log_messages.append(
-                        f"Updated roles for `{member_id}`: Sent `{valid_messages}` valid messages, upgraded from `{roles['temporary'].name}` to `{roles['approved'].name}`."
-                    )
-            if members_to_update:
-                for member_id_int in members_to_update:
-                    try:
-                        if member := await guild.fetch_member(member_id_int):
-                            if remove_roles := role_updates["remove"][member_id_int]:
-                                await member.remove_roles(remove_roles)
-                            if add_roles := role_updates["add"][member_id_int]:
-                                await member.add_roles(add_roles)
-                        else:
-                            logger.error(
-                                f"Member {member_id} not found during role update"
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"Error updating roles for member {member_id}: {str(e)}\n{traceback.format_exc()}"
-                        )
-
-                if log_messages:
-                    await self.send_success(None, "\n".join(log_messages))
-
-            self.stats = Counter(
-                {
-                    k: cast(Dict[str, Any], v)
-                    for k, v in self.stats.items()
-                    if (
-                        int(k) not in members_to_update
-                        or len(cast(Dict[str, Any], v).get("message_timestamps", []))
-                        < 5
-                    )
-                }
-            )
-            await self.save_stats_roles()
-
-        except Exception as e:
-            logger.error(
-                f"Critical error in role update task: {str(e)}\n{traceback.format_exc()}"
-            )
-            raise
-
-    # Serve
-
-    async def handle_new_thread(self, thread: interactions.GuildPublicThread) -> None:
-        try:
-            timestamp = f"{int(datetime.now(timezone.utc).strftime('%y%m%d%H%M'))}"
-            new_title = f"[{timestamp}] {thread.name}"
-
-            await thread.edit(name=new_title)
-
-            review_task = asyncio.create_task(self._send_review_components(thread))
-            notify_task = asyncio.create_task(
-                self.notify_vetting_reviewers(
-                    self.config.VETTING_ROLE_IDS, thread, timestamp
-                )
+        if thread_parent == self.CONGRESS_ID:
+            return bool(
+                user_roles & {self.CONGRESS_MOD_ROLE, self.CONGRESS_MEMBER_ROLE}
             )
 
-            await review_task
-            await notify_task
-
-        except Exception as e:
-            logger.exception(f"Error processing new post: {e!r}")
-
-    async def _send_review_components(
-        self, thread: interactions.GuildPublicThread
-    ) -> None:
-        embed, buttons = await self.create_review_components(thread)
-        await thread.send(embed=embed, components=buttons)
-
-    custom_roles_menu_pattern = re.compile(r"manage_roles_menu_(\d+)")
-
-    @interactions.component_callback(custom_roles_menu_pattern)
-    async def handle_custom_roles_menu(
-        self, ctx: interactions.ComponentContext
-    ) -> None:
-        if (
-            not (match := self.custom_roles_menu_pattern.match(ctx.custom_id))
-            or not ctx.values
-        ):
-            await self.send_error(
-                ctx,
+        return (
+            thread.owner_id == user_id
+            or self.model.has_thread_permissions(str(thread.id), str(user_id))
+            or next(
                 (
-                    "Please select an action (add/remove) from the dropdown menu to continue."
-                    if match
-                    else "Invalid menu format"
+                    True
+                    for role_id, channels in self.ROLE_CHANNEL_PERMISSIONS.items()
+                    if role_id in user_roles and thread_parent in channels
+                ),
+                False,
+            )
+        )
+
+    async def check_permissions(
+        self, ctx: interactions.SlashContext
+    ) -> tuple[bool, str]:
+        r, p_id, perms = (
+            ctx.author.roles,
+            ctx.channel.parent_id,
+            self.ROLE_CHANNEL_PERMISSIONS,
+        )
+        return (
+            any(role.id in perms and p_id in perms[role.id] for role in r),
+            "You do not have permission for this action."
+            * (not any(role.id in perms and p_id in perms[role.id] for role in r)),
+        )
+
+    async def validate_channel(self, ctx: interactions.InteractionContext) -> bool:
+        return (
+            isinstance(
+                ctx.channel,
+                (
+                    interactions.GuildForumPost,
+                    interactions.GuildPublicThread,
+                    interactions.ThreadChannel,
                 ),
             )
-            return
-
-        member_id: int = int(match[1])
-        action_str = ctx.values[0]
-        if action_str not in ("add", "remove"):
-            raise ValueError(f"Invalid action: {action_str}")
-        action: Literal["add", "remove"] = "add" if action_str == "add" else "remove"
-
-        member: interactions.Member = await ctx.guild.fetch_member(member_id)
-        if not member:
-            await self.send_error(ctx, f"Unable to find member with ID {member_id}.")
-            return
-
-        custom_roles_count: int = len(self.custom_roles)
-        if not custom_roles_count or custom_roles_count > 25:
-            await self.send_error(
-                ctx,
-                (
-                    lambda x: (
-                        "There are currently no custom roles configured that can be managed."
-                        if not x
-                        else "There are too many custom roles to display in a single menu. Support for multiple pages will be added soon."
-                    )
-                )(custom_roles_count),
-            )
-            return
-
-        options: tuple[interactions.StringSelectOption, ...] = tuple(
-            map(
-                lambda role: interactions.StringSelectOption(label=role, value=role),
-                self.custom_roles,
-            )
+            and ctx.channel.parent_id in self.ALLOWED_CHANNELS
         )
 
-        await ctx.send(
-            f"Please select which role you would like to {action} {('to' if action == 'add' else 'from')} {member.mention}",
-            components=[
-                interactions.StringSelectMenu(
-                    *options,
-                    custom_id=f"{action}_roles_menu_{member.id}",
-                    placeholder="Select role to manage",
-                )
-            ],
-            ephemeral=True,
+    def should_process_message(self, event: MessageCreate) -> bool:
+        return (
+            event.message.guild
+            and event.message.guild.id == self.GUILD_ID
+            and isinstance(event.message.channel, interactions.ThreadChannel)
+            and bool(event.message.content)
         )
 
-    role_menu_regex_pattern = re.compile(r"(add|remove)_roles_menu_(\d+)")
+    @staticmethod
+    async def has_admin_permissions(member: interactions.Member) -> bool:
+        return any(
+            role.permissions & interactions.Permissions.ADMINISTRATOR
+            for role in member.roles
+        )
 
-    @interactions.component_callback(role_menu_regex_pattern)
-    async def on_role_menu_select(self, ctx: interactions.ComponentContext) -> None:
-        try:
-            logger.info(
-                f"on_role_menu_select triggered with custom_id: {ctx.custom_id}"
-            )
+    async def can_manage_message(
+        self,
+        thread: interactions.ThreadChannel,
+        user: interactions.Member,
+        message: interactions.Message,
+    ) -> bool:
+        return await self.can_manage_post(thread, user)
 
-            if not (match := self.role_menu_regex_pattern.match(ctx.custom_id)):
-                logger.error(f"Invalid custom ID format: {ctx.custom_id}")
-                return await self.send_error(ctx, "Invalid custom ID format.")
+    def should_process_link(self, event: MessageCreate) -> bool:
+        guild = event.message.guild
+        return (
+            guild
+            and guild.id == self.GUILD_ID
+            and (member := guild.get_member(event.message.author.id))
+            and event.message.content
+            and not any(role.id == self.TAIWAN_ROLE_ID for role in member.roles)
+        )
 
-            action, member_id_str = match.groups()
-            member_id = int(member_id_str)
-            logger.info(f"Parsed action: {action}, member_id: {member_id}")
-
-            if action not in {Action.ADD.value, Action.REMOVE.value}:
-                logger.error(f"Invalid action: {action}")
-                return await self.send_error(ctx, f"Invalid action: {action}")
-
-            try:
-                member = await ctx.guild.fetch_member(member_id)
-            except NotFound:
-                logger.error(f"Member with ID {member_id} not found.")
-                return await self.send_error(
-                    ctx, f"Member with ID {member_id} not found."
-                )
-
-            if not (selected_role := next(iter(ctx.values), None)):
-                logger.warning("No role selected.")
-                return await self.send_error(
-                    ctx,
-                    "Please select a role from the dropdown menu to continue.",
-                )
-
-            logger.info(f"Selected role: {selected_role}")
-
-            if await self.update_custom_roles(
-                member_id, {selected_role}, Action(action)
-            ):
-                action_past = "added to" if action == "add" else "removed from"
-                success_message = (
-                    f"The role {selected_role} has been {action_past} {member.mention}."
-                )
-                logger.info(success_message)
-                await self.send_success(ctx, success_message)
-                await self.save_custom_roles()
-            else:
-                logger.warning("No roles were updated.")
-                await self.send_error(ctx, "No roles were updated.")
-
-        except Exception as e:
-            logger.error(f"Error in on_role_menu_select: {str(e)}")
-            logger.error(traceback.format_exc())
-            await self.send_error(ctx, f"An unexpected error occurred: {str(e)}")
-
-    async def update_custom_roles(
-        self, user_id: int, roles: Set[str], action: Action
-    ) -> Set[str]:
-        updated_roles: set[str] = set()
-        for role in roles:
-            if role not in self.custom_roles:
-                self.custom_roles[role] = set()
-                updated_roles.add(role)
-                continue
-
-            members = self.custom_roles[role]
-            if action == Action.ADD and user_id not in members:
-                members.add(user_id)
-                updated_roles.add(role)
-            elif action == Action.REMOVE and user_id in members:
-                members.remove(user_id)
-                if not members:
-                    self.custom_roles.pop(role, None)
-                updated_roles.add(role)
-
-        if updated_roles:
-            await self.save_custom_roles()
-        return updated_roles
-
-    async def save_custom_roles(self) -> None:
-        try:
-            serializable_custom_roles = dict(
-                map(lambda x: (x[0], list(x[1])), self.custom_roles.items())
-            )
-            await self.model.save_data("custom.json", serializable_custom_roles)
-            logger.info("Custom roles saved successfully")
-        except Exception as e:
-            logger.error(f"Failed to save custom roles: {e}")
-            raise
-
-    async def save_stats_roles(self) -> None:
-        try:
-            await self.model.save_data("stats.json", dict(self.stats))
-            logger.info(f"Stats saved successfully: {self.stats!r}")
-        except Exception as e:
-            logger.error(f"Failed to save stats roles: {e!r}", exc_info=True)
-            raise
-
-    async def save_incarcerated_members(self) -> None:
-        try:
-            await self.model.save_data(
-                "incarcerated_members.json", dict(self.incarcerated_members)
-            )
-        except Exception as e:
-            logger.error(f"Failed to save incarcerated members: {e!r}")
-            raise
+    async def is_user_banned(
+        self, channel_id: str, post_id: str, author_id: str
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.model.is_user_banned, channel_id, post_id, author_id
+        )
