@@ -42,6 +42,7 @@ from typing import (
 )
 
 import aiofiles
+import aiohttp
 import cysimdjson
 import interactions
 import numpy as np
@@ -213,14 +214,14 @@ class Model(Generic[T]):
             loop = asyncio.get_running_loop()
             try:
                 json_parsed = await loop.run_in_executor(
-                    self._executor, lambda: orjson.loads(content)
+                    self._executor, orjson.loads, content
                 )
             except orjson.JSONDecodeError:
                 logger.warning(
                     f"`orjson` failed to parse {file_name}, using `cysimdjson`"
                 )
                 json_parsed = await loop.run_in_executor(
-                    self._executor, lambda: self.parser.parse(content)
+                    self._executor, self.parser.parse, content
                 )
 
             if file_name == "custom.json":
@@ -230,11 +231,8 @@ class Model(Generic[T]):
             elif issubclass(model, BaseModel):
                 instance = await loop.run_in_executor(
                     self._executor,
-                    lambda: (
-                        model.model_validate_json(content)
-                        if content
-                        else model.model_validate({})
-                    ),
+                    model.model_validate_json if content else model.model_validate,
+                    content if content else {},
                 )
             elif model == Counter:
                 instance = Counter(json_parsed)
@@ -276,9 +274,9 @@ class Model(Generic[T]):
         file_path = self.base_path / file_name
         try:
             loop = asyncio.get_running_loop()
-            json_data = await loop.run_in_executor(
-                self._executor,
-                lambda: orjson.dumps(
+
+            def dump_data():
+                return orjson.dumps(
                     (
                         data.model_dump(mode="json")
                         if isinstance(data, BaseModel)
@@ -287,8 +285,9 @@ class Model(Generic[T]):
                     option=orjson.OPT_INDENT_2
                     | orjson.OPT_SERIALIZE_NUMPY
                     | orjson.OPT_NON_STR_KEYS,
-                ),
-            )
+                )
+
+            json_data = await loop.run_in_executor(self._executor, dump_data)
 
             async with self._file_operation(file_path, "wb") as file:
                 await file.write(json_data)
@@ -387,6 +386,75 @@ class Message:
 
 
 # Controller
+
+
+class ChannelHistoryIteractor:
+    def __init__(self, history: interactions.ChannelHistory) -> None:
+        self.history: interactions.ChannelHistory = history
+        self._retries = 0
+        self.MAX_RETRIES = 3
+        self.RETRY_DELAY = 1.0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while self._retries < self.MAX_RETRIES:
+            try:
+                return await self.history.__anext__()
+            except StopAsyncIteration:
+                raise
+            except HTTPException as e:
+                try:
+                    match e.code:
+                        case 50083 | 10003 | 50001 | 50013:
+                            logger.error(
+                                f"Channel {self.history.channel.name} ({self.history.channel.id}): "
+                                f"{'archived thread' if e.code == 50083 else 'unknown channel' if e.code == 10003 else 'no access' if e.code == 50001 else 'lacks permission'}"
+                            )
+                            raise StopAsyncIteration
+                        case 10008:
+                            logger.warning(
+                                f"Unknown message in Channel {self.history.channel.name} ({self.history.channel.id})"
+                            )
+                        case 50021:
+                            logger.warning(
+                                f"System message in Channel {self.history.channel.name} ({self.history.channel.id})"
+                            )
+                        case 160005:
+                            logger.warning(
+                                f"Channel {self.history.channel.name} ({self.history.channel.id}) is a locked thread"
+                            )
+                        case _:
+                            logger.warning(
+                                f"Channel {self.history.channel.name} ({self.history.channel.id}) has unknown code {e.code}"
+                            )
+                except ValueError:
+                    logger.warning(
+                        f"Unknown HTTP exception {e.code} {e.errors} {e.route} {e.response} {e.text}",
+                        stack_info=True,
+                    )
+            except aiohttp.ClientPayloadError as e:
+                self._retries += 1
+                if self._retries >= self.MAX_RETRIES:
+                    logger.error(
+                        f"Failed to fetch message history after {self.MAX_RETRIES} retries: {str(e)}"
+                    )
+                    raise StopAsyncIteration
+                logger.warning(
+                    f"ClientPayloadError occurred (attempt {self._retries}/{self.MAX_RETRIES}): {str(e)}"
+                )
+                await asyncio.sleep(self.RETRY_DELAY * self._retries)
+                continue
+            except Exception as e:
+                logger.warning(
+                    f"Unknown exception {e.__class__.__name__}: {str(e)}", exc_info=True
+                )
+                self._retries += 1
+                if self._retries >= self.MAX_RETRIES:
+                    raise StopAsyncIteration
+                await asyncio.sleep(self.RETRY_DELAY * self._retries)
+                continue
 
 
 class Roles(interactions.Extension):
@@ -806,7 +874,7 @@ class Roles(interactions.Extension):
         interactions.Permissions.ADMINISTRATOR
     )
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
+    async def process_inactive_members(self, ctx: interactions.SlashContext, version: int) -> None:
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
             await self.send_error(
                 ctx, "You need Administrator permission to use this command."
@@ -827,8 +895,8 @@ class Roles(interactions.Extension):
                     f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
                 )
 
-            cutoff = datetime.now(timezone.utc) - timedelta(days=15)
-            grace_period = datetime.now(timezone.utc) - timedelta(days=15)
+            temp_cutoff = datetime.now(timezone.utc) - timedelta(days=15)
+            electoral_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             converted_members = []
 
             text_channels = {
@@ -868,15 +936,67 @@ class Roles(interactions.Extension):
                 batch_start = time.monotonic()
 
                 for member in batch:
-                    if member.joined_at and member.joined_at > grace_period:
+                    cutoff = (
+                        temp_cutoff if temp_role in member.roles else electoral_cutoff
+                    )
+
+                    if member.joined_at and member.joined_at > cutoff:
                         skipped += 1
                         processed += 1
                         continue
 
                     try:
-                        if await self.check_member_last_activity(
-                            member, text_channels, cutoff
+                        latest_message_time: Optional[datetime] = None
+                        chunk_size = min(
+                            max(8, (os.cpu_count() or 4) * 4), len(text_channels)
+                        )
+                        max_retries = 3
+                        is_active = False
+
+                        for channel_chunk in (
+                            list(text_channels)[i : i + chunk_size]
+                            for i in range(0, len(text_channels), chunk_size)
                         ):
+                            for channel in channel_chunk:
+                                for retry in range(max_retries):
+                                    try:
+                                        history = channel.history(
+                                            limit=0,
+                                            before=int(cutoff.timestamp() * 1000),
+                                        )
+
+                                        async for message in ChannelHistoryIteractor(
+                                            history
+                                        ):
+                                            if message.author.id == member.id:
+                                                msg_time = (
+                                                    message.edited_timestamp
+                                                    or message.timestamp
+                                                )
+                                                if msg_time > cutoff:
+                                                    is_active = True
+                                                    break
+                                                elif (
+                                                    latest_message_time is None
+                                                    or msg_time > latest_message_time
+                                                ):
+                                                    latest_message_time = msg_time
+                                        break
+                                    except Exception as e:
+                                        if retry == max_retries - 1:
+                                            logger.error(
+                                                f"Error checking channel {channel.id}: {e}"
+                                            )
+                                        await asyncio.sleep(0.5)
+
+                                if is_active:
+                                    break
+
+                            if is_active:
+                                break
+                            await asyncio.sleep(0.1)
+
+                        if not is_active:
                             new_roles = {
                                 role.id
                                 for role in member.roles
@@ -946,150 +1066,6 @@ class Roles(interactions.Extension):
             await self.send_error(
                 ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
             )
-
-    async def check_member_last_activity(
-        self,
-        member: interactions.Member,
-        text_channels: set[Union[interactions.ThreadChannel, interactions.GuildText]],
-        cutoff: datetime,
-    ) -> bool:
-        try:
-            last_message_time = await self.get_last_message_time(
-                member, text_channels, cutoff
-            )
-            return (
-                not last_message_time
-                or (
-                    last_message_time.replace(tzinfo=timezone.utc)
-                    if last_message_time.tzinfo is None
-                    else last_message_time
-                )
-                < cutoff
-            )
-        except Exception as e:
-            logger.error(f"Error checking activity for member {member.id}: {e}")
-            raise
-
-    @staticmethod
-    async def get_last_message_time(
-        member: interactions.Member,
-        text_channels: set[Union[interactions.ThreadChannel, interactions.GuildText]],
-        cutoff: datetime,
-    ) -> Optional[datetime]:
-        message_limit = 0
-        max_retries = 3
-        current_latest_time: datetime = cutoff
-        channel_latest_times: Dict[int, datetime] = {}
-
-        filtered_channels = {
-            c
-            for c in text_channels
-            if isinstance(
-                c,
-                (
-                    interactions.GuildText,
-                    interactions.ThreadChannel,
-                ),
-            )
-        }
-
-        async def check_channel_history(
-            channel: Union[
-                interactions.GuildText,
-                interactions.ThreadChannel,
-            ],
-        ) -> AsyncGenerator[
-            tuple[Optional[datetime], Optional[datetime], Optional[datetime]], None
-        ]:
-            for retry in range(max_retries):
-                try:
-                    messages = [
-                        msg async for msg in channel.history(limit=message_limit)
-                    ]
-                    if not messages:
-                        yield None, None, None
-                        return
-
-                    channel_latest = messages[0].created_at
-                    channel_earliest = messages[-1].created_at
-
-                    if (
-                        current_latest_time is not None
-                        and channel_earliest <= current_latest_time
-                    ):
-                        yield None, channel_latest, channel_earliest
-                        return
-
-                    member_time = next(
-                        (m.created_at for m in messages if m.author.id == member.id),
-                        None,
-                    )
-                    yield member_time, channel_latest, channel_earliest
-                    return
-                except Exception as e:
-                    if retry == max_retries - 1:
-                        logger.error(
-                            f"Error checking channel {channel.id} after {max_retries} retries: {e}"
-                        )
-                        yield None, None, None
-                        return
-                    await asyncio.sleep(0.5)
-
-        total_channels = len(filtered_channels)
-        chunk_size = min(max(8, (os.cpu_count() or 4) * 4), total_channels)
-        found_any_messages = False
-
-        async def process_channels() -> AsyncGenerator[Optional[datetime], None]:
-            nonlocal current_latest_time, found_any_messages
-            remaining_channels = filtered_channels.copy()
-
-            while remaining_channels:
-                current_chunk = set(itertools.islice(remaining_channels, chunk_size))
-                remaining_channels -= current_chunk
-
-                for channel in current_chunk:
-                    async for (
-                        member_time,
-                        channel_latest,
-                        channel_earliest,
-                    ) in check_channel_history(channel):
-                        if channel_latest:
-                            channel_latest_times[channel.id] = channel_latest
-
-                        if member_time:
-                            if member_time > cutoff:
-                                yield member_time
-                                return
-
-                            found_any_messages = True
-                            if (
-                                current_latest_time is None
-                                or member_time > current_latest_time
-                            ):
-                                current_latest_time = member_time
-                                yield None
-
-                remaining_channels = {
-                    channel
-                    for channel in remaining_channels
-                    if channel.id not in channel_latest_times
-                    or (
-                        channel_latest_times[channel.id]
-                        and channel_latest_times[channel.id]
-                        > (current_latest_time or cutoff)
-                    )
-                }
-
-                if not remaining_channels:
-                    break
-
-                await asyncio.sleep(0.1)
-
-        async for final_time in process_channels():
-            if final_time is not None:
-                return final_time
-
-        return current_latest_time if found_any_messages else None
 
     @module_group_debug.subcommand(
         "conflicts", sub_cmd_description="Check and resolve role conflicts"
