@@ -1,4 +1,5 @@
 aiofiles
+aiohttp
 cysimdjson
 discord-py-interactions
 cachetools
