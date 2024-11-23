@@ -874,7 +874,7 @@ class Roles(interactions.Extension):
         interactions.Permissions.ADMINISTRATOR
     )
     @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
-    async def process_inactive_members(self, ctx: interactions.SlashContext, version: int) -> None:
+    async def process_inactive_members(self, ctx: interactions.SlashContext) -> None:
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
             await self.send_error(
                 ctx, "You need Administrator permission to use this command."
@@ -885,11 +885,20 @@ class Roles(interactions.Extension):
 
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            temp_role = await guild.fetch_role(self.config.TEMPORARY_ROLE_ID)
-            electoral_role = await guild.fetch_role(self.config.ELECTORAL_ROLE_ID)
-            missing_role = await guild.fetch_role(self.config.MISSING_ROLE_ID)
+            logger.info(f"Processing inactive members for guild {guild.id}")
 
-            if not all((temp_role, electoral_role, missing_role)):
+            roles = await asyncio.gather(
+                guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
+                guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
+                guild.fetch_role(self.config.MISSING_ROLE_ID),
+            )
+            temp_role, electoral_role, missing_role = roles
+            logger.info(
+                f"Fetched roles - temp: {temp_role.id}, electoral: {electoral_role.id}, missing: {missing_role.id}"
+            )
+
+            if not all(roles):
+                logger.error("One or more required roles not found")
                 return await self.send_error(
                     ctx,
                     f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
@@ -912,157 +921,171 @@ class Roles(interactions.Extension):
                     interactions.ChannelType.GUILD_PRIVATE_THREAD,
                 )
             }
+            logger.info(f"Found {len(text_channels)} text channels to scan")
 
-            members_to_check: list[interactions.Member] = [
-                *filter(None, (temp_role.members, electoral_role.members))
-            ]
-            members_to_check = [
-                member for member in temp_role.members + electoral_role.members
-            ]
-
+            members_to_check = temp_role.members + electoral_role.members
             total_members = len(members_to_check)
+            logger.info(f"Total members to check: {total_members}")
             processed = skipped = 0
 
-            BATCH_SIZE = min(25, total_members)
+            MEMBER_EDIT_RATE = 10
+            MESSAGE_RATE = 5
+            BATCH_SIZE = min(MEMBER_EDIT_RATE, total_members)
             REPORT_THRESHOLD = 10
-            BATCH_COOLDOWN = 5.0
-            PROGRESS_UPDATE_INTERVAL = 30.0
-            last_progress_update = time.monotonic()
 
-            for batch in (
-                members_to_check[i : i + BATCH_SIZE]
-                for i in range(0, total_members, BATCH_SIZE)
-            ):
-                batch_start = time.monotonic()
+            member_edit_sem = asyncio.Semaphore(MEMBER_EDIT_RATE)
+            message_sem = asyncio.Semaphore(MESSAGE_RATE)
 
-                for member in batch:
-                    cutoff = (
-                        temp_cutoff if temp_role in member.roles else electoral_cutoff
+            async def process_member(member: interactions.Member):
+                nonlocal processed, skipped
+                cutoff = temp_cutoff if temp_role in member.roles else electoral_cutoff
+                logger.debug(f"Processing member {member.id} with cutoff {cutoff}")
+
+                if member.joined_at and member.joined_at > cutoff:
+                    logger.debug(f"Member {member.id} skipped - within grace period")
+                    skipped += 1
+                    processed += 1
+                    return
+
+                try:
+                    cutoff_ts = cutoff.timestamp()
+                    cutoff_ms = int(cutoff_ts * 1000)
+                    member_id = member.id
+                    channels = tuple(text_channels)
+                    logger.debug(
+                        f"Checking activity for member {member_id} across {len(channels)} channels"
                     )
 
-                    if member.joined_at and member.joined_at > cutoff:
-                        skipped += 1
-                        processed += 1
-                        continue
+                    is_active = False
+                    for chunk_start in range(0, len(channels), 4):
+                        chunk = channels[chunk_start : chunk_start + 4]
+                        logger.debug(f"Processing channel chunk {chunk_start//4 + 1}")
 
-                    try:
-                        latest_message_time: Optional[datetime] = None
-                        chunk_size = min(
-                            max(8, (os.cpu_count() or 4) * 4), len(text_channels)
-                        )
-                        max_retries = 3
-                        is_active = False
+                        for channel in chunk:
+                            try:
+                                limit, max_limit = 50, 1000
+                                last_msg_id = None
+                                logger.debug(
+                                    f"Scanning channel {channel.id} for member {member_id}"
+                                )
 
-                        for channel_chunk in (
-                            list(text_channels)[i : i + chunk_size]
-                            for i in range(0, len(text_channels), chunk_size)
-                        ):
-                            for channel in channel_chunk:
-                                for retry in range(max_retries):
-                                    try:
-                                        history = channel.history(
-                                            limit=0,
-                                            before=int(cutoff.timestamp() * 1000),
-                                        )
+                                while limit <= max_limit:
+                                    history = channel.history(
+                                        limit=limit, before=last_msg_id, after=cutoff_ms
+                                    )
 
-                                        async for message in ChannelHistoryIteractor(
-                                            history
-                                        ):
-                                            if message.author.id == member.id:
-                                                msg_time = (
-                                                    message.edited_timestamp
-                                                    or message.timestamp
-                                                )
-                                                if msg_time > cutoff:
-                                                    is_active = True
-                                                    break
-                                                elif (
-                                                    latest_message_time is None
-                                                    or msg_time > latest_message_time
-                                                ):
-                                                    latest_message_time = msg_time
-                                        break
-                                    except Exception as e:
-                                        if retry == max_retries - 1:
-                                            logger.error(
-                                                f"Error checking channel {channel.id}: {e}"
+                                    async for message in ChannelHistoryIteractor(
+                                        history
+                                    ):
+                                        if (
+                                            message.author.id == member_id
+                                            and (
+                                                message.edited_timestamp
+                                                or message.timestamp
                                             )
-                                        await asyncio.sleep(0.5)
+                                            > cutoff
+                                        ):
+                                            logger.info(
+                                                f"Found activity for member {member_id} in channel {channel.id}"
+                                            )
+                                            is_active = True
+                                            break
+                                        last_msg_id = message.id
 
-                                if is_active:
-                                    break
+                                    if not last_msg_id or is_active:
+                                        break
 
-                            if is_active:
-                                break
-                            await asyncio.sleep(0.1)
+                                    limit <<= 1
 
-                        if not is_active:
-                            new_roles = {
-                                role.id
-                                for role in member.roles
-                                if role not in (temp_role, electoral_role)
-                            } | {missing_role.id}
+                            except Exception as e:
+                                logger.debug(
+                                    f"Error scanning channel {channel.id}: {e}"
+                                )
+                                continue
 
+                        if is_active:
+                            break
+                        await asyncio.sleep(0)
+
+                    if not is_active:
+                        new_roles = {
+                            role.id
+                            for role in member.roles
+                            if role not in (temp_role, electoral_role)
+                        } | {missing_role.id}
+
+                        async with member_edit_sem:
+                            logger.info(
+                                f"Updating roles for inactive member {member.id}"
+                            )
                             await member.edit(
                                 roles=list(new_roles),
                                 reason="Converting inactive member",
                             )
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(1.0)
 
-                            converted_members.append(member.mention)
-                            logger.info(f"Updated roles for member {member.id}")
-
-                        processed += 1
+                        converted_members.append(member.mention)
+                        logger.info(
+                            f"Successfully updated roles for member {member.id}"
+                        )
 
                         if len(converted_members) >= REPORT_THRESHOLD:
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}\n"
-                                f"- Recently converted members: {', '.join(converted_members)}",
-                            )
+                            async with message_sem:
+                                logger.info(
+                                    f"Sending progress report - processed: {processed}/{total_members}"
+                                )
+                                await self.send_success(
+                                    ctx,
+                                    f"- Processed: {processed}/{total_members} members\n"
+                                    f"- Skipped (grace period): {skipped}\n"
+                                    f"- Recently converted members: {', '.join(converted_members)}",
+                                )
+                                await asyncio.sleep(1.0)
                             converted_members.clear()
-                            await asyncio.sleep(0.5)
 
-                        current_time = time.monotonic()
-                        if (
-                            current_time - last_progress_update
-                            >= PROGRESS_UPDATE_INTERVAL
-                        ):
-                            await self.send_success(
-                                ctx,
-                                f"- Processed: {processed}/{total_members} members\n"
-                                f"- Skipped (grace period): {skipped}",
-                            )
-                            last_progress_update = current_time
+                    processed += 1
 
-                    except Exception as e:
-                        logger.error(f"Error processing member {member.id}: {e}")
-                        continue
+                except Exception as e:
+                    logger.error(
+                        f"Error processing member {member.id}: {e}", exc_info=True
+                    )
 
-                elapsed = time.monotonic() - batch_start
-                if elapsed < BATCH_COOLDOWN:
-                    await asyncio.sleep(BATCH_COOLDOWN - elapsed)
-
-            if converted_members:
-                await asyncio.sleep(0.5)
-                await self.send_success(
-                    ctx,
-                    f"- Total processed: {processed}/{total_members}\n"
-                    f"- Skipped (grace period): {skipped}\n"
-                    f"- Last converted members: {', '.join(converted_members)}",
+            for i in range(0, total_members, BATCH_SIZE):
+                batch = members_to_check[i : i + BATCH_SIZE]
+                logger.info(
+                    f"Processing batch {i//BATCH_SIZE + 1} with {len(batch)} members"
                 )
+                await asyncio.gather(*(process_member(m) for m in batch))
+                await asyncio.sleep(10.0)
 
-            await asyncio.sleep(0.5)
+                if converted_members:
+                    async with message_sem:
+                        logger.info(
+                            f"Sending batch progress report - processed: {processed}/{total_members}"
+                        )
+                        await self.send_success(
+                            ctx,
+                            f"Batch progress:\n"
+                            f"- Processed: {processed}/{total_members}\n"
+                            f"- Skipped: {skipped}\n"
+                            f"- Recent conversions: {', '.join(converted_members)}",
+                        )
+                        await asyncio.sleep(1.0)
+                    converted_members.clear()
+
+            logger.info(
+                f"Process completed - Total: {total_members}, Skipped: {skipped}, Converted: {processed - skipped}"
+            )
             await self.send_success(
                 ctx,
-                f"- Total members processed: {total_members}\n"
-                f"- Members skipped (grace period): {skipped}\n"
-                f"- Members converted: {processed - skipped}",
+                f"Process completed:\n"
+                f"- Total processed: {total_members}\n"
+                f"- Skipped: {skipped}\n"
+                f"- Converted: {processed - skipped}",
             )
 
         except Exception as e:
-            logger.error(f"Error in process_inactive_members: {e}")
+            logger.error(f"Error in process_inactive_members: {e}", exc_info=True)
             await self.send_error(
                 ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
             )
