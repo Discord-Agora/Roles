@@ -881,7 +881,7 @@ class Roles(interactions.Extension):
             )
             return
 
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
@@ -928,10 +928,10 @@ class Roles(interactions.Extension):
             logger.info(f"Total members to check: {total_members}")
             processed = skipped = 0
 
-            MEMBER_EDIT_RATE = 10
-            MESSAGE_RATE = 5
+            MEMBER_EDIT_RATE = 9
+            MESSAGE_RATE = 4
             BATCH_SIZE = min(MEMBER_EDIT_RATE, total_members)
-            REPORT_THRESHOLD = 10
+            REPORT_THRESHOLD = 5
 
             member_edit_sem = asyncio.Semaphore(MEMBER_EDIT_RATE)
             message_sem = asyncio.Semaphore(MESSAGE_RATE)
@@ -957,13 +957,13 @@ class Roles(interactions.Extension):
                     )
 
                     is_active = False
-                    for chunk_start in range(0, len(channels), 4):
-                        chunk = channels[chunk_start : chunk_start + 4]
-                        logger.debug(f"Processing channel chunk {chunk_start//4 + 1}")
+                    for chunk_start in range(0, len(channels), 3):
+                        chunk = channels[chunk_start : chunk_start + 3]
+                        logger.debug(f"Processing channel chunk {chunk_start//3 + 1}")
 
                         for channel in chunk:
                             try:
-                                limit, max_limit = 50, 1000
+                                limit, max_limit = 50, 500
                                 last_msg_id = None
                                 logger.debug(
                                     f"Scanning channel {channel.id} for member {member_id}"
@@ -997,6 +997,8 @@ class Roles(interactions.Extension):
 
                                     limit <<= 1
 
+                                await asyncio.sleep(1.0)
+
                             except Exception as e:
                                 logger.debug(
                                     f"Error scanning channel {channel.id}: {e}"
@@ -1005,7 +1007,7 @@ class Roles(interactions.Extension):
 
                         if is_active:
                             break
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(2.0)
 
                     if not is_active:
                         new_roles = {
@@ -1117,7 +1119,7 @@ class Roles(interactions.Extension):
             )
             return
 
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         try:
             processed, conflicts = 0, 0
@@ -1231,7 +1233,7 @@ class Roles(interactions.Extension):
     )
     @error_handler
     async def view_config(self, ctx: interactions.SlashContext, config: str) -> None:
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
         try:
             if not (config_data := await self._get_config_data(config)):
                 return await self.send_error(
@@ -2350,7 +2352,7 @@ class Roles(interactions.Extension):
 
     @module_group_servant.subcommand("view", sub_cmd_description="Servant Directory")
     async def view_servant_roles(self, ctx: interactions.SlashContext) -> None:
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
 
         filtered_roles = self.filter_roles(tuple(ctx.guild.roles))
         role_members_list = self.extract_role_members_list(filtered_roles)
