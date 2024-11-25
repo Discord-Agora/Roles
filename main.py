@@ -2232,6 +2232,7 @@ class Roles(interactions.Extension):
         return {
             "electoral": await guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
             "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
+            "temporary": await guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
         }
 
     def get_thread_approvals(self, thread_id: int) -> Approval:
