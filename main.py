@@ -120,7 +120,8 @@ class Data(BaseModel):
 
 @dataclass
 class Config:
-    VETTING_FORUM_ID: int = 1164834982737489930
+    ELECT_VETTING_FORUM_ID: int = 1164834982737489930
+    APPR_VETTING_FORUM_ID: int = 1307001955230552075
     VETTING_ROLE_IDS: List[int] = field(default_factory=lambda: [1200066469300551782])
     ELECTORAL_ROLE_ID: int = 1200043628899356702
     APPROVED_ROLE_ID: int = 1282944839679344721
@@ -669,13 +670,20 @@ class Roles(interactions.Extension):
         timestamp: str,
     ) -> None:
         if not (guild := await self.bot.fetch_guild(thread.guild.id)):
-            error_msg = f"Guild with ID {thread.guild.id} could not be fetched."
+            error_msg = f"Could not fetch the guild with ID {thread.guild.id}."
             logger.error(error_msg)
             raise ValueError(error_msg)
 
+        is_appr_forum = thread.parent_id == self.config.APPR_VETTING_FORUM_ID
+        title = (
+            f"Quick Identity Verification #{timestamp}"
+            if is_appr_forum
+            else f"Voter Identity Verification #{timestamp}"
+        )
+
         embed = await self.create_embed(
-            title=f"Voter Identity Approval #{timestamp}",
-            description=f"[Click to jump: {thread.name}](https://discord.com/channels/{thread.guild.id}/{thread.id})",
+            title=title,
+            description=f"[Click here to jump: {thread.name}](https://discord.com/channels/{thread.guild.id}/{thread.id})",
         )
 
         async def process_role(role_id: int) -> None:
@@ -823,15 +831,26 @@ class Roles(interactions.Extension):
         approval_info: Approval = self.approval_counts.get(thread.id, Approval())
         approval_count: int = approval_info.approval_count
 
+        is_appr_forum = thread.parent_id == self.config.APPR_VETTING_FORUM_ID
+        required_approvals = 1 if is_appr_forum else self.config.REQUIRED_APPROVALS
+        title = (
+            "Quick Identity Verification"
+            if is_appr_forum
+            else "Voter Identity Verification"
+        )
+
         reviewers_text: str = (
             ",".join(f"<@{rid}>" for rid in sorted(approval_info.reviewers, key=int))
             if approval_info.reviewers
-            else "No approvals yet."
+            else "No review records available"
         )
 
         embed: interactions.Embed = await self.create_embed(
-            title="Voter Identity Approval",
-            description=f"- Approvals: {approval_count}/{self.config.REQUIRED_APPROVALS}\n- Reviewers: {reviewers_text}",
+            title=title,
+            description=(
+                f"- Current status: {approval_count}/{required_approvals} votes\n"
+                f"- Review records: {reviewers_text}"
+            ),
         )
 
         return embed, [
@@ -2091,37 +2110,50 @@ class Roles(interactions.Extension):
             f"Starting approval process for member {member.id} | Roles: {current_roles}"
         )
 
-        electoral_id = roles["electoral"].id
-        if electoral_id in current_roles:
+        is_appr_forum: bool = thread.parent_id == self.config.APPR_VETTING_FORUM_ID
+        role_mapping = {
+            True: ("temporary", "approved"),
+            False: ("approved", "electoral"),
+        }
+        required_role_name, target_role_name = role_mapping[is_appr_forum]
+        required_role = roles[required_role_name]
+        target_role = roles[target_role_name]
+
+        if target_role.id in current_roles:
             await self.send_error(
                 ctx,
-                f"{member.mention} already has the electoral role and cannot be approved again.",
+                f"{member.mention} already has the {target_role_name} role and cannot be approved again.",
             )
-            logger.info(f"Member {member.id} already has electoral role")
-            return "Approval aborted: Already approved"
+            return f"Approval aborted: Already has {target_role_name} role"
 
+        if required_role.id not in current_roles:
+            await self.send_error(
+                ctx,
+                f"{member.mention} must have the {required_role_name} role before being approved.",
+            )
+            return f"Approval aborted: Missing {required_role_name} role"
+
+        required_approvals: int = 1 if is_appr_forum else self.config.REQUIRED_APPROVALS
         thread_approvals = Approval(
-            approval_count=min(
-                thread_approvals.approval_count + 1, self.config.REQUIRED_APPROVALS
-            ),
+            approval_count=min(thread_approvals.approval_count + 1, required_approvals),
             reviewers=thread_approvals.reviewers | {ctx.author.id},
             last_approval_time=thread_approvals.last_approval_time,
         )
         self.approval_counts[thread.id] = thread_approvals
 
-        if thread_approvals.approval_count == self.config.REQUIRED_APPROVALS:
+        if thread_approvals.approval_count == required_approvals:
             thread_approvals.last_approval_time = datetime.now(timezone.utc)
             await self.update_member_roles(
-                member, roles["electoral"], roles["approved"], current_roles
+                member, target_role, required_role, current_roles
             )
             await self.send_approval_notification(ctx, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Approved {member.mention} with role updates"
 
-        remaining = self.config.REQUIRED_APPROVALS - thread_approvals.approval_count
+        remaining = required_approvals - thread_approvals.approval_count
         await self.send_success(
             ctx,
-            f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{self.config.REQUIRED_APPROVALS} approvals needed. Waiting for {remaining} more approval(s).",
+            f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{required_approvals} approvals needed. Waiting for {remaining} more approval(s).",
             log_to_channel=False,
         )
         return "Approval registered"
@@ -2135,16 +2167,25 @@ class Roles(interactions.Extension):
         thread_approvals: Approval,
         thread: interactions.GuildPublicThread,
     ) -> str:
-        electoral_id: int = roles["electoral"].id
-        if electoral_id not in current_roles:
+        is_appr_forum: bool = thread.parent_id == self.config.APPR_VETTING_FORUM_ID
+        required_role = roles[("approved" if is_appr_forum else "electoral")]
+        fallback_role = roles[("temporary" if is_appr_forum else "approved")]
+
+        if required_role.id not in current_roles:
+            role_name = "approved" if is_appr_forum else "electoral"
             await self.send_error(
                 ctx,
-                f"Unable to reject {member.mention} as they have not yet been approved. Members must first be approved before they can be rejected.",
+                f"Unable to reject {member.mention} as they have not yet been granted the {role_name} role.",
             )
-            return "Rejection aborted: Not approved"
+            return f"Rejection aborted: No {role_name} role"
 
-        if thread_approvals.last_approval_time and self.is_rejection_window_closed(
-            thread_approvals
+        if (
+            not is_appr_forum
+            and thread_approvals.last_approval_time
+            and (
+                datetime.now(timezone.utc) - thread_approvals.last_approval_time
+            ).total_seconds()
+            > self.config.REJECTION_WINDOW_DAYS * 86400
         ):
             await self.send_error(
                 ctx,
@@ -2152,39 +2193,34 @@ class Roles(interactions.Extension):
             )
             return "Rejection aborted: Window closed"
 
+        required_rejections: int = (
+            1 if is_appr_forum else self.config.REQUIRED_REJECTIONS
+        )
+        rejection_count = min(thread_approvals.rejection_count + 1, required_rejections)
+
         thread_approvals = Approval(
             approval_count=thread_approvals.approval_count,
-            rejection_count=min(
-                thread_approvals.rejection_count + 1, self.config.REQUIRED_REJECTIONS
-            ),
+            rejection_count=rejection_count,
             reviewers=thread_approvals.reviewers | {ctx.author.id},
             last_approval_time=thread_approvals.last_approval_time,
         )
         self.approval_counts[thread.id] = thread_approvals
 
-        if thread_approvals.rejection_count == self.config.REQUIRED_REJECTIONS:
+        if rejection_count == required_rejections:
             await self.update_member_roles(
-                member, roles["approved"], roles["electoral"], current_roles
+                member, fallback_role, required_role, current_roles
             )
             await self.send_rejection_notification(ctx, member, thread_approvals)
             self.cleanup_approval_data(thread.id)
             return f"Rejected {member.mention} with role updates"
 
-        remaining: int = (
-            self.config.REQUIRED_REJECTIONS - thread_approvals.rejection_count
-        )
+        remaining: int = required_rejections - rejection_count
         await self.send_success(
             ctx,
-            f"Your rejection vote for {member.mention} has been registered. Current status: {thread_approvals.rejection_count}/{self.config.REQUIRED_REJECTIONS} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
+            f"Your rejection vote for {member.mention} has been registered. Current status: {rejection_count}/{required_rejections} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
             log_to_channel=False,
         )
         return "Rejection registered"
-
-    def is_rejection_window_closed(self, thread_approvals: Approval) -> bool:
-        if not thread_approvals.last_approval_time:
-            return False
-        time_diff = datetime.now(timezone.utc) - thread_approvals.last_approval_time
-        return time_diff.total_seconds() > self.config.REJECTION_WINDOW_DAYS * 86400
 
     def cleanup_approval_data(self, thread_id: int) -> None:
         self.approval_counts.pop(thread_id, None)
@@ -2931,7 +2967,13 @@ class Roles(interactions.Extension):
     @interactions.listen(NewThreadCreate)
     async def on_new_thread_create(self, event: NewThreadCreate) -> None:
         if not isinstance(thread := event.thread, interactions.GuildPublicThread) or (
-            (thread.parent_id != self.config.VETTING_FORUM_ID)
+            (
+                thread.parent_id
+                not in (
+                    self.config.ELECT_VETTING_FORUM_ID,
+                    self.config.APPR_VETTING_FORUM_ID,
+                )
+            )
             | (thread.id in self.processed_thread_ids)
             | (thread.owner_id is None)
         ):
@@ -3180,7 +3222,7 @@ class Roles(interactions.Extension):
 
             await thread.edit(name=new_title)
 
-            review_task = asyncio.create_task(self._send_review_components(thread))
+            review_task = asyncio.create_task(self.send_review_components(thread))
             notify_task = asyncio.create_task(
                 self.notify_vetting_reviewers(
                     self.config.VETTING_ROLE_IDS, thread, timestamp
@@ -3193,7 +3235,7 @@ class Roles(interactions.Extension):
         except Exception as e:
             logger.exception(f"Error processing new post: {e!r}")
 
-    async def _send_review_components(
+    async def send_review_components(
         self, thread: interactions.GuildPublicThread
     ) -> None:
         embed, buttons = await self.create_review_components(thread)
