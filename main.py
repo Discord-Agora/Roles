@@ -821,7 +821,7 @@ class Roles(interactions.Extension):
         ],
         message: str,
         log_to_channel: bool = True,
-        ephemeral: bool = False,
+        ephemeral: bool = True,
     ) -> None:
         await self.send_response(
             ctx, "Success", message, EmbedColor.INFO, log_to_channel, ephemeral
@@ -1063,7 +1063,6 @@ class Roles(interactions.Extension):
                                     f"- Processed: {processed}/{total_members} members\n"
                                     f"- Skipped (grace period): {skipped}\n"
                                     f"- Recently converted members: {', '.join(converted_members)}",
-                                    ephemeral=True,
                                 )
                                 await asyncio.sleep(1.0)
                             converted_members.clear()
@@ -1094,7 +1093,6 @@ class Roles(interactions.Extension):
                             f"- Processed: {processed}/{total_members}\n"
                             f"- Skipped: {skipped}\n"
                             f"- Recent conversions: {', '.join(converted_members)}",
-                            ephemeral=True,
                         )
                         await asyncio.sleep(1.0)
                     converted_members.clear()
@@ -1108,7 +1106,6 @@ class Roles(interactions.Extension):
                 f"- Total processed: {total_members}\n"
                 f"- Skipped: {skipped}\n"
                 f"- Converted: {processed - skipped}",
-                ephemeral=True,
             )
 
         except Exception as e:
@@ -1197,7 +1194,7 @@ class Roles(interactions.Extension):
                                 if current_time - last_report_time >= REPORT_INTERVAL:
                                     if log_buffer:
                                         await self.send_success(
-                                            None, "\n".join(log_buffer), ephemeral=True
+                                            None, "\n".join(log_buffer)
                                         )
                                         log_buffer = []
                                         last_report_time = current_time
@@ -1217,14 +1214,13 @@ class Roles(interactions.Extension):
 
             if log_buffer:
                 await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(None, "\n".join(log_buffer), ephemeral=True)
+                await self.send_success(None, "\n".join(log_buffer))
 
             if conflicts:
                 await asyncio.sleep(ROLE_CHANGE_INTERVAL)
                 await self.send_success(
                     None,
                     f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
-                    ephemeral=True,
                 )
 
             logger.info(
@@ -1533,9 +1529,7 @@ class Roles(interactions.Extension):
             await self.save_custom_roles()
             await self.send_success(
                 ctx,
-                f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}. Use `/custom mention` to mention members with these roles.",
-                log_to_channel=False,
-                ephemeral=True,
+                f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}.",
             )
         else:
             await self.send_error(
@@ -1572,7 +1566,6 @@ class Roles(interactions.Extension):
             await ctx.send(
                 f"Please select whether you want to add or remove custom roles for {member.mention}. After selecting an action, you'll be able to choose specific roles.",
                 components=components,
-                ephemeral=True,
             )
             logger.info(f"Context menu response sent for user: {ctx.target.id}")
 
@@ -2163,7 +2156,6 @@ class Roles(interactions.Extension):
             ctx,
             f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{required_approvals} approvals needed. Waiting for {remaining} more approval(s).",
             log_to_channel=False,
-            ephemeral=True,
         )
         return "Approval registered"
 
@@ -2228,7 +2220,6 @@ class Roles(interactions.Extension):
             ctx,
             f"Your rejection vote for {member.mention} has been registered. Current status: {rejection_count}/{required_rejections} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
             log_to_channel=False,
-            ephemeral=True,
         )
         return "Rejection registered"
 
@@ -2363,8 +2354,8 @@ class Roles(interactions.Extension):
 
         await self.send_success(
             ctx,
-            f"{member.mention} has been approved by {reviewers_text}. The request has been successfully processed and the member's roles will be updated accordingly.",
-            log_to_channel=False,
+            f"{member.mention} has been approved by {reviewers_text}.",
+            ephemeral=False,
         )
 
     async def send_rejection_notification(
@@ -2391,8 +2382,7 @@ class Roles(interactions.Extension):
 
         await self.send_success(
             ctx,
-            f"{member.mention} has been rejected by {reviewers_text}. The request has been denied.",
-            log_to_channel=False,
+            f"{member.mention} has been rejected by {reviewers_text}.",
         )
 
     # Servant commands
