@@ -54,7 +54,7 @@ from interactions.api.events import (
     MessageCreate,
     NewThreadCreate,
 )
-from interactions.client.errors import NotFound
+from interactions.client.errors import HTTPException, NotFound
 from interactions.ext.paginators import Paginator
 from pydantic import BaseModel, Field
 from yarl import URL
@@ -737,11 +737,12 @@ class Roles(interactions.Extension):
         message: str,
         color: EmbedColor,
         log_to_channel: bool = True,
+        ephemeral: bool = True,
     ) -> None:
         embed: interactions.Embed = await self.create_embed(title, message, color)
 
         if ctx:
-            await ctx.send(embed=embed, ephemeral=True)
+            await ctx.send(embed=embed, ephemeral=ephemeral)
 
         if log_to_channel:
             LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
@@ -803,9 +804,10 @@ class Roles(interactions.Extension):
         ],
         message: str,
         log_to_channel: bool = False,
+        ephemeral: bool = True,
     ) -> None:
         await self.send_response(
-            ctx, "Error", message, EmbedColor.ERROR, log_to_channel
+            ctx, "Error", message, EmbedColor.ERROR, log_to_channel, ephemeral
         )
 
     async def send_success(
@@ -819,9 +821,10 @@ class Roles(interactions.Extension):
         ],
         message: str,
         log_to_channel: bool = True,
+        ephemeral: bool = False,
     ) -> None:
         await self.send_response(
-            ctx, "Success", message, EmbedColor.INFO, log_to_channel
+            ctx, "Success", message, EmbedColor.INFO, log_to_channel, ephemeral
         )
 
     async def create_review_components(
@@ -1060,6 +1063,7 @@ class Roles(interactions.Extension):
                                     f"- Processed: {processed}/{total_members} members\n"
                                     f"- Skipped (grace period): {skipped}\n"
                                     f"- Recently converted members: {', '.join(converted_members)}",
+                                    ephemeral=True,
                                 )
                                 await asyncio.sleep(1.0)
                             converted_members.clear()
@@ -1090,6 +1094,7 @@ class Roles(interactions.Extension):
                             f"- Processed: {processed}/{total_members}\n"
                             f"- Skipped: {skipped}\n"
                             f"- Recent conversions: {', '.join(converted_members)}",
+                            ephemeral=True,
                         )
                         await asyncio.sleep(1.0)
                     converted_members.clear()
@@ -1103,6 +1108,7 @@ class Roles(interactions.Extension):
                 f"- Total processed: {total_members}\n"
                 f"- Skipped: {skipped}\n"
                 f"- Converted: {processed - skipped}",
+                ephemeral=True,
             )
 
         except Exception as e:
@@ -1191,7 +1197,7 @@ class Roles(interactions.Extension):
                                 if current_time - last_report_time >= REPORT_INTERVAL:
                                     if log_buffer:
                                         await self.send_success(
-                                            None, "\n".join(log_buffer)
+                                            None, "\n".join(log_buffer), ephemeral=True
                                         )
                                         log_buffer = []
                                         last_report_time = current_time
@@ -1211,13 +1217,14 @@ class Roles(interactions.Extension):
 
             if log_buffer:
                 await asyncio.sleep(ROLE_CHANGE_INTERVAL)
-                await self.send_success(None, "\n".join(log_buffer))
+                await self.send_success(None, "\n".join(log_buffer), ephemeral=True)
 
             if conflicts:
                 await asyncio.sleep(ROLE_CHANGE_INTERVAL)
                 await self.send_success(
                     None,
                     f"- Total members processed: {processed}\n- Conflicts resolved: {conflicts}",
+                    ephemeral=True,
                 )
 
             logger.info(
@@ -1528,6 +1535,7 @@ class Roles(interactions.Extension):
                 ctx,
                 f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}. Use `/custom mention` to mention members with these roles.",
                 log_to_channel=False,
+                ephemeral=True,
             )
         else:
             await self.send_error(
@@ -2155,6 +2163,7 @@ class Roles(interactions.Extension):
             ctx,
             f"Your approval for {member.mention} has been registered. Current approval status: {thread_approvals.approval_count}/{required_approvals} approvals needed. Waiting for {remaining} more approval(s).",
             log_to_channel=False,
+            ephemeral=True,
         )
         return "Approval registered"
 
@@ -2219,6 +2228,7 @@ class Roles(interactions.Extension):
             ctx,
             f"Your rejection vote for {member.mention} has been registered. Current status: {rejection_count}/{required_rejections} rejections needed. Waiting for {remaining} more rejection(s) to complete the process.",
             log_to_channel=False,
+            ephemeral=True,
         )
         return "Rejection registered"
 
