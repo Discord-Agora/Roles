@@ -2383,6 +2383,7 @@ class Roles(interactions.Extension):
         await self.send_success(
             ctx,
             f"{member.mention} has been rejected by {reviewers_text}.",
+            ephemeral=False,
         )
 
     # Servant commands
@@ -2678,7 +2679,7 @@ class Roles(interactions.Extension):
             f"{member.mention} has been incarcerated until <t:{release_time}:F> "
             f"(<t:{release_time}:R>) by {executor.mention if executor else 'the system'}."
         )
-        await self.send_success(ctx, log_message)
+        await self.send_success(ctx, log_message, ephemeral=False)
 
     async def perform_member_release(
         self,
@@ -2714,7 +2715,7 @@ class Roles(interactions.Extension):
         release_time = int(float(member_data.get("release_time", 0)))
         current_time = int(time.time())
         log_message = f"{member.mention} has been released by {executor.mention if executor else 'the system'} at <t:{current_time}:F>. Scheduled: <t:{release_time}:F>."
-        await self.send_success(ctx, log_message)
+        await self.send_success(ctx, log_message, ephemeral=False)
 
     async def schedule_release(
         self, member_id: str, data: Dict[str, Any], delay: float
