@@ -42,7 +42,10 @@ from typing import (
 )
 
 import aiofiles
+import aiofiles.os
+import aiofiles.ospath
 import aiohttp
+import aioshutil
 import cysimdjson
 import interactions
 import numpy as np
@@ -52,11 +55,13 @@ from interactions.api.events import (
     ExtensionLoad,
     ExtensionUnload,
     MessageCreate,
+    MessageReactionAdd,
+    MessageReactionRemove,
     NewThreadCreate,
 )
 from interactions.client.errors import HTTPException, NotFound
 from interactions.ext.paginators import Paginator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from yarl import URL
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
@@ -107,10 +112,10 @@ class Action(Enum):
 
 
 class Data(BaseModel):
-    assigned_roles: Dict[str, Dict[str, int]] = Field(default_factory=dict)
-    authorized_roles: Dict[str, int] = Field(default_factory=dict)
-    assignable_roles: Dict[str, List[str]] = Field(default_factory=dict)
-    incarcerated_members: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    assigned_roles: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    authorized_roles: Dict[str, int] = field(default_factory=dict)
+    assignable_roles: Dict[str, List[str]] = field(default_factory=dict)
+    incarcerated_members: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     class Config:
         json_encoders = {
@@ -126,6 +131,7 @@ class Config:
     ELECTORAL_ROLE_ID: int = 1200043628899356702
     APPROVED_ROLE_ID: int = 1282944839679344721
     TEMPORARY_ROLE_ID: int = 1164761892015833129
+    MINISTER_ROLE_ID: int = 1297556675473182720
     MISSING_ROLE_ID: int = 1289949397362409472
     INCARCERATED_ROLE_ID: int = 1247284720044085370
     AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
@@ -189,14 +195,14 @@ class Model(Generic[T]):
 
         return decorator
 
-    async def _get_file_lock(self, file_name: str) -> asyncio.Lock:
+    async def get_file_lock(self, file_name: str) -> asyncio.Lock:
         return self._file_locks.setdefault(file_name, asyncio.Lock())
 
     @asynccontextmanager
-    async def _file_operation(
+    async def file_operation(
         self, file_path: Path, mode: str
     ) -> AsyncGenerator[Any, None]:
-        lock = await self._get_file_lock(str(file_path))
+        lock = await self.get_file_lock(str(file_path))
         async with lock:
             try:
                 async with aiofiles.open(str(file_path), mode=mode) as file:
@@ -209,88 +215,59 @@ class Model(Generic[T]):
     async def load_data(self, file_name: str, model: Type[T]) -> T:
         file_path = self.base_path / file_name
         try:
-            async with self._file_operation(file_path, "rb") as file:
+            async with self.file_operation(file_path, "rb") as file:
                 content = await file.read()
-
-            loop = asyncio.get_running_loop()
-            try:
-                json_parsed = await loop.run_in_executor(
-                    self._executor, orjson.loads, content
-                )
-            except orjson.JSONDecodeError:
-                logger.warning(
-                    f"`orjson` failed to parse {file_name}, using `cysimdjson`"
-                )
-                json_parsed = await loop.run_in_executor(
-                    self._executor, self.parser.parse, content
-                )
+                json_parsed = orjson.loads(content)
 
             if file_name == "custom.json":
                 instance = {
                     role: frozenset(members) for role, members in json_parsed.items()
                 }
             elif issubclass(model, BaseModel):
-                instance = await loop.run_in_executor(
-                    self._executor,
-                    model.model_validate_json if content else model.model_validate,
-                    content if content else {},
+                instance = (
+                    model.model_validate_json(content)
+                    if content
+                    else model.model_validate({})
                 )
             elif model == Counter:
-                instance = Counter(json_parsed)
-                instance = cast(T, instance)
+                instance = cast(T, Counter(json_parsed))
             else:
-                if issubclass(model, BaseModel):
-                    instance = model.model_validate({})
-                elif model == Counter:
-                    instance = cast(T, Counter())
-                else:
-                    instance = {}
+                instance = {}
                 await self.save_data(file_name, instance)
                 return cast(T, instance)
 
             self._data_cache[file_name] = instance
-            logger.info(f"Successfully loaded data from {file_name}")
             return cast(T, instance)
 
         except FileNotFoundError:
-            logger.info(f"{file_name} not found. Creating new.")
-            if file_name == "custom.json":
-                instance = {}
-            else:
-                instance = (
+            instance = (
+                {}
+                if file_name == "custom.json"
+                else (
                     model.model_validate({})
                     if issubclass(model, BaseModel)
                     else Counter() if model == Counter else {}
                 )
+            )
             await self.save_data(file_name, instance)
             return cast(T, instance)
 
         except Exception as e:
-            error_msg = f"Unexpected error loading {file_name}: {e}"
-            logger.error(error_msg)
-            raise ValueError(error_msg) from e
+            logger.error(f"Error loading {file_name}: {e}")
+            raise ValueError(f"Failed to load {file_name}") from e
 
     @async_retry()
     async def save_data(self, file_name: str, data: T) -> None:
         file_path = self.base_path / file_name
         try:
-            loop = asyncio.get_running_loop()
+            json_data = orjson.dumps(
+                (data.model_dump(mode="json") if isinstance(data, BaseModel) else data),
+                option=orjson.OPT_INDENT_2
+                | orjson.OPT_SERIALIZE_NUMPY
+                | orjson.OPT_NON_STR_KEYS,
+            )
 
-            def dump_data():
-                return orjson.dumps(
-                    (
-                        data.model_dump(mode="json")
-                        if isinstance(data, BaseModel)
-                        else data
-                    ),
-                    option=orjson.OPT_INDENT_2
-                    | orjson.OPT_SERIALIZE_NUMPY
-                    | orjson.OPT_NON_STR_KEYS,
-                )
-
-            json_data = await loop.run_in_executor(self._executor, dump_data)
-
-            async with self._file_operation(file_path, "wb") as file:
+            async with self.file_operation(file_path, "wb") as file:
                 await file.write(json_data)
 
             self._data_cache[file_name] = data
@@ -471,6 +448,7 @@ class Roles(interactions.Extension):
         self.member_role_locks: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
         self.stats_lock: asyncio.Lock = asyncio.Lock()
         self.stats_save_task: asyncio.Task | None = None
+        self.reaction_roles: Dict[str, Dict[str, int]] = {}
         self.message_monitoring_enabled = False
         self.validation_flags = {
             "repetition": True,
@@ -494,6 +472,7 @@ class Roles(interactions.Extension):
             self.model.load_data("custom.json", dict),
             self.model.load_data("incarcerated_members.json", dict),
             self.model.load_data("stats.json", Counter),
+            self.model.load_data("reaction_roles.json", dict),
         ]
 
         asyncio.create_task(self.load_initial_data())
@@ -506,6 +485,7 @@ class Roles(interactions.Extension):
                 self.custom_roles,
                 self.incarcerated_members,
                 self.stats,
+                self.reaction_roles,
             ) = results
             logger.info("Initial data loaded successfully")
         except Exception as e:
@@ -515,6 +495,7 @@ class Roles(interactions.Extension):
 
     ContextType = TypeVar("ContextType", bound=interactions.BaseContext)
 
+    @staticmethod
     def error_handler(
         func: Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]
     ) -> Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]:
@@ -523,22 +504,19 @@ class Roles(interactions.Extension):
             self, ctx: interactions.BaseContext, *args: P.args, **kwargs: P.kwargs
         ) -> T:
             try:
-                result = await func(self, ctx, *args, **kwargs)
+                result = await asyncio.shield(func(self, ctx, *args, **kwargs))
                 logger.info(f"`{func.__name__}` completed successfully: {result}")
                 return result
-            except asyncio.CancelledError:
-                logger.warning(f"{func.__name__} was cancelled", exc_info=True)
-                raise
+            except asyncio.CancelledError as ce:
+                logger.warning(
+                    f"{func.__name__} was cancelled",
+                    extra={"exc_info": True, "stack_info": True},
+                )
+                raise ce from None
             except Exception as e:
                 error_msg = f"Error in {func.__name__}: {e!r}\n{traceback.format_exc()}"
                 logger.exception(error_msg)
-                try:
-                    await asyncio.shield(
-                        self.send_error(ctx, str(e), log_to_channel=True)
-                    )
-                except Exception:
-                    logger.exception("Failed to send error message")
-                raise
+                raise e from None
 
         return wrapper
 
@@ -652,16 +630,36 @@ class Roles(interactions.Extension):
 
     # View methods
 
-    @staticmethod
     async def create_embed(
-        title: str, description: str = "", color: EmbedColor = EmbedColor.INFO
+        self,
+        title: str,
+        description: str = "",
+        color: Union[EmbedColor, int] = EmbedColor.INFO,
+        fields: Optional[List[Dict[str, str]]] = None,
     ) -> interactions.Embed:
-        return interactions.Embed(
-            title=title,
-            description=description,
-            color=color.value,
-            timestamp=datetime.now(timezone.utc),
-        ).set_footer(text="鍵政大舞台")
+        color_value: int = color.value if isinstance(color, EmbedColor) else color
+
+        embed: interactions.Embed = interactions.Embed(
+            title=title, description=description, color=color_value
+        )
+
+        if fields:
+            for field in fields:
+                embed.add_field(
+                    name=field.get("name", ""),
+                    value=field.get("value", ""),
+                    inline=field.get("inline", True),
+                )
+
+        guild: Optional[interactions.Guild] = await self.bot.fetch_guild(
+            self.config.GUILD_ID
+        )
+        if guild and guild.icon:
+            embed.set_footer(text=guild.name, icon_url=guild.icon.url)
+
+        embed.timestamp = datetime.now(timezone.utc)
+        embed.set_footer(text="鍵政大舞台")
+        return embed
 
     async def notify_vetting_reviewers(
         self,
@@ -717,7 +715,7 @@ class Roles(interactions.Extension):
             logger.error(f"Failed to send embed to {member.id}: {e}")
 
     @lru_cache(maxsize=1)
-    def _get_log_channels(self) -> tuple[int, int, int]:
+    def get_log_channels(self) -> tuple[int, int, int]:
         return (
             self.config.LOG_CHANNEL_ID,
             self.config.LOG_POST_ID,
@@ -745,7 +743,7 @@ class Roles(interactions.Extension):
             await ctx.send(embed=embed, ephemeral=ephemeral)
 
         if log_to_channel:
-            LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self._get_log_channels()
+            LOG_CHANNEL_ID, LOG_POST_ID, LOG_FORUM_ID = self.get_log_channels()
             await self.send_to_channel(LOG_CHANNEL_ID, embed)
             await self.send_to_forum_post(LOG_FORUM_ID, LOG_POST_ID, embed)
 
@@ -884,8 +882,373 @@ class Roles(interactions.Extension):
     module_group_debug: interactions.SlashCommand = module_base.group(
         name="debug", description="Debug commands"
     )
+    module_group_reaction: interactions.SlashCommand = module_base.group(
+        name="reaction", description="Reaction commands"
+    )
+
+    # Reaction commands
+
+    @module_group_reaction.subcommand(
+        "start", sub_cmd_description="Configure reaction role"
+    )
+    @interactions.slash_option(
+        name="message",
+        description="Message ID or URL",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+    )
+    @interactions.slash_option(
+        name="emoji",
+        description="Emoji to react with",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        autocomplete=True,
+    )
+    @interactions.slash_option(
+        name="role",
+        description="Role to assign/remove",
+        opt_type=interactions.OptionType.ROLE,
+        required=True,
+    )
+    @interactions.slash_option(
+        name="action",
+        description="Whether to add or remove the role when reacted",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        choices=[
+            interactions.SlashCommandChoice(name="Add", value="add"),
+            interactions.SlashCommandChoice(name="Remove", value="remove"),
+        ],
+    )
+    @error_handler
+    async def configure_reaction_role(
+        self,
+        ctx: interactions.SlashContext,
+        message: str,
+        emoji: str,
+        role: interactions.Role,
+        action: str,
+    ) -> None:
+        if not next(
+            (r for r in ctx.author.roles if r.id == self.config.MINISTER_ROLE_ID), None
+        ):
+            await self.send_error(
+                ctx,
+                f"Only the <@&{self.config.MINISTER_ROLE_ID}> can configure reaction roles.",
+            )
+            return
+
+        try:
+            message_id = self.extract_message_id(message)
+            if not message_id:
+                await self.send_error(ctx, "Invalid message ID/URL.")
+                return
+
+            self.reaction_roles.setdefault(message_id, {})
+            self.reaction_roles[message_id][emoji] = role.id
+
+            try:
+                channel = await ctx.guild.fetch_channel(ctx.channel_id)
+                msg = await channel.fetch_message(int(message_id))
+                await msg.add_reaction(emoji)
+            except Exception as e:
+                logger.error(f"Failed to add reaction: {e}")
+                await self.send_error(ctx, "Failed to add reaction to message.")
+                return
+
+            await self.model.save_data("reaction_roles.json", dict(self.reaction_roles))
+
+            action_text = "added to" if action == "add" else "removed from"
+            await self.send_success(
+                ctx,
+                f"Successfully configured reaction role:\n- Emoji: {emoji}\n- Role: {role.mention} will be {action_text} users when they react",
+            )
+
+        except Exception as e:
+            logger.error(f"Error configuring reaction role: {e}")
+            await self.send_error(ctx, f"Failed to configure reaction role: {str(e)}")
+
+    @module_group_reaction.subcommand(
+        "stop", sub_cmd_description="Stop monitoring a reaction"
+    )
+    @interactions.slash_option(
+        name="config",
+        description="Select reaction configuration to stop",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        autocomplete=True,
+        argument_name="reaction_config",
+    )
+    @error_handler
+    async def stop_monitoring_reaction(
+        self,
+        ctx: interactions.SlashContext,
+        reaction_config: str,
+    ) -> None:
+        if not any(r.id == self.config.MINISTER_ROLE_ID for r in ctx.author.roles):
+            return await self.send_error(
+                ctx,
+                f"Only <@&{self.config.MINISTER_ROLE_ID}> can stop reaction monitoring.",
+            )
+
+        message_id, emoji = reaction_config.split(":", 1)
+
+        if (
+            message_id not in self.reaction_roles
+            or emoji not in self.reaction_roles[message_id]
+        ):
+            return await self.send_error(
+                ctx, "No reaction monitoring found for this message and emoji."
+            )
+
+        del self.reaction_roles[message_id][emoji]
+        if not self.reaction_roles[message_id]:
+            del self.reaction_roles[message_id]
+
+        await self.model.save_data()
+        await self.send_success(
+            ctx, f"Successfully stopped monitoring reaction {emoji}"
+        )
+
+    @configure_reaction_role.autocomplete("emoji")
+    async def autocomplete_emoji(self, ctx: interactions.AutocompleteContext) -> None:
+        user_input: str = ctx.input_text.casefold()
+        choices: list[interactions.SlashCommandChoice] = []
+
+        emojis = await self.bot.http.get_all_guild_emoji(ctx.guild_id)
+        for emoji in emojis:
+            if user_input in emoji["name"].casefold():
+                choices.append(
+                    interactions.SlashCommandChoice(
+                        name=f":{emoji['name']}:", value=str(emoji["id"])
+                    )
+                )
+
+        await ctx.send(choices[:25])
+
+    @stop_monitoring_reaction.autocomplete("reaction_config")
+    async def autocomplete_reaction_config(
+        self, ctx: interactions.AutocompleteContext
+    ) -> None:
+        choices: list[interactions.SlashCommandChoice] = []
+
+        for reactions in self.reaction_roles.values():
+            for emoji, config in reactions.items():
+                if isinstance(config, dict):
+                    role_id = config.get("role_id")
+                    action = config.get("action")
+                else:
+                    role_id = config
+                    action = "add"
+
+                if role_id is None:
+                    continue
+
+                guild = await self.bot.fetch_guild(ctx.guild_id)
+                role = await guild.fetch_role(role_id)
+
+                if role is None:
+                    continue
+
+                choice_name = f"{emoji} | {action} {role.name}"
+                choices.append(
+                    interactions.SlashCommandChoice(
+                        name=choice_name, value=f":{emoji}:{action}:{role.name}"
+                    )
+                )
+
+        await ctx.send(choices[:25])
+
+    @staticmethod
+    def extract_message_id(message_input: str) -> Optional[str]:
+        if message_input.isdigit():
+            return message_input
+
+        if "discord.com/channels" in message_input:
+            url_parts = message_input.split("/")
+            if len(url_parts) > 0:
+                return url_parts[-1]
+
+        return None
+
+    @interactions.listen("MessageReactionAdd")
+    async def on_reaction_add(self, event: MessageReactionAdd) -> None:
+        if event.author.id == self.bot.user.id:
+            return
+
+        message_id = str(event.message.id)
+        emoji = str(event.emoji)
+
+        try:
+            reaction_config = self.reaction_roles.get(message_id, {}).get(emoji)
+            if not reaction_config:
+                return
+
+            if not isinstance(reaction_config, dict):
+                logger.error(f"Invalid reaction config format: {reaction_config}")
+                return
+
+            role_id = reaction_config.get("role_id")
+            action = reaction_config.get("action")
+            if not role_id or not action:
+                return
+
+            guild = await self.bot.fetch_guild(event.message.guild.id)
+            member = await guild.fetch_member(event.author.id)
+            role = await guild.fetch_role(role_id)
+
+            if role is not None:
+                await (member.add_roles if action == "add" else member.remove_roles)(
+                    [role]
+                )
+            logger.info(
+                f"{'Added' if action == 'add' else 'Removed'} role {role.id} "
+                f"{'to' if action == 'add' else 'from'} member {member.id} via reaction"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to handle reaction: {e}")
+
+    @interactions.listen("MessageReactionRemove")
+    async def on_reaction_remove(self, event: MessageReactionRemove) -> None:
+        if event.author.id == self.bot.user.id:
+            return
+
+        message_id = str(event.message.id)
+        emoji = str(event.emoji)
+
+        try:
+            reaction_config = self.reaction_roles.get(message_id, {}).get(emoji)
+            if not reaction_config:
+                return
+
+            if not isinstance(reaction_config, dict):
+                logger.error(f"Invalid reaction config format: {reaction_config}")
+                return
+
+            role_id = reaction_config.get("role_id")
+            action = reaction_config.get("action")
+            if not role_id or not action:
+                return
+
+            guild = await self.bot.fetch_guild(event.message.guild.id)
+            member = await guild.fetch_member(event.author.id)
+            role = await guild.fetch_role(role_id)
+
+            if role is not None:
+                await (member.remove_roles if action == "add" else member.add_roles)(
+                    [role]
+                )
+            logger.info(
+                f"{'Removed' if action == 'add' else 'Added'} role {role.id} "
+                f"{'from' if action == 'add' else 'to'} member {member.id} via reaction removal"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to handle reaction removal: {e}")
 
     # Debug commands
+
+    @module_group_debug.subcommand(
+        "export", sub_cmd_description="Export files from the extension directory"
+    )
+    @interactions.slash_option(
+        name="type",
+        description="Type of files to export",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+        autocomplete=True,
+        argument_name="file_type",
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    async def command_export(
+        self, ctx: interactions.SlashContext, file_type: str
+    ) -> None:
+        await ctx.defer(ephemeral=True)
+        filename: str = ""
+
+        if not os.path.exists(BASE_DIR):
+            return await self.send_error(ctx, "Extension directory does not exist.")
+
+        if file_type != "all" and not os.path.isfile(os.path.join(BASE_DIR, file_type)):
+            return await self.send_error(
+                ctx, f"File `{file_type}` does not exist in the extension directory."
+            )
+
+        try:
+            async with aiofiles.tempfile.NamedTemporaryFile(
+                prefix="export_", suffix=".tar.gz", delete=False
+            ) as afp:
+                filename = afp.name
+                base_name = filename[:-7]
+
+                await aioshutil.make_archive(
+                    base_name,
+                    "gztar",
+                    BASE_DIR,
+                    "." if file_type == "all" else file_type,
+                )
+
+            if not os.path.exists(filename):
+                return await self.send_error(ctx, "Failed to create archive file.")
+
+            file_size = os.path.getsize(filename)
+            if file_size > 8_388_608:
+                return await self.send_error(
+                    ctx, "Archive file is too large to send (>8MB)."
+                )
+
+            message = (
+                "All extension files attached."
+                if file_type == "all"
+                else f"File `{file_type}` attached."
+            )
+            await ctx.send(
+                message,
+                files=[interactions.File(filename)],
+            )
+
+        except PermissionError:
+            logger.error(f"Permission denied while exporting {file_type}")
+            await self.send_error(ctx, "Permission denied while accessing files.")
+        except Exception as e:
+            logger.error(f"Error exporting {file_type}: {e}", exc_info=True)
+            await self.send_error(
+                ctx, f"An error occurred while exporting {file_type}: {str(e)}"
+            )
+        finally:
+            if filename and os.path.exists(filename):
+                try:
+                    os.unlink(filename)
+                except Exception as e:
+                    logger.error(f"Error cleaning up temp file: {e}")
+
+    @command_export.autocomplete("type")
+    async def export_type_autocomplete(
+        self, ctx: interactions.AutocompleteContext
+    ) -> None:
+        choices: list[dict[str, str]] = [{"name": "All Files", "value": "all"}]
+
+        try:
+            if os.path.exists(BASE_DIR):
+                files = [
+                    f
+                    for f in os.listdir(BASE_DIR)
+                    if os.path.isfile(os.path.join(BASE_DIR, f))
+                    and not f.startswith(".")
+                ]
+
+                choices.extend({"name": file, "value": file} for file in sorted(files))
+        except PermissionError:
+            logger.error("Permission denied while listing files")
+            choices = [{"name": "Error: Permission denied", "value": "error"}]
+        except Exception as e:
+            logger.error(f"Error listing files: {e}", exc_info=True)
+            choices = [{"name": f"Error: {str(e)}", "value": "error"}]
+
+        await ctx.send(choices[:25])
 
     @module_group_debug.subcommand(
         "inactive",
@@ -1335,7 +1698,6 @@ class Roles(interactions.Extension):
                         current_embed = await self.create_embed(
                             title=f"{config.title()} Configuration Details (Page {len(embeds) + 2})",
                             description="Continued configuration details.",
-                            color=EmbedColor.INFO,
                         )
                         field_count = 0
                         total_chars = len(current_embed.title or "") + len(
@@ -2018,55 +2380,50 @@ class Roles(interactions.Extension):
     async def process_approval_status_change(
         self, ctx: interactions.ComponentContext, status: Status
     ) -> Optional[str]:
-        if not (await self.validate_context(ctx)):
+        if not await self.validate_context(ctx):
             return None
 
-        if not isinstance(
-            thread := await self.bot.fetch_channel(ctx.channel_id),
-            interactions.GuildPublicThread,
-        ):
+        thread = await self.bot.fetch_channel(ctx.channel_id)
+        if not isinstance(thread, interactions.GuildPublicThread):
             raise ValueError("Invalid context: Must be used in threads")
 
         guild = await self.bot.fetch_guild(thread.guild.id)
-        if not (member := await guild.fetch_member(thread.owner_id)):
+        member = await guild.fetch_member(thread.owner_id)
+        if not member:
             await self.send_error(ctx, "Member not found in server")
             return None
 
         async with self.member_lock(member.id):
             try:
-                if not self.validate_roles(
-                    roles := await self.fetch_required_roles(guild)
-                ):
-                    await self.send_error(ctx, "Required roles configuration invalid")
+                roles = await self.fetch_required_roles(guild)
+                if not self.validate_roles(roles):
+                    await self.send_error(ctx, "Required roles configuration invalid.")
                     return None
 
-                current_roles = frozenset(map(lambda r: r.id, member.roles))
                 thread_approvals = self.get_thread_approvals(thread.id)
-
                 if not await self.validate_reviewer(ctx, thread_approvals):
                     return None
 
                 handler = {
                     Status.APPROVED: self.process_approval,
                     Status.REJECTED: self.process_rejection,
-                }.get(status)
-
-                if not handler:
-                    await self.send_error(ctx, "Invalid status")
-                    return None
+                }[status]
 
                 return await handler(
                     ctx=ctx,
                     member=member,
                     roles=roles,
-                    current_roles=current_roles,
+                    current_roles=frozenset(r.id for r in member.roles),
                     thread_approvals=thread_approvals,
                     thread=thread,
                 )
 
+            except KeyError:
+                await self.send_error(ctx, "Invalid status.")
+                return None
             except Exception as e:
                 logger.exception(f"Status change failed: {e}")
-                await self.send_error(ctx, "Processing error occurred")
+                await self.send_error(ctx, "Processing error occurred.")
                 return None
             finally:
                 await self.update_review_components(ctx, thread)
@@ -2246,88 +2603,42 @@ class Roles(interactions.Extension):
         role_to_remove: interactions.Role,
         current_roles: FrozenSet[int],
     ) -> bool:
-        async def verify_roles(member_to_check: interactions.Member) -> set[int]:
-            return {
-                role.id
-                for role in (
-                    await member_to_check.guild.fetch_member(member_to_check.id)
-                ).roles
-            }
-
-        async def execute_role_updates(
-            target: interactions.Member,
-            *,
-            to_add: interactions.Role | None = None,
-            to_remove: interactions.Role | None = None,
-        ) -> None:
-            if to_remove and to_remove.id in {role.id for role in target.roles}:
-                logger.info(f"Removing role {to_remove.id} from member {target.id}")
-                await target.remove_roles([to_remove])
-            if to_add and to_add.id not in {role.id for role in target.roles}:
-                logger.info(f"Adding role {to_add.id} to member {target.id}")
-                await target.add_roles([to_add])
-
         logger.info(
-            f"Initiating role update for member {member.id}. Current roles: {current_roles}. Role to add: {role_to_add.id}, Role to remove: {role_to_remove.id}"
+            f"Updating roles for {member.id}: +{role_to_add.id}, -{role_to_remove.id}"
         )
 
         try:
-            updates = (
-                (
-                    ("remove", role_to_remove)
-                    if role_to_remove.id in current_roles
-                    else None
-                ),
-                ("add", role_to_add) if role_to_add.id not in current_roles else None,
-            )
-            updates_needed = [u for u in updates if u]
+            if role_to_remove.id in current_roles:
+                await member.remove_roles([role_to_remove])
+            if role_to_add.id not in current_roles:
+                await member.add_roles([role_to_add])
 
-            if updates_needed:
-                for action, role in updates_needed:
-                    await execute_role_updates(
-                        member,
-                        to_add=role if action == "add" else None,
-                        to_remove=role if action == "remove" else None,
-                    )
-
-            MAX_RETRIES = 3
-            backoff = (0.5, 1.0, 2.0)
-
-            for attempt in range(MAX_RETRIES):
-                final_roles = await verify_roles(member)
-                logger.info(
-                    f"Verification attempt {attempt + 1} - Current roles: {final_roles}"
-                )
+            for attempt in range(3):
+                updated_member = await member.guild.fetch_member(member.id)
+                updated_roles = {role.id for role in updated_member.roles}
 
                 if (
-                    role_to_add.id in final_roles
-                    and role_to_remove.id not in final_roles
+                    role_to_add.id in updated_roles
+                    and role_to_remove.id not in updated_roles
                 ):
-                    logger.info("Role update successful and verified")
+                    logger.info(f"Role update successful for {member.id}")
                     return True
 
-                if attempt < MAX_RETRIES - 1:
+                if attempt < 2:
                     logger.warning(
-                        f"Role verification failed on attempt {attempt + 1}, retrying. Expected: +{role_to_add.id}, -{role_to_remove.id}. Current: {final_roles}"
+                        f"Retrying role update for {member.id}, attempt {attempt + 2}"
                     )
-                    await execute_role_updates(
-                        member,
-                        to_add=(
-                            role_to_add if role_to_add.id not in final_roles else None
-                        ),
-                        to_remove=(
-                            role_to_remove if role_to_remove.id in final_roles else None
-                        ),
-                    )
-                    await asyncio.sleep(backoff[attempt])
+                    if role_to_add.id not in updated_roles:
+                        await member.add_roles([role_to_add])
+                    if role_to_remove.id in updated_roles:
+                        await member.remove_roles([role_to_remove])
+                    await asyncio.sleep(0.5 * (2**attempt))
 
-            logger.error("Role update failed after all retry attempts")
+            logger.error(f"Role update failed for {member.id} after 3 attempts")
             return False
 
         except Exception as e:
-            logger.error(
-                f"Critical error during role update for member {member.id}: {type(e).__name__}: {str(e)}"
-            )
+            logger.error(f"Error updating roles for {member.id}: {e}")
             return False
 
     async def send_approval_notification(
