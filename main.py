@@ -448,7 +448,7 @@ class Roles(interactions.Extension):
         self.member_role_locks: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
         self.stats_lock: asyncio.Lock = asyncio.Lock()
         self.stats_save_task: asyncio.Task | None = None
-        self.reaction_roles: Dict[str, Dict[str, int]] = {}
+        self.reaction_roles: Dict[str, Dict[str, Any]] = {}
         self.message_monitoring_enabled = False
         self.validation_flags = {
             "repetition": True,
@@ -944,13 +944,44 @@ class Roles(interactions.Extension):
                 await self.send_error(ctx, "Invalid message ID/URL.")
                 return
 
+            if not emoji:
+                await self.send_error(ctx, "Invalid emoji provided.")
+                return
+
             self.reaction_roles.setdefault(message_id, {})
-            self.reaction_roles[message_id][emoji] = role.id
+            emoji_key = f":{emoji}:" if emoji.isdigit() else emoji
+            self.reaction_roles[message_id][emoji_key] = {
+                "role_id": role.id,
+                "action": action,
+            }
 
             try:
                 channel = await ctx.guild.fetch_channel(ctx.channel_id)
                 msg = await channel.fetch_message(int(message_id))
+
                 await msg.add_reaction(emoji)
+
+                for reaction in msg.reactions:
+                    if str(reaction.emoji) == emoji:
+                        async for user in reaction.users():
+                            if not user.bot:
+                                try:
+                                    member = await ctx.guild.fetch_member(user.id)
+                                    if action == "add" and role.id not in [
+                                        r.id for r in member.roles
+                                    ]:
+                                        await member.add_role(role.id)
+                                    elif action == "remove" and role.id in [
+                                        r.id for r in member.roles
+                                    ]:
+                                        await member.remove_role(role.id)
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to modify role for user {user.id}: {e}"
+                                    )
+                                    continue
+                        break
+
             except Exception as e:
                 logger.error(f"Failed to add reaction: {e}")
                 await self.send_error(ctx, "Failed to add reaction to message.")
@@ -961,12 +992,85 @@ class Roles(interactions.Extension):
             action_text = "added to" if action == "add" else "removed from"
             await self.send_success(
                 ctx,
-                f"Successfully configured reaction role:\n- Emoji: {emoji}\n- Role: {role.mention} will be {action_text} users when they react",
+                f"Successfully configured reaction role:\n- Emoji: {emoji_key}\n- Role: {role.mention} will be {action_text} users when they react",
             )
 
         except Exception as e:
             logger.error(f"Error configuring reaction role: {e}")
             await self.send_error(ctx, f"Failed to configure reaction role: {str(e)}")
+
+    @configure_reaction_role.autocomplete("emoji")
+    async def autocomplete_emoji(self, ctx: interactions.AutocompleteContext) -> None:
+        user_input: str = ctx.input_text.casefold()
+        choices: list[interactions.SlashCommandChoice] = []
+
+        emojis = await self.bot.http.get_all_guild_emoji(ctx.guild_id)
+        for emoji in emojis:
+            if user_input in emoji["name"].casefold():
+                choices.append(
+                    interactions.SlashCommandChoice(
+                        name=f":{emoji['name']}:", value=str(emoji["id"])
+                    )
+                )
+
+        await ctx.send(choices[:25])
+
+    @interactions.listen("MessageReactionAdd")
+    async def on_reaction_add(self, event: MessageReactionAdd) -> None:
+        if event.author.id == self.bot.user.id:
+            return
+
+        message_id = str(event.message.id)
+        emoji = event.emoji
+
+        try:
+            reaction_config = self.reaction_roles.get(message_id, {}).get(
+                emoji.name
+            ) or self.reaction_roles.get(message_id, {}).get(str(emoji))
+
+            if not reaction_config:
+                logger.info(
+                    f"No reaction config found for message {message_id} and emoji {emoji}"
+                )
+                return
+
+            if not isinstance(reaction_config, dict):
+                logger.error(f"Invalid reaction config format: {reaction_config}")
+                return
+
+            role_id = reaction_config.get("role_id")
+            action = reaction_config.get("action")
+            if not role_id or not action:
+                logger.error(f"Missing role_id or action in config: {reaction_config}")
+                return
+
+            guild = await self.bot.fetch_guild(event.message.guild.id)
+            member = await guild.fetch_member(event.author.id)
+            role = await guild.fetch_role(role_id)
+
+            if role is None:
+                logger.error(f"Could not find role with ID {role_id}")
+                return
+
+            try:
+                if action == "add":
+                    await member.add_roles([role])
+                elif action == "remove":
+                    await member.remove_roles([role])
+                else:
+                    logger.error(f"Invalid action `{action}` in config")
+                    return
+
+                logger.info(
+                    f"Successfully {'added' if action == 'add' else 'removed'} role {role.id} "
+                    f"{'to' if action == 'add' else 'from'} member {member.id} via reaction"
+                )
+            except Exception as e:
+                logger.error(f"Failed to modify roles: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to handle reaction: {e}")
+            logger.error(f"Full reaction config: {self.reaction_roles}")
 
     @module_group_reaction.subcommand(
         "stop", sub_cmd_description="Stop monitoring a reaction"
@@ -991,7 +1095,10 @@ class Roles(interactions.Extension):
                 f"Only <@&{self.config.MINISTER_ROLE_ID}> can stop reaction monitoring.",
             )
 
-        message_id, emoji = reaction_config.split(":", 1)
+        try:
+            message_id, emoji = reaction_config.split(":", 1)
+        except ValueError:
+            return await self.send_error(ctx, "Invalid reaction config format.")
 
         if (
             message_id not in self.reaction_roles
@@ -1005,57 +1112,38 @@ class Roles(interactions.Extension):
         if not self.reaction_roles[message_id]:
             del self.reaction_roles[message_id]
 
-        await self.model.save_data()
+        await self.model.save_data("reaction_roles.json", self.reaction_roles)
         await self.send_success(
             ctx, f"Successfully stopped monitoring reaction {emoji}"
         )
 
-    @configure_reaction_role.autocomplete("emoji")
-    async def autocomplete_emoji(self, ctx: interactions.AutocompleteContext) -> None:
-        user_input: str = ctx.input_text.casefold()
-        choices: list[interactions.SlashCommandChoice] = []
-
-        emojis = await self.bot.http.get_all_guild_emoji(ctx.guild_id)
-        for emoji in emojis:
-            if user_input in emoji["name"].casefold():
-                choices.append(
-                    interactions.SlashCommandChoice(
-                        name=f":{emoji['name']}:", value=str(emoji["id"])
-                    )
-                )
-
-        await ctx.send(choices[:25])
-
-    @stop_monitoring_reaction.autocomplete("reaction_config")
+    @stop_monitoring_reaction.autocomplete("config")
     async def autocomplete_reaction_config(
         self, ctx: interactions.AutocompleteContext
     ) -> None:
         choices: list[interactions.SlashCommandChoice] = []
+        focused_value = ctx.input_text.lower()
 
-        for reactions in self.reaction_roles.values():
+        for message_id, reactions in self.reaction_roles.items():
             for emoji, config in reactions.items():
-                if isinstance(config, dict):
-                    role_id = config.get("role_id")
-                    action = config.get("action")
-                else:
-                    role_id = config
-                    action = "add"
-
-                if role_id is None:
+                if not isinstance(config, dict):
                     continue
+
+                role_id = config.get("role_id")
+                action = config.get("action", "add")
 
                 guild = await self.bot.fetch_guild(ctx.guild_id)
                 role = await guild.fetch_role(role_id)
-
                 if role is None:
                     continue
 
                 choice_name = f"{emoji} | {action} {role.name}"
-                choices.append(
-                    interactions.SlashCommandChoice(
-                        name=choice_name, value=f":{emoji}:{action}:{role.name}"
+                if focused_value in choice_name.lower():
+                    choices.append(
+                        interactions.SlashCommandChoice(
+                            name=choice_name, value=f"{message_id}:{emoji}"
+                        )
                     )
-                )
 
         await ctx.send(choices[:25])
 
@@ -1070,44 +1158,6 @@ class Roles(interactions.Extension):
                 return url_parts[-1]
 
         return None
-
-    @interactions.listen("MessageReactionAdd")
-    async def on_reaction_add(self, event: MessageReactionAdd) -> None:
-        if event.author.id == self.bot.user.id:
-            return
-
-        message_id = str(event.message.id)
-        emoji = str(event.emoji)
-
-        try:
-            reaction_config = self.reaction_roles.get(message_id, {}).get(emoji)
-            if not reaction_config:
-                return
-
-            if not isinstance(reaction_config, dict):
-                logger.error(f"Invalid reaction config format: {reaction_config}")
-                return
-
-            role_id = reaction_config.get("role_id")
-            action = reaction_config.get("action")
-            if not role_id or not action:
-                return
-
-            guild = await self.bot.fetch_guild(event.message.guild.id)
-            member = await guild.fetch_member(event.author.id)
-            role = await guild.fetch_role(role_id)
-
-            if role is not None:
-                await (member.add_roles if action == "add" else member.remove_roles)(
-                    [role]
-                )
-            logger.info(
-                f"{'Added' if action == 'add' else 'Removed'} role {role.id} "
-                f"{'to' if action == 'add' else 'from'} member {member.id} via reaction"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to handle reaction: {e}")
 
     @interactions.listen("MessageReactionRemove")
     async def on_reaction_remove(self, event: MessageReactionRemove) -> None:
@@ -1655,6 +1705,7 @@ class Roles(interactions.Extension):
                                 "custom": ("custom.json", dict),
                                 "incarcerated": ("incarcerated_members.json", dict),
                                 "stats": ("stats.json", Counter),
+                                "reaction_roles": ("reaction_roles.json", dict),
                             }.items()
                             if c == config
                         ),
@@ -1891,7 +1942,7 @@ class Roles(interactions.Extension):
             await self.save_custom_roles()
             await self.send_success(
                 ctx,
-                f"Successfully {'added to' if action == 'add' else 'removed from'} custom roles: {', '.join(updated_roles)}.",
+                f"{'Added to' if action == 'add' else 'Removed from'} custom roles: `{', '.join(updated_roles)}`.",
             )
         else:
             await self.send_error(
@@ -1971,7 +2022,7 @@ class Roles(interactions.Extension):
 
         if mentioned_users:
             await ctx.send(
-                f"Successfully found users with the following roles: {', '.join(found_roles)}. Here are the users: {' '.join(mentioned_users)}"
+                f"Found users with the following roles: `{', '.join(found_roles)}`. Here are the users: {' '.join(mentioned_users)}"
             )
             return
 
@@ -1984,7 +2035,7 @@ class Roles(interactions.Extension):
 
         await self.send_error(
             ctx,
-            f"No users currently have the roles: {roles}. The roles exist, but no users are assigned to them at the moment.",
+            f"No users currently have the roles: `{roles}`. The roles exist, but no users are assigned to them at the moment.",
         )
 
     @mention_custom_roles.autocomplete("roles")
