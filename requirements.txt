@@ -7,3 +7,4 @@ pydantic
 yarl
 orjson
 numpy
+aioshutil
