@@ -142,29 +142,28 @@ Key configuration options include:
 ### Algorithm
 
 1. Role Vetting
-
-  - Message:
-    - Maintains a sliding 2-hour window of message timestamps
-    - Computes Shannon entropy and numerical character density
-    - Identifies message duplication and spam patterns
-    - Implements language-specific processing for CJK vs Latin text
-  - Threshold:
-    - Core parameters:
-      - `MIN_MESSAGE_ENTROPY`: `1.5` (valid range: `0.0-4.0`)
-      - `DIGIT_RATIO_THRESHOLD`: `0.5` (valid range: `0.1-1.0`)
-    - Dynamic adjustment coefficients:
-      - User reputation factor: `0.01 × score × tanh(|score|/5)`
-      - Temporal decay function: `exp(-Δt/3600)`
-      - Content length normalization: `log2(max(length,2))/10`
-      - CJK text coefficient: `0.7-0.8 × baseline`
-  - User Metrics:
-    - Reputation score (bounded `[-5.0, 5.0]`)
-    - Consecutive compliance streaks
-    - Violation frequency counter
-    - Message timing distribution
-    - Threshold recalibration timestamp
-  - Adaptive Control:
-    - Positive reinforcement for sustained compliance
-    - Progressive penalty scaling for infractions
-    - Time-based threshold regression to defaults
-    - Per-user calibration state persistence
+   - Message:
+     - Maintains a sliding 2-hour window of message timestamps
+     - Computes Shannon entropy and numerical character density
+     - Identifies message duplication and spam patterns
+     - Implements language-specific processing for CJK vs Latin text
+   - Threshold:
+     - Core parameters:
+     - `MIN_MESSAGE_ENTROPY`: `1.5` (valid range: `0.0-4.0`)
+     - `DIGIT_RATIO_THRESHOLD`: `0.5` (valid range: `0.1-1.0`)
+     - Dynamic adjustment coefficients:
+     - User reputation factor: `0.01 × score × tanh(|score|/5)`
+     - Temporal decay function: `exp(-Δt/3600)`
+     - Content length normalization: `log2(max(length,2))/10`
+     - CJK text coefficient: `0.7-0.8 × baseline`
+   - User Metrics:
+     - Reputation score (bounded `[-5.0, 5.0]`)
+     - Consecutive compliance streaks
+     - Violation frequency counter
+     - Message timing distribution
+     - Threshold recalibration timestamp
+   - Adaptive Control:
+     - Positive reinforcement for sustained compliance
+     - Progressive penalty scaling for infractions
+     - Time-based threshold regression to defaults
+     - Per-user calibration state persistence
