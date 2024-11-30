@@ -24,6 +24,8 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
 - Intelligent message quality assessment using entropy and pattern analysis
 - Automatic conflict resolution for role assignments
 - Recovery streak system to reward consistent good behavior
+- Reaction-based role management system with customizable actions
+- Automatic role assignment/removal based on emoji reactions
 
 ## Usage
 
@@ -34,12 +36,22 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
     - `roles` (string, required): Comma-separated list of roles to add or remove
     - `action` (string, required): Choose between `add` or `remove`
 
+- `/roles custom mention`: Mention members with specific custom roles
+  - Options:
+    - `roles` (string, required): Role names to mention members from
+
+- `/roles vetting toggle`: Configure message monitoring and validation settings
+  - Options:
+    - `type` (string, required): Setting type to configure
+    - `state` (string, required): Enable or disable the setting
+
 - `/roles vetting assign`: Assign vetting roles to a member
   - Options:
     - `member` (user, required): The member to assign roles to
     - `ideology` (string, optional): Specify ideology role
     - `domicile` (string, optional): Specify domicile role
     - `status` (string, optional): Specify status role
+    - `others` (string, optional): Specify other roles
 
 - `/roles vetting remove`: Remove vetting roles from a member
   - Options:
@@ -60,9 +72,24 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
   - Options:
     - `member` (user, required): The member to release
 
+- `/roles reaction start`: Configure reaction roles
+  - Options:
+    - `message` (string, required): Message ID or URL to monitor
+    - `emoji` (string, required): Emoji to react with
+    - `role` (role, required): Role to assign/remove
+    - `action` (string, required): Whether to add or remove the role
+
+- `/roles reaction stop`: Stop monitoring a reaction
+  - Options:
+    - `config` (string, required): Select reaction configuration to stop
+
 - `/roles debug view`: View configuration settings and statistics
   - Options:
     - `config` (string, required): Configuration type to view (vetting/custom/incarcerated/stats/dynamic)
+
+- `/roles debug export`: Export files from the extension directory
+  - Options:
+    - `type` (string, required): Type of files to export
 
 - `/roles debug inactive`: Convert inactive members to missing members
   - Requires administrator permissions
@@ -79,13 +106,15 @@ The **Roles** module is designed to manage roles, streamline vetting processes, 
 
 ## Configuration
 
-Key configuration settings include:
+Key configuration options include:
 
-- `VETTING_FORUM_ID`: Discord channel ID for vetting threads
+- `ELECT_VETTING_FORUM_ID`: Discord forum ID for electoral vetting threads
+- `APPR_VETTING_FORUM_ID`: Discord forum ID for approval vetting threads
 - `VETTING_ROLE_IDS`: List of role IDs authorized to participate in vetting
-- `ELECTORAL_ROLE_ID`: Role granted upon successful vetting
+- `ELECTORAL_ROLE_ID`: Role granted upon successful electoral vetting
 - `APPROVED_ROLE_ID`: Role for approved members
 - `TEMPORARY_ROLE_ID`: Role for temporarily restricted members
+- `MINISTER_ROLE_ID`: Role authorized to configure reaction roles
 - `MISSING_ROLE_ID`: Role for inactive/missing members
 - `INCARCERATED_ROLE_ID`: Role assigned to incarcerated members
 - `AUTHORIZED_CUSTOM_ROLE_IDS`: Roles permitted to manage custom roles
@@ -102,17 +131,40 @@ Key configuration settings include:
 - `DIGIT_THRESHOLD`: Threshold for excessive digit usage
 - `MIN_ENTROPY_THRESHOLD`: Minimum required message entropy
 
-The dynamic threshold adjustment based on:
+### Files
 
-- User feedback scores
-- Message quality
-- Activity patterns
-- Recovery streaks
-- Violation history
+- `stats.json`: User statistics and feedback scores
+- `custom.json`: Custom role configurations
+- `vetting.json`: Vetting role settings
+- `incarcerated_members.json`: Incarcerated member records and status
+- `reaction_roles.json`: Reaction role configurations and mappings
 
-These thresholds automatically adjust to:
+### Algorithm
 
-- Reward consistent good behavior
-- Penalize repeated violations
-- Account for different language patterns
-- Adapt to user-specific communication styles
+1. Role Vetting
+
+  - Message:
+    - Maintains a sliding 2-hour window of message timestamps
+    - Computes Shannon entropy and numerical character density
+    - Identifies message duplication and spam patterns
+    - Implements language-specific processing for CJK vs Latin text
+  - Threshold:
+    - Core parameters:
+      - `MIN_MESSAGE_ENTROPY`: `1.5` (valid range: `0.0-4.0`)
+      - `DIGIT_RATIO_THRESHOLD`: `0.5` (valid range: `0.1-1.0`)
+    - Dynamic adjustment coefficients:
+      - User reputation factor: `0.01 × score × tanh(|score|/5)`
+      - Temporal decay function: `exp(-Δt/3600)`
+      - Content length normalization: `log2(max(length,2))/10`
+      - CJK text coefficient: `0.7-0.8 × baseline`
+  - User Metrics:
+    - Reputation score (bounded `[-5.0, 5.0]`)
+    - Consecutive compliance streaks
+    - Violation frequency counter
+    - Message timing distribution
+    - Threshold recalibration timestamp
+  - Adaptive Control:
+    - Positive reinforcement for sustained compliance
+    - Progressive penalty scaling for infractions
+    - Time-based threshold regression to defaults
+    - Per-user calibration state persistence
