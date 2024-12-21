@@ -8,3 +8,4 @@ yarl
 orjson
 numpy
 aioshutil
+pyarrow
