@@ -184,6 +184,7 @@ class StickyRoles:
         self._table_cache: Optional[pa.Table] = None
         self._last_read: float = 0
         self._cache_ttl: float = 1.0
+        self._lock = asyncio.Lock()
 
     def ensure_db(self) -> None:
         if not self.db_path.exists():
@@ -192,34 +193,52 @@ class StickyRoles:
             )
             pq.write_table(empty_table, str(self.db_path))
 
-    def read_table(self) -> pa.Table:
-        current_time = time.monotonic()
-        if (
-            self._table_cache is None
-            or current_time - self._last_read > self._cache_ttl
-        ):
-            self._table_cache = pq.read_table(str(self.db_path))
-            self._last_read = current_time
-        return self._table_cache
+    async def read_table(self) -> pa.Table:
+        async with self._lock:
+            current_time = time.monotonic()
+            if (
+                self._table_cache is None
+                or current_time - self._last_read > self._cache_ttl
+            ):
+                self._table_cache = await asyncio.to_thread(
+                    pq.read_table, str(self.db_path)
+                )
+                self._last_read = current_time
+            return self._table_cache
 
-    def write_table(self, table: pa.Table) -> None:
-        pq.write_table(
-            table, str(self.db_path), compression="ZSTD", compression_level=3
-        )
-        self._table_cache = table
-        self._last_read = time.monotonic()
+    async def write_table(self, table: pa.Table) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                pq.write_table,
+                table,
+                str(self.db_path),
+                compression="ZSTD",
+                compression_level=3,
+            )
+            self._table_cache = table
+            self._last_read = time.monotonic()
 
-    def get_sticky_roles(self, member_id: int) -> list[int]:
-        table = self.read_table()
-        filtered = table.filter(table["member_id"] == member_id)
-        return filtered["role_ids"][0].as_py() if filtered.num_rows else []
+    async def get_sticky_roles(self, member_id: int) -> list[int]:
+        try:
+            table = await self.read_table()
+            filtered = table.filter(table["member_id"] == member_id)
+            if filtered.num_rows == 0:
+                return []
+            role_ids = filtered["role_ids"][0].as_py()
+            return [int(rid) for rid in role_ids] if role_ids else []
+        except Exception as e:
+            logger.error(
+                f"Error getting sticky roles for member {member_id}: {e}",
+                exc_info=True,
+            )
+            return []
 
-    def update_sticky_roles(self, member_id: int, role_ids: list[int]) -> None:
+    async def update_sticky_roles(self, member_id: int, role_ids: list[int]) -> None:
         try:
             role_ids = [int(rid) for rid in role_ids]
             unique_role_ids = list(dict.fromkeys(role_ids))
 
-            table = self.read_table()
+            table = await self.read_table()
 
             new_data = {
                 "member_id": [member_id],
@@ -233,19 +252,26 @@ class StickyRoles:
                 [
                     filtered_table,
                     pa.Table.from_pydict(new_data, schema=self.schema),
-                ]
+                ],
             )
-            self.write_table(new_table)
+
+            indices = pc.sort_indices(new_table["member_id"])
+            new_table = new_table.take(indices)
+
+            await self.write_table(new_table)
+
+        except ValueError as e:
+            logger.error(
+                f"Invalid role ID format for member {member_id}: {e}",
+                exc_info=True,
+            )
+            raise
         except Exception as e:
             logger.error(
                 f"Error updating sticky roles for member {member_id}: {e}",
                 exc_info=True,
             )
             raise
-
-    def remove_member(self, member_id: int) -> None:
-        table = self.read_table()
-        self.write_table(table.filter(table["member_id"] != member_id))
 
 
 class Model(Generic[T]):
@@ -567,7 +593,7 @@ class Roles(interactions.Extension):
 
         asyncio.create_task(self.load_initial_data())
 
-    async def load_initial_data(self):
+    async def load_initial_data(self) -> None:
         try:
             results = await asyncio.gather(*self.load_tasks)
             (
@@ -579,7 +605,7 @@ class Roles(interactions.Extension):
             ) = results
             logger.info("Initial data loaded successfully")
 
-            sticky_role_updates = []
+            sticky_role_updates: List[Tuple[int, List[int]]] = []
             after = None
             while True:
                 members = await self.bot.http.list_members(
@@ -590,20 +616,21 @@ class Roles(interactions.Extension):
                 sticky_role_updates.extend(
                     (
                         int(member["user"]["id"]),
-                        list(int(role_id) for role_id in member["roles"]),
+                        [int(role_id) for role_id in member["roles"]],
                     )
                     for member in members
                 )
                 after = members[-1]["user"]["id"]
 
-            for member_id, roles in (
-                update for update in sticky_role_updates if update[1]
-            ):
-                print(f"Member ID: {member_id}, Roles: {roles}, Type: {type(roles)}")
-                self.sticky_roles.update_sticky_roles(member_id, roles)
-            logger.info("Sticky roles database initialized")
+            for member_id, roles in sticky_role_updates:
+                if roles:
+                    await self.sticky_roles.update_sticky_roles(member_id, roles)
+            logger.info(
+                f"Sticky roles database initialized with {len(sticky_role_updates)} members"
+            )
         except Exception as e:
-            logger.critical(f"Failed to load critical data: {e}")
+            logger.critical(f"Failed to load critical data: {e}", exc_info=True)
+            raise
 
     # Decorator
 
@@ -983,7 +1010,9 @@ class Roles(interactions.Extension):
         try:
             sticky_roles = [role.id for role in event.member.roles]
             if sticky_roles:
-                self.sticky_roles.update_sticky_roles(event.member.id, sticky_roles)
+                await self.sticky_roles.update_sticky_roles(
+                    event.member.id, sticky_roles
+                )
                 logger.info(
                     f"Saved {len(sticky_roles)} sticky roles for leaving member {event.member.id}"
                 )
@@ -997,16 +1026,17 @@ class Roles(interactions.Extension):
     async def on_member_add(self, event: MemberAdd) -> None:
         try:
             if not (
-                sticky_role_ids := self.sticky_roles.get_sticky_roles(event.member.id)
+                sticky_role_ids := await self.sticky_roles.get_sticky_roles(
+                    event.member.id
+                )
             ):
                 return
 
             guild = await self.bot.fetch_guild(event.member.guild.id)
-            roles_to_add = [
-                role
-                for role_id in sticky_role_ids
-                if (role := await guild.fetch_role(role_id))
-                and not (
+            roles_to_add = []
+            for role_id in sticky_role_ids:
+                role = await guild.fetch_role(role_id)
+                if role and not (
                     role.permissions
                     & (
                         interactions.Permissions.ADMINISTRATOR
@@ -1016,8 +1046,8 @@ class Roles(interactions.Extension):
                     )
                     or role.id in self.excluded_role_ids
                     or role.bot_managed
-                )
-            ]
+                ):
+                    roles_to_add.append(role)
 
             if roles_to_add:
                 await event.member.add_roles(roles_to_add)
@@ -1025,7 +1055,7 @@ class Roles(interactions.Extension):
                     f"Restored {len(roles_to_add)} sticky roles for member {event.member.id}: "
                     f"{','.join(role.name for role in roles_to_add)}"
                 )
-                self.sticky_roles.update_sticky_roles(
+                await self.sticky_roles.update_sticky_roles(
                     event.member.id, [role.id for role in roles_to_add]
                 )
 
