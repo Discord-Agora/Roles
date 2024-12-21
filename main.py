@@ -50,10 +50,15 @@ import cysimdjson
 import interactions
 import numpy as np
 import orjson
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from cachetools import TTLCache
 from interactions.api.events import (
     ExtensionLoad,
     ExtensionUnload,
+    MemberAdd,
+    MemberRemove,
     MessageCreate,
     MessageReactionAdd,
     MessageReactionRemove,
@@ -162,6 +167,85 @@ class Approval:
     rejection_count: int = 0
     reviewers: Set[int] = field(default_factory=set)
     last_approval_time: Optional[datetime] = None
+
+
+class StickyRoles:
+    def __init__(self) -> None:
+        self.base_path: Path = Path(__file__).parent
+        self.db_path = self.base_path / "sticky_roles.parquet"
+        self.schema = pa.schema(
+            [
+                ("member_id", pa.int64()),
+                ("role_ids", pa.list_(pa.int64())),
+                ("updated_at", pa.timestamp("us")),
+            ]
+        )
+        self.ensure_db()
+        self._table_cache: Optional[pa.Table] = None
+        self._last_read: float = 0
+        self._cache_ttl: float = 1.0
+
+    def ensure_db(self) -> None:
+        if not self.db_path.exists():
+            empty_table = pa.Table.from_pydict(
+                {"member_id": [], "role_ids": [], "updated_at": []}, schema=self.schema
+            )
+            pq.write_table(empty_table, str(self.db_path))
+
+    def read_table(self) -> pa.Table:
+        current_time = time.monotonic()
+        if (
+            self._table_cache is None
+            or current_time - self._last_read > self._cache_ttl
+        ):
+            self._table_cache = pq.read_table(str(self.db_path))
+            self._last_read = current_time
+        return self._table_cache
+
+    def write_table(self, table: pa.Table) -> None:
+        pq.write_table(
+            table, str(self.db_path), compression="ZSTD", compression_level=3
+        )
+        self._table_cache = table
+        self._last_read = time.monotonic()
+
+    def get_sticky_roles(self, member_id: int) -> list[int]:
+        table = self.read_table()
+        filtered = table.filter(table["member_id"] == member_id)
+        return filtered["role_ids"][0].as_py() if filtered.num_rows else []
+
+    def update_sticky_roles(self, member_id: int, role_ids: list[int]) -> None:
+        try:
+            role_ids = [int(rid) for rid in role_ids]
+            unique_role_ids = list(dict.fromkeys(role_ids))
+
+            table = self.read_table()
+
+            new_data = {
+                "member_id": [member_id],
+                "role_ids": [unique_role_ids],
+                "updated_at": [datetime.now(timezone.utc)],
+            }
+
+            filtered_table = table.filter(pc.not_equal(table["member_id"], member_id))
+
+            new_table = pa.concat_tables(
+                [
+                    filtered_table,
+                    pa.Table.from_pydict(new_data, schema=self.schema),
+                ]
+            )
+            self.write_table(new_table)
+        except Exception as e:
+            logger.error(
+                f"Error updating sticky roles for member {member_id}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    def remove_member(self, member_id: int) -> None:
+        table = self.read_table()
+        self.write_table(table.filter(table["member_id"] != member_id))
 
 
 class Model(Generic[T]):
@@ -439,6 +523,7 @@ class Roles(interactions.Extension):
     def __init__(self, bot: interactions.Client):
         self.bot: interactions.Client = bot
         self.config: Config = Config()
+        self.sticky_roles: StickyRoles = StickyRoles()
         self.vetting_roles: Data = Data()
         self.custom_roles: Dict[str, Set[int]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
@@ -449,8 +534,8 @@ class Roles(interactions.Extension):
         self.stats_lock: asyncio.Lock = asyncio.Lock()
         self.stats_save_task: asyncio.Task | None = None
         self.reaction_roles: Dict[str, Dict[str, Any]] = {}
-        self.message_monitoring_enabled = False
-        self.validation_flags = {
+        self.message_monitoring_enabled: bool = False
+        self.validation_flags: Dict[str, bool] = {
             "repetition": True,
             "digit_ratio": True,
             "entropy": True,
@@ -461,6 +546,11 @@ class Roles(interactions.Extension):
             "MAX_REPEATED_MESSAGES": 3,
             "DIGIT_RATIO_THRESHOLD": 0.5,
             "MIN_MESSAGE_ENTROPY": 1.5,
+        }
+        self.excluded_role_ids = {
+            self.config.ELECTORAL_ROLE_ID,
+            self.config.APPROVED_ROLE_ID,
+            self.config.TEMPORARY_ROLE_ID,
         }
 
         self.cache = TTLCache(maxsize=100, ttl=300)
@@ -488,6 +578,30 @@ class Roles(interactions.Extension):
                 self.reaction_roles,
             ) = results
             logger.info("Initial data loaded successfully")
+
+            sticky_role_updates = []
+            after = None
+            while True:
+                members = await self.bot.http.list_members(
+                    self.config.GUILD_ID, limit=1000, after=after
+                )
+                if not members:
+                    break
+                sticky_role_updates.extend(
+                    (
+                        int(member["user"]["id"]),
+                        list(int(role_id) for role_id in member["roles"]),
+                    )
+                    for member in members
+                )
+                after = members[-1]["user"]["id"]
+
+            for member_id, roles in (
+                update for update in sticky_role_updates if update[1]
+            ):
+                print(f"Member ID: {member_id}, Roles: {roles}, Type: {type(roles)}")
+                self.sticky_roles.update_sticky_roles(member_id, roles)
+            logger.info("Sticky roles database initialized")
         except Exception as e:
             logger.critical(f"Failed to load critical data: {e}")
 
@@ -861,6 +975,65 @@ class Roles(interactions.Extension):
                 (interactions.ButtonStyle.DANGER, "Reject", "reject"),
             )
         ]
+
+    # Sticky roles
+
+    @interactions.listen("MemberRemove")
+    async def on_member_remove(self, event: MemberRemove) -> None:
+        try:
+            sticky_roles = [role.id for role in event.member.roles]
+            if sticky_roles:
+                self.sticky_roles.update_sticky_roles(event.member.id, sticky_roles)
+                logger.info(
+                    f"Saved {len(sticky_roles)} sticky roles for leaving member {event.member.id}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Error saving sticky roles for member {event.member.id}: {e!r}",
+                exc_info=True,
+            )
+
+    @interactions.listen("MemberAdd")
+    async def on_member_add(self, event: MemberAdd) -> None:
+        try:
+            if not (
+                sticky_role_ids := self.sticky_roles.get_sticky_roles(event.member.id)
+            ):
+                return
+
+            guild = await self.bot.fetch_guild(event.member.guild.id)
+            roles_to_add = [
+                role
+                for role_id in sticky_role_ids
+                if (role := await guild.fetch_role(role_id))
+                and not (
+                    role.permissions
+                    & (
+                        interactions.Permissions.ADMINISTRATOR
+                        | interactions.Permissions.MANAGE_GUILD
+                        | interactions.Permissions.MANAGE_ROLES
+                        | interactions.Permissions.MANAGE_CHANNELS
+                    )
+                    or role.id in self.excluded_role_ids
+                    or role.bot_managed
+                )
+            ]
+
+            if roles_to_add:
+                await event.member.add_roles(roles_to_add)
+                logger.info(
+                    f"Restored {len(roles_to_add)} sticky roles for member {event.member.id}: "
+                    f"{','.join(role.name for role in roles_to_add)}"
+                )
+                self.sticky_roles.update_sticky_roles(
+                    event.member.id, [role.id for role in roles_to_add]
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Error restoring sticky roles for member {event.member.id}: {e!r}",
+                exc_info=True,
+            )
 
     # Command groups
 
