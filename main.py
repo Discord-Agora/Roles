@@ -1885,7 +1885,21 @@ class Roles(interactions.Extension):
                     f"The `{config}` configuration exists but contains no displayable data. This may indicate an empty or corrupted configuration file.",
                 )
 
-            await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
+            paginator = Paginator(
+                client=self.bot,
+                pages=embeds,
+                timeout_interval=120,
+                show_callback_button=True,
+                show_select_menu=True,
+                show_back_button=True,
+                show_next_button=True,
+                show_first_button=True,
+                show_last_button=True,
+                wrong_user_message="This leaderboard can only be controlled by the user who requested it.",
+                hide_buttons_on_stop=True,
+            )
+
+            await paginator.send(ctx)
 
         except Exception as e:
             logger.error(f"Error in view_config: {e}\n{traceback.format_exc()}")
@@ -2993,7 +3007,21 @@ class Roles(interactions.Extension):
         if field_count:
             embeds.append(current_embed)
 
-        await Paginator.create_from_embeds(self.bot, *embeds, timeout=300).send(ctx)
+        paginator = Paginator(
+            client=self.bot,
+            pages=embeds,
+            timeout_interval=120,
+            show_callback_button=True,
+            show_select_menu=True,
+            show_back_button=True,
+            show_next_button=True,
+            show_first_button=True,
+            show_last_button=True,
+            wrong_user_message="This leaderboard can only be controlled by the user who requested it.",
+            hide_buttons_on_stop=True,
+        )
+
+        await paginator.send(ctx)
 
     @staticmethod
     @lru_cache(maxsize=256)
