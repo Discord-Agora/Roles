@@ -742,6 +742,13 @@ class Roles(interactions.Extension):
         member_roles = frozenset(map(attrgetter("id"), member.roles))
         roles_to_add = frozenset(role_ids_to_add)
 
+        others_role_ids = self._get_category_role_ids("others")
+
+        roles_to_check = roles_to_add - others_role_ids
+
+        if not roles_to_check:
+            return False
+
         conflicts = [
             (
                 member_roles & category_roles,
@@ -750,6 +757,7 @@ class Roles(interactions.Extension):
             for category, category_roles in (
                 (cat, self._get_category_role_ids(cat))
                 for cat in self.vetting_roles.assigned_roles
+                if cat != "others"
             )
             if bool(member_roles & category_roles)
             and bool(roles_to_add & category_roles)
