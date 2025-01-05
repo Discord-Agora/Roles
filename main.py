@@ -50,15 +50,13 @@ import cysimdjson
 import interactions
 import numpy as np
 import orjson
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from cachetools import TTLCache
 from interactions.api.events import (
     ExtensionLoad,
     ExtensionUnload,
     MemberAdd,
     MemberRemove,
+    MemberUpdate,
     MessageCreate,
     MessageReactionAdd,
     MessageReactionRemove,
@@ -170,62 +168,44 @@ class Approval:
 
 
 class StickyRoles:
+
     def __init__(self) -> None:
         self.base_path: Path = Path(__file__).parent
-        self.db_path = self.base_path / "sticky_roles.parquet"
-        self.schema = pa.schema(
-            [
-                ("member_id", pa.int64()),
-                ("role_ids", pa.list_(pa.int64())),
-                ("updated_at", pa.timestamp("us")),
-            ]
-        )
-        self.ensure_db()
-        self._table_cache: Optional[pa.Table] = None
+        self.db_path = self.base_path / "sticky_roles.json"
+        self._data_cache: Optional[dict] = None
         self._last_read: float = 0
         self._cache_ttl: float = 1.0
         self._lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task] = None
 
-    def ensure_db(self) -> None:
-        if not self.db_path.exists():
-            empty_table = pa.Table.from_pydict(
-                {"member_id": [], "role_ids": [], "updated_at": []}, schema=self.schema
-            )
-            pq.write_table(empty_table, str(self.db_path))
-
-    async def read_table(self) -> pa.Table:
+    async def read_data(self) -> Dict[str, Any]:
         async with self._lock:
-            current_time = time.monotonic()
             if (
-                self._table_cache is None
-                or current_time - self._last_read > self._cache_ttl
+                not self._data_cache
+                or (time.monotonic() - self._last_read) > self._cache_ttl
             ):
-                self._table_cache = await asyncio.to_thread(
-                    pq.read_table, str(self.db_path)
-                )
-                self._last_read = current_time
-            return self._table_cache
+                try:
+                    self._data_cache = orjson.loads(
+                        await (await aiofiles.open(self.db_path, mode="rb")).read()
+                    )
+                    self._last_read = time.monotonic()
+                except (IOError, orjson.JSONDecodeError):
+                    self._data_cache = {"members": {}}
+            return self._data_cache or {"members": {}}
 
-    async def write_table(self, table: pa.Table) -> None:
+    async def write_data(self, data: Dict[str, Any]) -> None:
         async with self._lock:
-            await asyncio.to_thread(
-                pq.write_table,
-                table,
-                str(self.db_path),
-                compression="ZSTD",
-                compression_level=3,
+            serialized = orjson.dumps(
+                data, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS
             )
-            self._table_cache = table
-            self._last_read = time.monotonic()
+            async with aiofiles.open(self.db_path, mode="wb") as f:
+                await f.write(serialized)
+            self._data_cache, self._last_read = data, time.monotonic()
 
     async def get_sticky_roles(self, member_id: int) -> list[int]:
         try:
-            table = await self.read_table()
-            filtered = table.filter(table["member_id"] == member_id)
-            if filtered.num_rows == 0:
-                return []
-            role_ids = filtered["role_ids"][0].as_py()
-            return [int(rid) for rid in role_ids] if role_ids else []
+            data = await self.read_data()
+            return data.get("members", {}).get(str(member_id), {}).get("role_ids", [])
         except Exception as e:
             logger.error(
                 f"Error getting sticky roles for member {member_id}: {e}",
@@ -235,30 +215,14 @@ class StickyRoles:
 
     async def update_sticky_roles(self, member_id: int, role_ids: list[int]) -> None:
         try:
-            role_ids = [int(rid) for rid in role_ids]
-            unique_role_ids = list(dict.fromkeys(role_ids))
+            role_ids = [*{int(rid) for rid in role_ids}]
+            data = await self.read_data()
 
-            table = await self.read_table()
+            ts = datetime.now(timezone.utc).isoformat()
 
-            new_data = {
-                "member_id": [member_id],
-                "role_ids": [unique_role_ids],
-                "updated_at": [datetime.now(timezone.utc)],
-            }
+            data["members"][str(member_id)] = {"role_ids": role_ids, "updated_at": ts}
 
-            filtered_table = table.filter(pc.not_equal(table["member_id"], member_id))
-
-            new_table = pa.concat_tables(
-                [
-                    filtered_table,
-                    pa.Table.from_pydict(new_data, schema=self.schema),
-                ],
-            )
-
-            indices = pc.sort_indices(new_table["member_id"])
-            new_table = new_table.take(indices)
-
-            await self.write_table(new_table)
+            await self.write_data(data)
 
         except ValueError as e:
             logger.error(
@@ -271,6 +235,23 @@ class StickyRoles:
                 f"Error updating sticky roles for member {member_id}: {e}",
                 exc_info=True,
             )
+            raise
+
+    async def cleanup_inactive_roles(self, days: int = 30) -> None:
+        try:
+            data = await self.read_data()
+            cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+
+            data["members"] = {
+                mid: mdata
+                for mid, mdata in data["members"].items()
+                if datetime.fromisoformat(mdata["updated_at"]).timestamp() >= cutoff_ts
+            }
+
+            await self.write_data(data)
+
+        except Exception as e:
+            logger.error(f"Error during sticky roles cleanup: {e}", exc_info=True)
             raise
 
 
@@ -318,7 +299,7 @@ class Model(Generic[T]):
                 async with aiofiles.open(str(file_path), mode=mode) as file:
                     yield file
             except IOError as e:
-                logger.error(f"IO operation failed for {file_path}: {e}")
+                logger.error(f"IO operation failed for {file_path}: {e}", exc_info=True)
                 raise
 
     @async_retry()
@@ -329,41 +310,29 @@ class Model(Generic[T]):
                 content = await file.read()
                 json_parsed = orjson.loads(content)
 
-            if file_name == "custom.json":
-                instance = {
-                    role: frozenset(members) for role, members in json_parsed.items()
-                }
-            elif issubclass(model, BaseModel):
-                instance = (
-                    model.model_validate_json(content)
-                    if content
-                    else model.model_validate({})
-                )
-            elif model == Counter:
-                instance = cast(T, Counter(json_parsed))
-            else:
-                instance = {}
-                await self.save_data(file_name, instance)
-                return cast(T, instance)
+                if issubclass(model, BaseModel):
+                    instance = (
+                        model.model_validate_json(content)
+                        if content
+                        else model.model_validate({})
+                    )
+                else:
+                    instance = cast(T, json_parsed if json_parsed else {})
+                    if file_name == "custom.json":
+                        instance = {
+                            role: set(members) for role, members in instance.items()
+                        }
 
-            self._data_cache[file_name] = instance
-            return cast(T, instance)
+                self._data_cache[file_name] = instance
+                return instance
 
         except FileNotFoundError:
-            instance = (
-                {}
-                if file_name == "custom.json"
-                else (
-                    model.model_validate({})
-                    if issubclass(model, BaseModel)
-                    else Counter() if model == Counter else {}
-                )
-            )
+            instance = model.model_validate({}) if issubclass(model, BaseModel) else {}
             await self.save_data(file_name, instance)
             return cast(T, instance)
 
         except Exception as e:
-            logger.error(f"Error loading {file_name}: {e}")
+            logger.error(f"Error loading {file_name}: {e}", exc_info=True)
             raise ValueError(f"Failed to load {file_name}") from e
 
     @async_retry()
@@ -384,7 +353,7 @@ class Model(Generic[T]):
             logger.info(f"Successfully saved data to {file_name}")
 
         except Exception as e:
-            logger.error(f"Error saving {file_name}: {e}")
+            logger.error(f"Error saving {file_name}: {e}", exc_info=True)
             raise
 
     def __del__(self) -> None:
@@ -553,7 +522,7 @@ class Roles(interactions.Extension):
         self.vetting_roles: Data = Data()
         self.custom_roles: Dict[str, Set[int]] = {}
         self.incarcerated_members: Dict[str, Dict[str, Any]] = {}
-        self.stats: Counter[str] = Counter()
+        self.stats: Dict[str, Dict[str, Any]] = {}
         self.processed_thread_ids: Set[int] = set()
         self.approval_counts: Dict[int, Approval] = {}
         self.member_role_locks: Dict[int, Dict[str, Union[asyncio.Lock, datetime]]] = {}
@@ -587,7 +556,7 @@ class Roles(interactions.Extension):
             self.model.load_data("vetting.json", Data),
             self.model.load_data("custom.json", dict),
             self.model.load_data("incarcerated_members.json", dict),
-            self.model.load_data("stats.json", Counter),
+            self.model.load_data("stats.json", dict),
             self.model.load_data("reaction_roles.json", dict),
         ]
 
@@ -605,29 +574,34 @@ class Roles(interactions.Extension):
             ) = results
             logger.info("Initial data loaded successfully")
 
+            data = await self.sticky_roles.read_data()
             sticky_role_updates: List[Tuple[int, List[int]]] = []
             after = None
+
             while True:
                 members = await self.bot.http.list_members(
                     self.config.GUILD_ID, limit=1000, after=after
                 )
                 if not members:
                     break
-                sticky_role_updates.extend(
-                    (
-                        int(member["user"]["id"]),
-                        [int(role_id) for role_id in member["roles"]],
-                    )
-                    for member in members
-                )
+
+                for member in members:
+                    member_id = int(member["user"]["id"])
+                    role_ids = [int(role_id) for role_id in member["roles"]]
+                    if role_ids:
+                        sticky_role_updates.append((member_id, role_ids))
+
                 after = members[-1]["user"]["id"]
 
             for member_id, roles in sticky_role_updates:
-                if roles:
-                    await self.sticky_roles.update_sticky_roles(member_id, roles)
+                ts = datetime.now(timezone.utc).isoformat()
+                data["members"][str(member_id)] = {"role_ids": roles, "updated_at": ts}
+
+            await self.sticky_roles.write_data(data)
             logger.info(
                 f"Sticky roles database initialized with {len(sticky_role_updates)} members"
             )
+
         except Exception as e:
             logger.critical(f"Failed to load critical data: {e}", exc_info=True)
             raise
@@ -846,7 +820,7 @@ class Roles(interactions.Extension):
                     f"Notifications sent to role ID {role_id} in thread {thread.id}"
                 )
             except Exception as e:
-                logger.error(f"Error processing role {role_id}: {e}")
+                logger.error(f"Error processing role {role_id}: {e}", exc_info=True)
 
         for role_id in reviewer_role_ids:
             await process_role(role_id)
@@ -861,7 +835,7 @@ class Roles(interactions.Extension):
             await member.send(embed=embed)
             logger.debug(f"Sent notification to member {member.id}")
         except Exception as e:
-            logger.error(f"Failed to send embed to {member.id}: {e}")
+            logger.error(f"Failed to send embed to {member.id}: {e}", exc_info=True)
 
     @lru_cache(maxsize=1)
     def get_log_channels(self) -> tuple[int, int, int]:
@@ -1016,14 +990,23 @@ class Roles(interactions.Extension):
     @interactions.listen("MemberRemove")
     async def on_member_remove(self, event: MemberRemove) -> None:
         try:
-            sticky_roles = [role.id for role in event.member.roles]
-            if sticky_roles:
+            member_roles = [role.id for role in event.member.roles]
+            if member_roles:
                 await self.sticky_roles.update_sticky_roles(
-                    event.member.id, sticky_roles
+                    event.member.id, member_roles
                 )
                 logger.info(
-                    f"Saved {len(sticky_roles)} sticky roles for leaving member {event.member.id}"
+                    f"Saved {len(member_roles)} sticky roles for leaving member {event.member.id}"
                 )
+
+                if (
+                    not self.sticky_roles._cleanup_task
+                    or self.sticky_roles._cleanup_task.done()
+                ):
+                    self.sticky_roles._cleanup_task = asyncio.create_task(
+                        self.sticky_roles.cleanup_inactive_roles()
+                    )
+
         except Exception as e:
             logger.error(
                 f"Error saving sticky roles for member {event.member.id}: {e!r}",
@@ -1033,43 +1016,79 @@ class Roles(interactions.Extension):
     @interactions.listen("MemberAdd")
     async def on_member_add(self, event: MemberAdd) -> None:
         try:
-            if not (
-                sticky_role_ids := await self.sticky_roles.get_sticky_roles(
-                    event.member.id
-                )
-            ):
+            sticky_role_ids = await self.sticky_roles.get_sticky_roles(event.member.id)
+            if not sticky_role_ids:
                 return
 
             guild = await self.bot.fetch_guild(event.member.guild.id)
             roles_to_add = []
+
             for role_id in sticky_role_ids:
-                role = await guild.fetch_role(role_id)
-                if role and not (
-                    role.permissions
-                    & (
-                        interactions.Permissions.ADMINISTRATOR
-                        | interactions.Permissions.MANAGE_GUILD
-                        | interactions.Permissions.MANAGE_ROLES
-                        | interactions.Permissions.MANAGE_CHANNELS
-                    )
-                    or role.id in self.excluded_role_ids
-                    or role.bot_managed
-                ):
-                    roles_to_add.append(role)
+                try:
+                    role = await guild.fetch_role(role_id)
+                    if role and not (
+                        role.permissions
+                        & (
+                            interactions.Permissions.ADMINISTRATOR
+                            | interactions.Permissions.MANAGE_GUILD
+                            | interactions.Permissions.MANAGE_ROLES
+                            | interactions.Permissions.MANAGE_CHANNELS
+                        )
+                        or role.id in self.excluded_role_ids
+                        or role.bot_managed
+                    ):
+                        roles_to_add.append(role)
+                except Exception as e:
+                    logger.warning(f"Could not fetch role {role_id}: {e!r}")
+                    continue
 
             if roles_to_add:
-                await event.member.add_roles(roles_to_add)
-                logger.info(
-                    f"Restored {len(roles_to_add)} sticky roles for member {event.member.id}: "
-                    f"{','.join(role.name for role in roles_to_add)}"
-                )
-                await self.sticky_roles.update_sticky_roles(
-                    event.member.id, [role.id for role in roles_to_add]
-                )
+                try:
+                    await event.member.add_roles(roles_to_add)
+                    logger.info(
+                        f"Restored {len(roles_to_add)} sticky roles for member {event.member.id}: "
+                        f"{','.join(str(role.name) for role in roles_to_add)}"
+                    )
+                    await self.sticky_roles.update_sticky_roles(
+                        event.member.id, [role.id for role in roles_to_add]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to add roles to member {event.member.id}: {e!r}",
+                        exc_info=True,
+                    )
 
         except Exception as e:
             logger.error(
                 f"Error restoring sticky roles for member {event.member.id}: {e!r}",
+                exc_info=True,
+            )
+
+    @interactions.listen("MemberUpdate")
+    async def on_member_update(self, event: MemberUpdate) -> None:
+        try:
+            before_roles: set[int] = set(role.id for role in event.before.roles)
+            after_roles: set[int] = set(role.id for role in event.after.roles)
+
+            if before_roles == after_roles:
+                return
+
+            added = after_roles - before_roles
+            removed = before_roles - after_roles
+
+            await self.sticky_roles.update_sticky_roles(event.after.id, [*after_roles])
+
+            logger.info(
+                "Updated sticky roles for member {} - Added: {}, Removed: {}".format(
+                    event.after.id, added, removed
+                )
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error updating sticky roles for member %s: %r",
+                event.after.id,
+                e,
                 exc_info=True,
             )
 
@@ -1188,13 +1207,14 @@ class Roles(interactions.Extension):
                                         await member.remove_role(role.id)
                                 except Exception as e:
                                     logger.error(
-                                        f"Failed to modify role for user {user.id}: {e}"
+                                        f"Failed to modify role for user {user.id}: {e}",
+                                        exc_info=True,
                                     )
                                     continue
                         break
 
             except Exception as e:
-                logger.error(f"Failed to add reaction: {e}")
+                logger.error(f"Failed to add reaction: {e}", exc_info=True)
                 await self.send_error(ctx, "Failed to add reaction to message.")
                 return
 
@@ -1207,7 +1227,7 @@ class Roles(interactions.Extension):
             )
 
         except Exception as e:
-            logger.error(f"Error configuring reaction role: {e}")
+            logger.error(f"Error configuring reaction role: {e}", exc_info=True)
             await self.send_error(ctx, f"Failed to configure reaction role: {str(e)}")
 
     @configure_reaction_role.autocomplete("emoji")
@@ -1277,10 +1297,10 @@ class Roles(interactions.Extension):
                     f"{'to' if action == 'add' else 'from'} member {member.id} via reaction"
                 )
             except Exception as e:
-                logger.error(f"Failed to modify roles: {e}")
+                logger.error(f"Failed to modify roles: {e}", exc_info=True)
 
         except Exception as e:
-            logger.error(f"Failed to handle reaction: {e}")
+            logger.error(f"Failed to handle reaction: {e}", exc_info=True)
             logger.error(f"Full reaction config: {self.reaction_roles}")
 
     @module_group_reaction.subcommand(
@@ -1397,18 +1417,89 @@ class Roles(interactions.Extension):
             role = await guild.fetch_role(role_id)
 
             if role is not None:
-                await (member.remove_roles if action == "add" else member.add_roles)(
-                    [role]
-                )
+                if action == "add":
+                    await member.remove_roles([role])
+                else:
+                    await member.add_roles([role])
             logger.info(
                 f"{'Removed' if action == 'add' else 'Added'} role {role.id} "
                 f"{'from' if action == 'add' else 'to'} member {member.id} via reaction removal"
             )
 
         except Exception as e:
-            logger.error(f"Failed to handle reaction removal: {e}")
+            logger.error(f"Failed to handle reaction removal: {e}", exc_info=True)
 
     # Debug commands
+
+    @module_group_debug.subcommand(
+        "delete", sub_cmd_description="Delete files from the extension directory"
+    )
+    @interactions.slash_option(
+        name="type",
+        description="Type of files to delete",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+        autocomplete=True,
+        argument_name="file_type",
+    )
+    @interactions.check(interactions.has_id(1268909926458064991))
+    async def command_delete(
+        self, ctx: interactions.SlashContext, file_type: str
+    ) -> None:
+        await ctx.defer(ephemeral=True)
+
+        if not os.path.exists(BASE_DIR):
+            return await self.send_error(ctx, "Extension directory does not exist.")
+
+        if file_type == "all":
+            return await self.send_error(
+                ctx, "Cannot delete all files at once for safety reasons."
+            )
+
+        file_path = os.path.join(BASE_DIR, file_type)
+        if not os.path.isfile(file_path):
+            return await self.send_error(
+                ctx, f"File `{file_type}` does not exist in the extension directory."
+            )
+
+        try:
+            os.remove(file_path)
+            await ctx.send(f"Successfully deleted file `{file_type}`.")
+            logger.info(f"Deleted file {file_type} from extension directory")
+
+        except PermissionError:
+            logger.error(f"Permission denied while deleting {file_type}")
+            await self.send_error(ctx, "Permission denied while deleting file.")
+        except Exception as e:
+            logger.error(f"Error deleting {file_type}: {e}", exc_info=True)
+            await self.send_error(
+                ctx, f"An error occurred while deleting {file_type}: {str(e)}"
+            )
+
+    @command_delete.autocomplete("type")
+    async def delete_type_autocomplete(
+        self, ctx: interactions.AutocompleteContext
+    ) -> None:
+        choices: list[dict[str, str]] = []
+
+        try:
+            if os.path.exists(BASE_DIR):
+                files = [
+                    f
+                    for f in os.listdir(BASE_DIR)
+                    if os.path.isfile(os.path.join(BASE_DIR, f))
+                    and not f.startswith(".")
+                ]
+
+                choices.extend({"name": file, "value": file} for file in sorted(files))
+        except PermissionError:
+            logger.error("Permission denied while listing files")
+            choices = [{"name": "Error: Permission denied", "value": "error"}]
+        except Exception as e:
+            logger.error(f"Error listing files: {e}", exc_info=True)
+            choices = [{"name": f"Error: {str(e)}", "value": "error"}]
+
+        await ctx.send(choices[:25])
 
     @module_group_debug.subcommand(
         "export", sub_cmd_description="Export files from the extension directory"
@@ -1484,7 +1575,7 @@ class Roles(interactions.Extension):
                 try:
                     os.unlink(filename)
                 except Exception as e:
-                    logger.error(f"Error cleaning up temp file: {e}")
+                    logger.error(f"Error cleaning up temp file: {e}", exc_info=True)
 
     @command_export.autocomplete("type")
     async def export_type_autocomplete(
@@ -1623,20 +1714,21 @@ class Roles(interactions.Extension):
                                     async for message in ChannelHistoryIteractor(
                                         history
                                     ):
+                                        msg_author = await message.author
+                                        msg_timestamp = message.timestamp
+                                        msg_edited = message.edited_timestamp
+                                        msg_id = message.id
+
                                         if (
-                                            message.author.id == member_id
-                                            and (
-                                                message.edited_timestamp
-                                                or message.timestamp
-                                            )
-                                            > cutoff
+                                            msg_author.id == member_id
+                                            and (msg_edited or msg_timestamp) > cutoff
                                         ):
                                             logger.info(
                                                 f"Found activity for member {member_id} in channel {channel.id}"
                                             )
                                             is_active = True
                                             break
-                                        last_msg_id = message.id
+                                        last_msg_id = msg_id
 
                                     if not last_msg_id or is_active:
                                         break
@@ -1929,7 +2021,7 @@ class Roles(interactions.Extension):
                                 "vetting": ("vetting.json", Data),
                                 "custom": ("custom.json", dict),
                                 "incarcerated": ("incarcerated_members.json", dict),
-                                "stats": ("stats.json", Counter),
+                                "stats": ("stats.json", dict),
                                 "reaction_roles": ("reaction_roles.json", dict),
                             }.items()
                             if c == config
@@ -2095,6 +2187,22 @@ class Roles(interactions.Extension):
                                     f"- **Last Threshold Update**: <t:{int(float(value))}:R>"
                                 )
 
+                            case "repetition" | "digit_ratio" | "entropy" | "feedback":
+                                formatted_stats.append(
+                                    f"- **{key.replace('_', ' ').title()}**: {'True' if value else 'False'}"
+                                )
+
+                            case (
+                                "MESSAGE_WINDOW_SECONDS"
+                                | "MAX_REPEATED_MESSAGES"
+                                | "DIGIT_RATIO_THRESHOLD"
+                                | "MIN_MESSAGE_ENTROPY"
+                            ):
+                                if isinstance(value, (int, float)):
+                                    formatted_stats.append(
+                                        f"- **{key.replace('_', ' ').title()}**: {value:.2f}"
+                                    )
+
                             case _:
                                 if isinstance(value, (int, float)):
                                     formatted_stats.append(
@@ -2235,13 +2343,13 @@ class Roles(interactions.Extension):
                 "You don't have permission to use this command.",
             )
 
-        role_set: frozenset[str] = frozenset(map(str.strip, roles.split(",")))
-        custom_roles_set: frozenset[str] = frozenset(self.custom_roles)
+        role_set: set[str] = set(map(str.strip, roles.split(",")))
+        custom_roles_set: set[str] = set(self.custom_roles)
 
-        found_roles: frozenset[str] = role_set & custom_roles_set
-        not_found_roles: frozenset[str] = role_set - custom_roles_set
+        found_roles: set[str] = role_set & custom_roles_set
+        not_found_roles: set[str] = role_set - custom_roles_set
 
-        mentioned_users: frozenset[str] = frozenset(
+        mentioned_users: set[str] = set(
             f"<@{uid}>" for role in found_roles for uid in self.custom_roles[role]
         )
 
@@ -2698,7 +2806,7 @@ class Roles(interactions.Extension):
                 await self.send_error(ctx, "Invalid status.")
                 return None
             except Exception as e:
-                logger.exception(f"Status change failed: {e}")
+                logger.exception(f"Status change failed: {e}", exc_info=True)
                 await self.send_error(ctx, "Processing error occurred.")
                 return None
             finally:
@@ -2914,7 +3022,7 @@ class Roles(interactions.Extension):
             return False
 
         except Exception as e:
-            logger.error(f"Error updating roles for {member.id}: {e}")
+            logger.error(f"Error updating roles for {member.id}: {e}", exc_info=True)
             return False
 
     async def send_approval_notification(
@@ -3255,7 +3363,7 @@ class Roles(interactions.Extension):
             if roles_to_remove:
                 await member.remove_roles(roles_to_remove)
                 logger.info(
-                    f"Removed roles {[r.id for r in roles_to_remove]} from {member}"
+                    f"Removed roles {[r.id for r in roles_to_remove if r is not None]} from {member}"
                 )
 
             if incarcerated_role:
@@ -3265,7 +3373,9 @@ class Roles(interactions.Extension):
                 )
 
         except Exception as e:
-            logger.error(f"Error assigning roles during incarceration: {e}")
+            logger.error(
+                f"Error assigning roles during incarceration: {e}", exc_info=True
+            )
             return
 
         release_time = int(time.time() + duration.total_seconds())
@@ -3366,7 +3476,9 @@ class Roles(interactions.Extension):
                 logger.info(f"Successfully fetched {key} role: {role.id}")
                 roles[key] = role
             except Exception as e:
-                logger.error(f"Failed to fetch {key} role (ID: {role_id}): {e}")
+                logger.error(
+                    f"Failed to fetch {key} role (ID: {role_id}): {e}", exc_info=True
+                )
                 continue
 
         return roles
@@ -3397,22 +3509,12 @@ class Roles(interactions.Extension):
         message_content = event.message.content.strip()
 
         async with self.stats_lock:
-            stats = self.stats.setdefault(
-                str(author_id),
-                {
-                    "message_timestamps": [],
-                    "invalid_message_count": 0,
-                    "feedback_score": 0.0,
-                    "recovery_streaks": 0,
-                    "last_threshold_adjustment": 0.0,
-                },
-            )
+            if str(author_id) not in self.stats:
+                self.stats[str(author_id)] = Counter()
 
-            if not isinstance(stats, dict):
-                stats = stats.copy()
-            self.stats[str(author_id)] = stats
+            stats = self.stats[str(author_id)]
 
-            timestamps = stats["message_timestamps"]
+            timestamps = stats.get("message_timestamps", [])
             cutoff = current_time - 7200
             stats["message_timestamps"] = [
                 t for t in [*timestamps, current_time] if t > cutoff
@@ -3422,9 +3524,9 @@ class Roles(interactions.Extension):
                 message_content, stats, self.limit_config, self.validation_flags
             ).analyze()
 
-            invalid_count = stats["invalid_message_count"]
-            recovery_streaks = stats["recovery_streaks"]
-            feedback_score = stats["feedback_score"]
+            invalid_count = stats.get("invalid_message_count", 0)
+            recovery_streaks = stats.get("recovery_streaks", 0)
+            feedback_score = stats.get("feedback_score", 0.0)
 
             stats.update(
                 {
@@ -3455,14 +3557,14 @@ class Roles(interactions.Extension):
         ):
             return
 
-        feedback = user_stats.get("feedback_score", 0.0)
-        last_adj = user_stats.get("last_threshold_adjustment", 0.0)
+        feedback = float(user_stats.get("feedback_score", 0.0))
+        last_adj = float(user_stats.get("last_threshold_adjustment", 0.0))
         time_delta = (now := time.time()) - last_adj
 
         adj = 0.01 * feedback * math.tanh(abs(feedback) / 5)
         decay = math.exp(-time_delta / 3600)
 
-        threshold_map = {}
+        threshold_map: Dict[str, Tuple[float, float, float]] = {}
 
         if self.validation_flags.get("digit_ratio"):
             threshold_map["DIGIT_RATIO_THRESHOLD"] = (0.1, 1.0, 0.5)
@@ -3475,9 +3577,10 @@ class Roles(interactions.Extension):
                 {
                     name: min(
                         max(
-                            self.limit_config[name]
+                            float(self.limit_config.get(name, default))
                             + adj
-                            + (default - self.limit_config[name]) * (1 - decay),
+                            + (default - float(self.limit_config.get(name, default)))
+                            * (1 - decay),
                             min_v,
                         ),
                         max_v,
@@ -3500,7 +3603,7 @@ class Roles(interactions.Extension):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Failed to save stats: {e}")
+            logger.error(f"Failed to save stats: {e}", exc_info=True)
         finally:
             self.stats_save_task = None
 
@@ -3625,9 +3728,11 @@ class Roles(interactions.Extension):
                         )
 
             if members_to_remove:
-                self.stats = Counter(
-                    {k: v for k, v in self.stats.items() if k not in members_to_remove}
-                )
+                filtered_stats = {}
+                for k, v in self.stats.items():
+                    if k not in members_to_remove:
+                        filtered_stats[k] = v
+                self.stats = filtered_stats
                 await self.save_stats_roles()
                 logger.info(
                     f"Stats cleanup completed - Processed: {processed}, Removed: {removed} members"
@@ -3797,17 +3902,15 @@ class Roles(interactions.Extension):
                 if log_messages:
                     await self.send_success(None, "\n".join(log_messages))
 
-            self.stats = Counter(
-                {
-                    k: cast(Dict[str, Any], v)
-                    for k, v in self.stats.items()
-                    if (
-                        int(k) not in members_to_update
-                        or len(cast(Dict[str, Any], v).get("message_timestamps", []))
-                        < 5
-                    )
-                }
-            )
+            new_stats: Dict[str, Dict[str, Any]] = {
+                k: cast(Dict[str, Any], v)
+                for k, v in self.stats.items()
+                if (
+                    int(k) not in members_to_update
+                    or len(cast(Dict[str, Any], v).get("message_timestamps", [])) < 5
+                )
+            }
+            self.stats = new_stats
             await self.save_stats_roles()
 
         except Exception as e:
@@ -3997,15 +4100,15 @@ class Roles(interactions.Extension):
             await self.model.save_data("custom.json", serializable_custom_roles)
             logger.info("Custom roles saved successfully")
         except Exception as e:
-            logger.error(f"Failed to save custom roles: {e}")
+            logger.error(f"Failed to save custom roles: {e}", exc_info=True)
             raise
 
     async def save_stats_roles(self) -> None:
         try:
             await self.model.save_data("stats.json", dict(self.stats))
-            logger.info(f"Stats saved successfully: {self.stats!r}")
+            logger.info("Stats saved successfully")
         except Exception as e:
-            logger.error(f"Failed to save stats roles: {e!r}", exc_info=True)
+            logger.error(f"Failed to save stats roles: {e!r}")
             raise
 
     async def save_incarcerated_members(self) -> None:
