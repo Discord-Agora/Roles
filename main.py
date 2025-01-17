@@ -62,7 +62,7 @@ from interactions.api.events import (
     MessageReactionRemove,
     NewThreadCreate,
 )
-from interactions.client.errors import HTTPException, NotFound
+from interactions.client.errors import Forbidden, HTTPException, NotFound
 from interactions.ext.paginators import Paginator
 from pydantic import BaseModel
 from yarl import URL
@@ -530,6 +530,7 @@ class Roles(interactions.Extension):
         self.stats_save_task: asyncio.Task | None = None
         self.reaction_roles: Dict[str, Dict[str, Any]] = {}
         self.message_monitoring_enabled: bool = False
+        self.divider_contains: str = "[]"
         self.validation_flags: Dict[str, bool] = {
             "repetition": True,
             "digit_ratio": True,
@@ -985,6 +986,120 @@ class Roles(interactions.Extension):
             )
         ]
 
+    # Command groups
+
+    module_base = interactions.SlashCommand(
+        name="roles", description="Role management commands"
+    )
+    module_group_custom: interactions.SlashCommand = module_base.group(
+        name="custom", description="Custom roles management"
+    )
+    module_group_vetting: interactions.SlashCommand = module_base.group(
+        name="vetting", description="Vetting management"
+    )
+    module_group_servant: interactions.SlashCommand = module_base.group(
+        name="servant", description="Servants management"
+    )
+    module_group_penitentiary: interactions.SlashCommand = module_base.group(
+        name="penitentiary", description="Penitentiary management"
+    )
+    module_group_debug: interactions.SlashCommand = module_base.group(
+        name="debug", description="Debug commands"
+    )
+    module_group_reaction: interactions.SlashCommand = module_base.group(
+        name="reaction", description="Reaction commands"
+    )
+
+    # Roles divider
+
+    def is_divider(self, role: interactions.Role) -> bool:
+        return all([(c in role.name) for c in self.divider_contains])
+
+    async def fix_member_roles(self, member: interactions.Member) -> None:
+
+        roles_reversed = member.guild.roles.copy()
+        roles_reversed.sort(key=lambda r: r.position)
+        should_add_divider = False
+
+        for role in roles_reversed:
+            if self.is_divider(role):
+                has_role = member.has_role(role)
+                if should_add_divider and not has_role:
+                    logger.info(f"Adding divider role {role.name} to member {member}")
+                    await member.add_role(role)
+                elif not should_add_divider and has_role:
+                    logger.info(
+                        f"Removing divider role {role.name} from member {member}"
+                    )
+                    await member.remove_role(role)
+                should_add_divider = False
+            else:
+                should_add_divider |= member.has_role(role) and not role.default
+
+    @module_group_debug.subcommand(
+        "divider",
+        sub_cmd_description="Manually fix divider roles status for one or all members",
+    )
+    @interactions.slash_option(
+        name="member",
+        description="Member to fix. If not specified, will fix all members' status",
+        required=False,
+        opt_type=interactions.OptionType.USER,
+    )
+    async def manual_fix(
+        self, ctx: interactions.SlashContext, member: interactions.Member = None
+    ) -> None:
+        await ctx.defer(ephemeral=True)
+
+        try:
+            if member is not None:
+                try:
+                    await self.fix_member_roles(member)
+                    await self.send_success(
+                        ctx,
+                        f"Successfully fixed divider roles for {member.display_name}.",
+                    )
+                except Forbidden:
+                    logger.warning(
+                        f"Missing permissions to modify roles for {member.display_name}"
+                    )
+                    await self.send_error(
+                        ctx,
+                        f"Missing permissions to modify roles for {member.display_name}.",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to modify roles for {member.display_name}: {e}"
+                    )
+                    await self.send_error(
+                        ctx,
+                        f"An error occurred while modifying roles for {member.display_name}.",
+                    )
+            else:
+                success_count = 0
+                failed_count = 0
+                for m in ctx.guild.members:
+                    try:
+                        await self.fix_member_roles(m)
+                        success_count += 1
+                    except Forbidden:
+                        logger.warning(
+                            f"Missing permissions to modify roles for {m.display_name}"
+                        )
+                        failed_count += 1
+                        continue
+
+                status_msg = f"Fixed divider roles for {success_count} members."
+                if failed_count > 0:
+                    status_msg += f" Failed for {failed_count} members due to missing permissions."
+                await self.send_success(ctx, status_msg)
+
+        except Exception as e:
+            error_msg = f"An error occurred while fixing divider roles: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            await self.send_error(ctx, error_msg)
+            raise
+
     # Sticky roles
 
     @interactions.listen("MemberRemove")
@@ -1091,30 +1206,6 @@ class Roles(interactions.Extension):
                 e,
                 exc_info=True,
             )
-
-    # Command groups
-
-    module_base = interactions.SlashCommand(
-        name="roles", description="Role management commands"
-    )
-    module_group_custom: interactions.SlashCommand = module_base.group(
-        name="custom", description="Custom roles management"
-    )
-    module_group_vetting: interactions.SlashCommand = module_base.group(
-        name="vetting", description="Vetting management"
-    )
-    module_group_servant: interactions.SlashCommand = module_base.group(
-        name="servant", description="Servants management"
-    )
-    module_group_penitentiary: interactions.SlashCommand = module_base.group(
-        name="penitentiary", description="Penitentiary management"
-    )
-    module_group_debug: interactions.SlashCommand = module_base.group(
-        name="debug", description="Debug commands"
-    )
-    module_group_reaction: interactions.SlashCommand = module_base.group(
-        name="reaction", description="Reaction commands"
-    )
 
     # Reaction commands
 
