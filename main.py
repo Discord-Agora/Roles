@@ -1718,22 +1718,24 @@ class Roles(interactions.Extension):
             roles = await asyncio.gather(
                 guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
                 guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
+                guild.fetch_role(self.config.APPROVED_ROLE_ID),
                 guild.fetch_role(self.config.MISSING_ROLE_ID),
             )
-            temp_role, electoral_role, missing_role = roles
+            temp_role, electoral_role, approved_role, missing_role = roles
             logger.info(
-                f"Fetched roles - temp: {temp_role.id}, electoral: {electoral_role.id}, missing: {missing_role.id}"
+                f"Fetched roles - temp: {temp_role.id}, electoral: {electoral_role.id}, approved: {approved_role.id}, missing: {missing_role.id}"
             )
 
             if not all(roles):
                 logger.error("One or more required roles not found")
                 return await self.send_error(
                     ctx,
-                    f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
+                    f"Required roles could not be found. Please verify that <@&{self.config.TEMPORARY_ROLE_ID}>, <@&{self.config.ELECTORAL_ROLE_ID}>, <@&{self.config.APPROVED_ROLE_ID}>, and <@&{self.config.MISSING_ROLE_ID}> exist in the server.",
                 )
 
             temp_cutoff = datetime.now(timezone.utc) - timedelta(days=15)
             electoral_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            approved_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             converted_members = []
 
             text_channels = {
@@ -1751,7 +1753,7 @@ class Roles(interactions.Extension):
             }
             logger.info(f"Found {len(text_channels)} text channels to scan")
 
-            members_to_check = temp_role.members + electoral_role.members
+            members_to_check = temp_role.members + electoral_role.members + approved_role.members
             total_members = len(members_to_check)
             logger.info(f"Total members to check: {total_members}")
             processed = skipped = 0
@@ -1766,7 +1768,12 @@ class Roles(interactions.Extension):
 
             async def process_member(member: interactions.Member):
                 nonlocal processed, skipped
-                cutoff = temp_cutoff if temp_role in member.roles else electoral_cutoff
+                if temp_role in member.roles:
+                    cutoff = temp_cutoff
+                elif electoral_role in member.roles:
+                    cutoff = electoral_cutoff
+                else:
+                    cutoff = approved_cutoff
                 logger.debug(f"Processing member {member.id} with cutoff {cutoff}")
 
                 if member.joined_at and member.joined_at > cutoff:
@@ -1842,7 +1849,7 @@ class Roles(interactions.Extension):
                         new_roles = {
                             role.id
                             for role in member.roles
-                            if role not in (temp_role, electoral_role)
+                            if role not in (temp_role, electoral_role, approved_role)
                         } | {missing_role.id}
 
                         async with member_edit_sem:
