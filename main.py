@@ -1955,11 +1955,9 @@ class Roles(interactions.Extension):
         try:
             current_time = int(time.time())
             self.last_messages[str(msg.author.id)] = current_time
-
-            if current_time - getattr(self, "_last_save_time", 0) > 300:
-                await self.model.save_data("last_messages.json", self.last_messages)
-                self._last_save_time = current_time
-                logger.debug("Saved %d message timestamps", len(self.last_messages))
+            await self.model.save_data("last_messages.json", self.last_messages)
+            self._last_save_time = current_time
+            logger.debug("Saved %d message timestamps", len(self.last_messages))
 
         except Exception as e:
             logger.error(
