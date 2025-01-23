@@ -529,6 +529,8 @@ class Roles(interactions.Extension):
         self.reaction_roles: Dict[str, Dict[str, Any]] = {}
         self.message_monitoring_enabled: bool = False
         self.divider_contains: str = "[]"
+        self.last_messages = {}
+        self._last_save_time = 0
         self.validation_flags: Dict[str, bool] = {
             "repetition": True,
             "digit_ratio": True,
@@ -1043,7 +1045,6 @@ class Roles(interactions.Extension):
     @interactions.slash_option(
         name="member",
         description="Member to fix. If not specified, will fix all members' status",
-        required=False,
         opt_type=interactions.OptionType.USER,
     )
     async def manual_fix(
@@ -1976,7 +1977,6 @@ class Roles(interactions.Extension):
         name="days",
         description="Number of days to scan back (default: 30, max: 90)",
         opt_type=interactions.OptionType.INTEGER,
-        required=False,
         min_value=1,
         max_value=90,
     )
@@ -1996,70 +1996,81 @@ class Roles(interactions.Extension):
         await ctx.defer(ephemeral=True)
 
         try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            logger.info(f"Scanning messages for guild {guild.id}")
+
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=days or 30)
             cutoff_ms = int(cutoff_date.timestamp() * 1000)
 
+            text_channels = {
+                channel
+                for channel in guild.channels
+                if isinstance(
+                    channel, (interactions.GuildText, interactions.ThreadChannel)
+                )
+                and channel.type
+                in (
+                    interactions.ChannelType.GUILD_TEXT,
+                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
+                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
+                )
+            }
+            logger.info(f"Found {len(text_channels)} text channels to scan")
+
             channels_scanned = processed_msgs = members_updated = 0
             new_timestamps: Dict[str, float] = {}
-            message_sem = asyncio.Semaphore(1)
             updated_members: list[str] = []
 
-            all_channels = [
-                thread
-                for channel in ctx.guild.channels
-                if isinstance(channel, interactions.GuildText)
-                for thread in (
-                    [channel]
-                    + (await channel.fetch_active_threads() if (lambda: True)() else [])
-                )
-            ]
+            MESSAGE_RATE = 4
+            REPORT_THRESHOLD = 5
+            message_sem = asyncio.Semaphore(MESSAGE_RATE)
 
-            total_channels = len(all_channels)
-
-            for channel in all_channels:
+            for channel in text_channels:
                 try:
                     last_msg_id = None
                     while True:
-                        history = channel.history(
-                            limit=100, before=last_msg_id, after=cutoff_ms
-                        )
+                        async with message_sem:
+                            history = channel.history(
+                                before=last_msg_id, after=cutoff_ms
+                            )
 
-                        message_batch = []
-                        async for message in ChannelHistoryIteractor(history):
-                            if not message.author.bot:
-                                processed_msgs += 1
-                                member_id = str(message.author.id)
-                                msg_time = message.edited_timestamp or message.timestamp
+                            message_batch = []
+                            async for message in ChannelHistoryIteractor(history):
+                                if not message.author.bot:
+                                    processed_msgs += 1
+                                    member_id = str(message.author.id)
+                                    msg_time = (
+                                        message.edited_timestamp or message.timestamp
+                                    )
 
-                                if (
-                                    member_id not in new_timestamps
-                                    or msg_time > new_timestamps[member_id]
-                                ):
-                                    new_timestamps[member_id] = msg_time
-                                    members_updated += 1
-                                    updated_members.append(str(message.author))
+                                    if (
+                                        member_id not in new_timestamps
+                                        or msg_time > new_timestamps[member_id]
+                                    ):
+                                        new_timestamps[member_id] = msg_time
+                                        members_updated += 1
+                                        updated_members.append(str(message.author))
 
-                            message_batch.append(message)
+                                message_batch.append(message)
 
-                        if not message_batch:
-                            break
+                            if not message_batch:
+                                break
 
-                        last_msg_id = message_batch[-1].id
+                            last_msg_id = message_batch[-1].id
 
-                        if len(updated_members) >= 5:
-                            async with message_sem:
+                            if len(updated_members) >= REPORT_THRESHOLD:
                                 logger.info(
-                                    f"Sending batch progress report - channels: {channels_scanned}/{total_channels}"
+                                    f"Sending batch progress report - channels: {channels_scanned}/{len(text_channels)}"
                                 )
                                 await self.send_success(
                                     ctx,
                                     f"Batch progress:\n"
-                                    f"- Channels scanned: {channels_scanned}/{total_channels}\n"
+                                    f"- Channels scanned: {channels_scanned}/{len(text_channels)}\n"
                                     f"- Messages processed: {processed_msgs:,}\n"
                                     f"- Recent updates: {', '.join(updated_members[-5:])}",
                                 )
                                 await asyncio.sleep(1.0)
-                            updated_members.clear()
+                                updated_members.clear()
 
                 except Exception as e:
                     logger.error(
@@ -2069,35 +2080,26 @@ class Roles(interactions.Extension):
 
                 channels_scanned += 1
 
-            self.last_messages.update(
-                {
-                    member_id: timestamp
-                    for member_id, timestamp in new_timestamps.items()
-                    if member_id not in self.last_messages
-                    or timestamp > self.last_messages[member_id]
-                }
-            )
+            for member_id, timestamp in new_timestamps.items():
+                self.last_messages[member_id] = timestamp
 
             await self.model.save_data("last_messages.json", self.last_messages)
 
             logger.info(
-                f"Scan completed - Total channels: {total_channels}, Messages: {processed_msgs}, Members: {members_updated}"
+                f"Scan completed - Total channels: {len(text_channels)}, Messages: {processed_msgs}, Members: {members_updated}"
             )
             await self.send_success(
                 ctx,
                 f"Scan completed:\n"
-                f"- Channels scanned: {channels_scanned}/{total_channels}\n"
+                f"- Channels scanned: {channels_scanned}/{len(text_channels)}\n"
                 f"- Messages processed: {processed_msgs:,}\n"
                 f"- Members updated: {members_updated:,}\n"
                 f"- Time period: Last {days} days",
-                ephemeral=True,
             )
 
         except Exception as e:
             logger.error(f"Error in scan_messages: {e}", exc_info=True)
-            await self.send_error(
-                ctx, f"An error occurred during the scan: {str(e)}", ephemeral=True
-            )
+            await self.send_error(ctx, f"An error occurred during the scan: {str(e)}")
 
     # Check and resolve role conflicts
 
@@ -3077,7 +3079,7 @@ class Roles(interactions.Extension):
                 await self.send_error(ctx, "Invalid status.")
                 return None
             except Exception as e:
-                logger.exception(f"Status change failed: {e}", exc_info=True)
+                logger.exception(f"Status change failed: {e}")
                 await self.send_error(ctx, "Processing error occurred.")
                 return None
             finally:
