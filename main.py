@@ -46,7 +46,6 @@ import aiofiles.os
 import aiofiles.ospath
 import aiohttp
 import aioshutil
-import cysimdjson
 import interactions
 import numpy as np
 import orjson
@@ -259,7 +258,6 @@ class Model(Generic[T]):
     def __init__(self) -> None:
         self.base_path: URL = URL(str(Path(__file__).parent))
         self._data_cache: Dict[str, Any] = {}
-        self.parser: cysimdjson.JSONParser = cysimdjson.JSONParser()
         self._file_locks: Dict[str, asyncio.Lock] = {}
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=min(cpu_count(), 4)
@@ -559,6 +557,7 @@ class Roles(interactions.Extension):
             self.model.load_data("incarcerated_members.json", dict),
             self.model.load_data("stats.json", dict),
             self.model.load_data("reaction_roles.json", dict),
+            self.model.load_data("last_messages.json", dict),
         ]
 
         asyncio.create_task(self.load_initial_data())
@@ -572,6 +571,7 @@ class Roles(interactions.Extension):
                 self.incarcerated_members,
                 self.stats,
                 self.reaction_roles,
+                self.last_messages,
             ) = results
             logger.info("Initial data loaded successfully")
 
@@ -1102,7 +1102,7 @@ class Roles(interactions.Extension):
 
     # Sticky roles
 
-    @interactions.listen("MemberRemove")
+    @interactions.listen(MemberRemove)
     async def on_member_remove(self, event: MemberRemove) -> None:
         try:
             member_roles = [role.id for role in event.member.roles]
@@ -1128,7 +1128,7 @@ class Roles(interactions.Extension):
                 exc_info=True,
             )
 
-    @interactions.listen("MemberAdd")
+    @interactions.listen(MemberAdd)
     async def on_member_add(self, event: MemberAdd) -> None:
         try:
             sticky_role_ids = await self.sticky_roles.get_sticky_roles(event.member.id)
@@ -1179,7 +1179,7 @@ class Roles(interactions.Extension):
                 exc_info=True,
             )
 
-    @interactions.listen("MemberUpdate")
+    @interactions.listen(MemberUpdate)
     async def on_member_update(self, event: MemberUpdate) -> None:
         try:
             before_roles: set[int] = set(role.id for role in event.before.roles)
@@ -1337,7 +1337,7 @@ class Roles(interactions.Extension):
 
         await ctx.send(choices[:25])
 
-    @interactions.listen("MessageReactionAdd")
+    @interactions.listen(MessageReactionAdd)
     async def on_reaction_add(self, event: MessageReactionAdd) -> None:
         if event.author.id == self.bot.user.id:
             return
@@ -1481,7 +1481,7 @@ class Roles(interactions.Extension):
 
         return None
 
-    @interactions.listen("MessageReactionRemove")
+    @interactions.listen(MessageReactionRemove)
     async def on_reaction_remove(self, event: MessageReactionRemove) -> None:
         if event.author.id == self.bot.user.id:
             return
@@ -1520,7 +1520,7 @@ class Roles(interactions.Extension):
         except Exception as e:
             logger.error(f"Failed to handle reaction removal: {e}", exc_info=True)
 
-    # Debug commands
+    # Delete files
 
     @module_group_debug.subcommand(
         "delete", sub_cmd_description="Delete files from the extension directory"
@@ -1591,6 +1591,8 @@ class Roles(interactions.Extension):
             choices = [{"name": f"Error: {str(e)}", "value": "error"}]
 
         await ctx.send(choices[:25])
+
+    # Export files
 
     @module_group_debug.subcommand(
         "export", sub_cmd_description="Export files from the extension directory"
@@ -1693,6 +1695,8 @@ class Roles(interactions.Extension):
 
         await ctx.send(choices[:25])
 
+    # Inactive members
+
     @module_group_debug.subcommand(
         "inactive",
         sub_cmd_description="Convert inactive members to missing members",
@@ -1753,7 +1757,9 @@ class Roles(interactions.Extension):
             }
             logger.info(f"Found {len(text_channels)} text channels to scan")
 
-            members_to_check = temp_role.members + electoral_role.members + approved_role.members
+            members_to_check = (
+                temp_role.members + electoral_role.members + approved_role.members
+            )
             total_members = len(members_to_check)
             logger.info(f"Total members to check: {total_members}")
             processed = skipped = 0
@@ -1768,21 +1774,23 @@ class Roles(interactions.Extension):
 
             async def process_member(member: interactions.Member):
                 nonlocal processed, skipped
-                if temp_role in member.roles:
-                    cutoff = temp_cutoff
-                elif electoral_role in member.roles:
-                    cutoff = electoral_cutoff
-                else:
-                    cutoff = approved_cutoff
-                logger.debug(f"Processing member {member.id} with cutoff {cutoff}")
-
-                if member.joined_at and member.joined_at > cutoff:
-                    logger.debug(f"Member {member.id} skipped - within grace period")
-                    skipped += 1
-                    processed += 1
-                    return
-
                 try:
+                    if temp_role in member.roles:
+                        cutoff = temp_cutoff
+                    elif electoral_role in member.roles:
+                        cutoff = electoral_cutoff
+                    else:
+                        cutoff = approved_cutoff
+                    logger.debug(f"Processing member {member.id} with cutoff {cutoff}")
+
+                    if member.joined_at and member.joined_at > cutoff:
+                        logger.debug(
+                            f"Member {member.id} skipped - within grace period"
+                        )
+                        skipped += 1
+                        processed += 1
+                        return
+
                     cutoff_ts = cutoff.timestamp()
                     cutoff_ms = int(cutoff_ts * 1000)
                     member_id = member.id
@@ -1887,13 +1895,23 @@ class Roles(interactions.Extension):
                     logger.error(
                         f"Error processing member {member.id}: {e}", exc_info=True
                     )
+                    raise
 
             for i in range(0, total_members, BATCH_SIZE):
                 batch = members_to_check[i : i + BATCH_SIZE]
                 logger.info(
                     f"Processing batch {i//BATCH_SIZE + 1} with {len(batch)} members"
                 )
-                await asyncio.gather(*(process_member(m) for m in batch))
+                try:
+                    await asyncio.gather(*(process_member(m) for m in batch))
+                except Exception as e:
+                    logger.error(f"Batch processing failed: {e}", exc_info=True)
+                    await self.send_error(
+                        ctx,
+                        f"An error occurred while processing batch {i//BATCH_SIZE + 1}: {str(e)}. Process stopped.",
+                    )
+                    return
+
                 await asyncio.sleep(10.0)
 
                 if converted_members:
@@ -1927,6 +1945,161 @@ class Roles(interactions.Extension):
             await self.send_error(
                 ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
             )
+
+    @interactions.listen(MessageCreate)
+    async def on_message(self, event: MessageCreate) -> None:
+        if not (msg := event.message) or msg.author.bot:
+            return
+
+        try:
+            current_time = int(time.time())
+            self.last_messages[str(msg.author.id)] = current_time
+
+            if current_time - getattr(self, "_last_save_time", 0) > 300:
+                await self.model.save_data("last_messages.json", self.last_messages)
+                self._last_save_time = current_time
+                logger.debug("Saved %d message timestamps", len(self.last_messages))
+
+        except Exception as e:
+            logger.error(
+                "Failed to track message timestamp for %d: %s",
+                msg.author.id,
+                e,
+                exc_info=True,
+            )
+
+    @module_group_debug.subcommand(
+        "scan",
+        sub_cmd_description="Scan all channels to update last message timestamps",
+    )
+    @interactions.slash_option(
+        name="days",
+        description="Number of days to scan back (default: 30, max: 90)",
+        opt_type=interactions.OptionType.INTEGER,
+        required=False,
+        min_value=1,
+        max_value=90,
+    )
+    @error_handler
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    async def scan_messages(
+        self, ctx: interactions.SlashContext, days: Optional[int] = 30
+    ) -> None:
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            return await self.send_error(
+                ctx, "This command requires Administrator permission."
+            )
+
+        await ctx.defer(ephemeral=True)
+
+        try:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days or 30)
+            cutoff_ms = int(cutoff_date.timestamp() * 1000)
+
+            channels_scanned = processed_msgs = members_updated = 0
+            new_timestamps: Dict[str, float] = {}
+            message_sem = asyncio.Semaphore(1)
+            updated_members: list[str] = []
+
+            all_channels = [
+                thread
+                for channel in ctx.guild.channels
+                if isinstance(channel, interactions.GuildText)
+                for thread in (
+                    [channel]
+                    + (await channel.fetch_active_threads() if (lambda: True)() else [])
+                )
+            ]
+
+            total_channels = len(all_channels)
+
+            for channel in all_channels:
+                try:
+                    last_msg_id = None
+                    while True:
+                        history = channel.history(
+                            limit=100, before=last_msg_id, after=cutoff_ms
+                        )
+
+                        message_batch = []
+                        async for message in ChannelHistoryIteractor(history):
+                            if not message.author.bot:
+                                processed_msgs += 1
+                                member_id = str(message.author.id)
+                                msg_time = message.edited_timestamp or message.timestamp
+
+                                if (
+                                    member_id not in new_timestamps
+                                    or msg_time > new_timestamps[member_id]
+                                ):
+                                    new_timestamps[member_id] = msg_time
+                                    members_updated += 1
+                                    updated_members.append(str(message.author))
+
+                            message_batch.append(message)
+
+                        if not message_batch:
+                            break
+
+                        last_msg_id = message_batch[-1].id
+
+                        if len(updated_members) >= 5:
+                            async with message_sem:
+                                logger.info(
+                                    f"Sending batch progress report - channels: {channels_scanned}/{total_channels}"
+                                )
+                                await self.send_success(
+                                    ctx,
+                                    f"Batch progress:\n"
+                                    f"- Channels scanned: {channels_scanned}/{total_channels}\n"
+                                    f"- Messages processed: {processed_msgs:,}\n"
+                                    f"- Recent updates: {', '.join(updated_members[-5:])}",
+                                )
+                                await asyncio.sleep(1.0)
+                            updated_members.clear()
+
+                except Exception as e:
+                    logger.error(
+                        f"Error scanning channel {channel.id}: {e}", exc_info=True
+                    )
+                    continue
+
+                channels_scanned += 1
+
+            self.last_messages.update(
+                {
+                    member_id: timestamp
+                    for member_id, timestamp in new_timestamps.items()
+                    if member_id not in self.last_messages
+                    or timestamp > self.last_messages[member_id]
+                }
+            )
+
+            await self.model.save_data("last_messages.json", self.last_messages)
+
+            logger.info(
+                f"Scan completed - Total channels: {total_channels}, Messages: {processed_msgs}, Members: {members_updated}"
+            )
+            await self.send_success(
+                ctx,
+                f"Scan completed:\n"
+                f"- Channels scanned: {channels_scanned}/{total_channels}\n"
+                f"- Messages processed: {processed_msgs:,}\n"
+                f"- Members updated: {members_updated:,}\n"
+                f"- Time period: Last {days} days",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in scan_messages: {e}", exc_info=True)
+            await self.send_error(
+                ctx, f"An error occurred during the scan: {str(e)}", ephemeral=True
+            )
+
+    # Check and resolve role conflicts
 
     @module_group_debug.subcommand(
         "conflicts", sub_cmd_description="Check and resolve role conflicts"
