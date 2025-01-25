@@ -1968,6 +1968,121 @@ class Roles(interactions.Extension):
             )
 
     @module_group_debug.subcommand(
+        "missing",
+        sub_cmd_description="Add missing role to members without last message records",
+    )
+    @error_handler
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    async def add_missing_role(self, ctx: interactions.SlashContext) -> None:
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            await self.send_error(
+                ctx, "You need Administrator permission to use this command."
+            )
+            return
+
+        await ctx.defer(ephemeral=True)
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+
+            roles = await asyncio.gather(
+                guild.fetch_role(self.config.MISSING_ROLE_ID),
+                guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
+                guild.fetch_role(self.config.APPROVED_ROLE_ID),
+                guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
+            )
+            missing_role, electoral_role, approved_role, temp_role = roles
+
+            if not all(roles):
+                return await self.send_error(
+                    ctx, "One or more required roles could not be found."
+                )
+
+            processed = skipped = updated = 0
+            BATCH_SIZE = 10
+            members = list(ctx.guild.members)
+
+            for i in range(0, len(members), BATCH_SIZE):
+                batch = members[i : i + BATCH_SIZE]
+
+                for member in batch:
+                    try:
+                        if member.bot:
+                            skipped += 1
+                            continue
+
+                        if str(member.id) in self.last_messages:
+                            skipped += 1
+                            continue
+
+                        current_roles = set(role.id for role in member.roles)
+                        roles_to_remove = {
+                            electoral_role.id,
+                            approved_role.id,
+                            temp_role.id,
+                        }
+
+                        new_roles = (current_roles - roles_to_remove) | {
+                            missing_role.id
+                        }
+
+                        if new_roles != current_roles:
+                            await member.edit(
+                                roles=list(new_roles),
+                                reason="Adding missing role and removing status roles",
+                            )
+                            updated += 1
+
+                            removed = current_roles & roles_to_remove
+                            if removed:
+                                logger.info(
+                                    f"Member {member.id}: Removed roles {removed} and added {missing_role.id}"
+                                )
+                            else:
+                                logger.info(
+                                    f"Member {member.id}: Added {missing_role.id}"
+                                )
+
+                        processed += 1
+
+                        if processed % 50 == 0:
+                            await self.send_success(
+                                ctx,
+                                f"Progress update:\n"
+                                f"- Processed: {processed}/{len(members)}\n"
+                                f"- Updated: {updated}\n"
+                                f"- Skipped: {skipped}",
+                                log_to_channel=False,
+                                ephemeral=True,
+                            )
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing member {member.id}: {e}", exc_info=True
+                        )
+                        continue
+
+                await asyncio.sleep(2.0)
+
+            await self.send_success(
+                ctx,
+                f"Process completed:\n"
+                f"- Total members: {len(members)}\n"
+                f"- Processed: {processed}\n"
+                f"- Updated: {updated}\n"
+                f"- Skipped: {skipped}",
+            )
+
+        except Exception as e:
+            logger.error(f"Error in add_missing_role: {e}", exc_info=True)
+            await self.send_error(
+                ctx, f"An error occurred while processing members: {str(e)}"
+            )
+
+    @module_group_debug.subcommand(
         "scan",
         sub_cmd_description="Scan all channels to update last message timestamps",
     )
@@ -1982,11 +2097,16 @@ class Roles(interactions.Extension):
     @interactions.slash_default_member_permission(
         interactions.Permissions.ADMINISTRATOR
     )
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 1)
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 2)
     async def scan_messages(
         self, ctx: interactions.SlashContext, days: Optional[int] = 30
     ) -> None:
+        logger.info(f"Starting scan_messages command with days={days}")
+
         if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            logger.warning(
+                f"User {ctx.author.id} attempted to run scan_messages without admin permissions"
+            )
             return await self.send_error(
                 ctx, "This command requires Administrator permission."
             )
@@ -1995,88 +2115,88 @@ class Roles(interactions.Extension):
 
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            logger.info(f"Scanning messages for guild {guild.id}")
+            logger.info(f"Scanning messages for guild {guild.id} ({guild.name})")
 
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=days or 30)
             cutoff_ms = int(cutoff_date.timestamp() * 1000)
+            logger.info(f"Cutoff date set to {cutoff_date} ({cutoff_ms}ms)")
 
-            text_channels = {
-                channel
-                for channel in guild.channels
+            channel_ids = [
+                1150630511136481322,
+                1151389184779636766,
+                1151690834383732797,
+                1310812059155300382,
+            ]
+            logger.info(f"Using predefined channel IDs: {channel_ids}")
+
+            channels = []
+            for channel_id in channel_ids:
+                channel = await guild.fetch_channel(channel_id)
                 if isinstance(
                     channel, (interactions.GuildText, interactions.ThreadChannel)
-                )
-                and channel.type
-                in (
+                ) and channel.type in (
                     interactions.ChannelType.GUILD_TEXT,
                     interactions.ChannelType.GUILD_PUBLIC_THREAD,
                     interactions.ChannelType.GUILD_PRIVATE_THREAD,
-                )
-            }
-            logger.info(f"Found {len(text_channels)} text channels to scan")
+                ):
+                    channels.append(channel)
+                    logger.debug(
+                        f"Added channel {channel.id} ({channel.name}) to scan list"
+                    )
 
-            channels_scanned = processed_msgs = members_updated = 0
+            logger.info(f"Found {len(channels)} text channels to scan")
+
+            processed_msgs = 0
             new_timestamps: Dict[str, float] = {}
-            updated_members: list[str] = []
+            progress_counter = 0
 
-            MESSAGE_RATE = 4
-            REPORT_THRESHOLD = 5
-            message_sem = asyncio.Semaphore(MESSAGE_RATE)
+            async def scan_channel(channel):
+                nonlocal processed_msgs, progress_counter
+                logger.info(f"Scanning channel {channel.id} ({channel.name})")
 
-            for channel in text_channels:
                 try:
-                    last_msg_id = None
+                    last_message_id = None
                     while True:
-                        async with message_sem:
-                            history = channel.history(
-                                before=last_msg_id, after=cutoff_ms
+                        messages = await channel.fetch_messages(
+                            limit=100, before=last_message_id
+                        )
+                        if not messages:
+                            break
+
+                        for message in messages:
+                            if message.timestamp.timestamp() < cutoff_date.timestamp():
+                                return
+
+                            if not message.author.bot:
+                                msg_time = float(
+                                    (
+                                        message.edited_timestamp or message.timestamp
+                                    ).timestamp()
+                                )
+                                processed_msgs += 1
+                                member_id = str(message.author.id)
+                                if (
+                                    member_id not in new_timestamps
+                                    or msg_time > new_timestamps[member_id]
+                                ):
+                                    new_timestamps[member_id] = msg_time
+
+                        last_message_id = messages[-1].id
+
+                        progress_counter += 1
+                        if progress_counter % 2 == 0:
+                            await self.send_success(
+                                ctx,
+                                f"Progress update:\n"
+                                f"- Channels scanned: {progress_counter}/{len(channels)}\n"
+                                f"- Messages processed: {processed_msgs:,}",
+                                log_to_channel=False,
                             )
 
-                            message_batch = []
-                            async for message in ChannelHistoryIteractor(history):
-                                if not message.author.bot:
-                                    processed_msgs += 1
-                                    member_id = str(message.author.id)
-                                    msg_time = (
-                                        message.edited_timestamp or message.timestamp
-                                    )
-
-                                    if (
-                                        member_id not in new_timestamps
-                                        or msg_time > new_timestamps[member_id]
-                                    ):
-                                        new_timestamps[member_id] = msg_time
-                                        members_updated += 1
-                                        updated_members.append(str(message.author))
-
-                                message_batch.append(message)
-
-                            if not message_batch:
-                                break
-
-                            last_msg_id = message_batch[-1].id
-
-                            if len(updated_members) >= REPORT_THRESHOLD:
-                                logger.info(
-                                    f"Sending batch progress report - channels: {channels_scanned}/{len(text_channels)}"
-                                )
-                                await self.send_success(
-                                    ctx,
-                                    f"Batch progress:\n"
-                                    f"- Channels scanned: {channels_scanned}/{len(text_channels)}\n"
-                                    f"- Messages processed: {processed_msgs:,}\n"
-                                    f"- Recent updates: {', '.join(updated_members[-5:])}",
-                                )
-                                await asyncio.sleep(1.0)
-                                updated_members.clear()
-
                 except Exception as e:
-                    logger.error(
-                        f"Error scanning channel {channel.id}: {e}", exc_info=True
-                    )
-                    continue
+                    logger.error(f"Error scanning channel {channel.id}: {e}")
 
-                channels_scanned += 1
+            await asyncio.gather(*[scan_channel(channel) for channel in channels])
 
             for member_id, timestamp in new_timestamps.items():
                 self.last_messages[member_id] = timestamp
@@ -2084,14 +2204,14 @@ class Roles(interactions.Extension):
             await self.model.save_data("last_messages.json", self.last_messages)
 
             logger.info(
-                f"Scan completed - Total channels: {len(text_channels)}, Messages: {processed_msgs}, Members: {members_updated}"
+                f"Scan completed - Messages: {processed_msgs}, Members updated: {len(new_timestamps)}"
             )
             await self.send_success(
                 ctx,
                 f"Scan completed:\n"
-                f"- Channels scanned: {channels_scanned}/{len(text_channels)}\n"
+                f"- Channels scanned: {len(channels)}\n"
                 f"- Messages processed: {processed_msgs:,}\n"
-                f"- Members updated: {members_updated:,}\n"
+                f"- Members updated: {len(new_timestamps):,}\n"
                 f"- Time period: Last {days} days",
             )
 
