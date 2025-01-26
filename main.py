@@ -293,7 +293,15 @@ class Model:
 
             async with self.file_operation(file_path, "rb") as file:
                 content = await file.read()
-                json_parsed = orjson.loads(content)
+                if not content:
+                    logger.warning(f"File {file_name} is empty")
+                    return model() if model is not dict else {}
+
+                try:
+                    json_parsed = orjson.loads(content)
+                except orjson.JSONDecodeError as e:
+                    logger.error(f"Failed to parse {file_name}: {e}", exc_info=True)
+                    return model() if model is not dict else {}
 
                 if model is dict:
                     instance = json_parsed if json_parsed else {}
@@ -308,6 +316,7 @@ class Model:
                 return instance
 
         except FileNotFoundError:
+            logger.info(f"File {file_name} not found, creating new instance")
             instance = model() if model is not dict else {}
             await self.save_data(file_name, instance)
             return instance
