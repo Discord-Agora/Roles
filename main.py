@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import itertools
 import logging
 import math
@@ -7,7 +8,6 @@ import re
 import time
 import traceback
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -15,28 +15,23 @@ from enum import Enum, auto
 from functools import lru_cache, partial, wraps
 from itertools import islice
 from logging.handlers import RotatingFileHandler
-from multiprocessing import cpu_count
 from operator import attrgetter
 from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
     Callable,
-    Concatenate,
     Coroutine,
     DefaultDict,
     Dict,
     FrozenSet,
-    Generic,
     Iterable,
     List,
     Literal,
     Optional,
-    ParamSpec,
     Set,
     Tuple,
     Type,
-    TypeVar,
     Union,
     cast,
 )
@@ -63,7 +58,6 @@ from interactions.api.events import (
 )
 from interactions.client.errors import Forbidden, HTTPException, NotFound
 from interactions.ext.paginators import Paginator
-from pydantic import BaseModel
 from yarl import URL
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
@@ -83,11 +77,6 @@ logger.addHandler(file_handler)
 
 
 # Model
-
-
-T = TypeVar("T", bound=Union[BaseModel, Counter, Dict[str, Any]])
-
-P = ParamSpec("P")
 
 
 class Status(Enum):
@@ -113,16 +102,12 @@ class Action(Enum):
     RELEASE = "release"
 
 
-class Data(BaseModel):
+@dataclass
+class Data:
     assigned_roles: Dict[str, Dict[str, int]] = field(default_factory=dict)
     authorized_roles: Dict[str, int] = field(default_factory=dict)
     assignable_roles: Dict[str, List[str]] = field(default_factory=dict)
     incarcerated_members: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-
-    class Config:
-        json_encoders = {
-            set: list,
-        }
 
 
 @dataclass
@@ -171,35 +156,35 @@ class StickyRoles:
     def __init__(self) -> None:
         self.base_path: Path = Path(__file__).parent
         self.db_path = self.base_path / "sticky_roles.json"
-        self._data_cache: Optional[dict] = None
-        self._last_read: float = 0
-        self._cache_ttl: float = 1.0
-        self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self.roles_cache: Optional[dict] = None
+        self.last_read: float = 0
+        self.roles_cache_ttl: float = 1.0
+        self.roles_lock = asyncio.Lock()
+        self.cleanup_task: Optional[asyncio.Task] = None
 
     async def read_data(self) -> Dict[str, Any]:
-        async with self._lock:
+        async with self.roles_lock:
             if (
-                not self._data_cache
-                or (time.monotonic() - self._last_read) > self._cache_ttl
+                not self.roles_cache
+                or (time.monotonic() - self.last_read) > self.roles_cache_ttl
             ):
                 try:
-                    self._data_cache = orjson.loads(
+                    self.roles_cache = orjson.loads(
                         await (await aiofiles.open(self.db_path, mode="rb")).read()
                     )
-                    self._last_read = time.monotonic()
+                    self.last_read = time.monotonic()
                 except (IOError, orjson.JSONDecodeError):
-                    self._data_cache = {"members": {}}
-            return self._data_cache or {"members": {}}
+                    self.roles_cache = {"members": {}}
+            return self.roles_cache or {"members": {}}
 
     async def write_data(self, data: Dict[str, Any]) -> None:
-        async with self._lock:
+        async with self.roles_lock:
             serialized = orjson.dumps(
                 data, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS
             )
             async with aiofiles.open(self.db_path, mode="wb") as f:
                 await f.write(serialized)
-            self._data_cache, self._last_read = data, time.monotonic()
+            self.roles_cache, self.last_read = data, time.monotonic()
 
     async def get_sticky_roles(self, member_id: int) -> list[int]:
         try:
@@ -254,14 +239,11 @@ class StickyRoles:
             raise
 
 
-class Model(Generic[T]):
+class Model:
     def __init__(self) -> None:
         self.base_path: URL = URL(str(Path(__file__).parent))
-        self._data_cache: Dict[str, Any] = {}
-        self._file_locks: Dict[str, asyncio.Lock] = {}
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=min(cpu_count(), 4)
-        )
+        self.model_cache: Dict[str, Any] = {}
+        self.file_locks: Dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def async_retry(max_retries: int = 3, delay: float = 1.0) -> Callable:
@@ -277,7 +259,7 @@ class Model(Generic[T]):
                         logger.warning(
                             f"Attempt {attempt + 1} failed: {e}. Retrying..."
                         )
-                        await asyncio.sleep(delay * (2**attempt))
+                        await asyncio.sleep(delay * (attempt << 1))
                 return None
 
             return wrapper
@@ -285,7 +267,9 @@ class Model(Generic[T]):
         return decorator
 
     async def get_file_lock(self, file_name: str) -> asyncio.Lock:
-        return self._file_locks.setdefault(file_name, asyncio.Lock())
+        if file_name not in self.file_locks:
+            self.file_locks[file_name] = asyncio.Lock()
+        return self.file_locks[file_name]
 
     @asynccontextmanager
     async def file_operation(
@@ -301,44 +285,47 @@ class Model(Generic[T]):
                 raise
 
     @async_retry()
-    async def load_data(self, file_name: str, model: Type[T]) -> T:
+    async def load_data(self, file_name: str, model: Type[Any]) -> Any:
         file_path = self.base_path / file_name
         try:
+            if file_name in self.model_cache:
+                return self.model_cache[file_name]
+
             async with self.file_operation(file_path, "rb") as file:
                 content = await file.read()
                 json_parsed = orjson.loads(content)
 
-                if issubclass(model, BaseModel):
-                    instance = (
-                        model.model_validate_json(content)
-                        if content
-                        else model.model_validate({})
-                    )
-                else:
-                    instance = cast(T, json_parsed if json_parsed else {})
+                if model is dict:
+                    instance = json_parsed if json_parsed else {}
                     if file_name == "custom.json":
                         instance = {
                             role: set(members) for role, members in instance.items()
                         }
+                else:
+                    instance = model(**json_parsed) if json_parsed else model()
 
-                self._data_cache[file_name] = instance
+                self.model_cache[file_name] = instance
                 return instance
 
         except FileNotFoundError:
-            instance = model.model_validate({}) if issubclass(model, BaseModel) else {}
+            instance = model() if model is not dict else {}
             await self.save_data(file_name, instance)
-            return cast(T, instance)
+            return instance
 
         except Exception as e:
             logger.error(f"Error loading {file_name}: {e}", exc_info=True)
             raise ValueError(f"Failed to load {file_name}") from e
 
     @async_retry()
-    async def save_data(self, file_name: str, data: T) -> None:
+    async def save_data(self, file_name: str, data: Any) -> None:
         file_path = self.base_path / file_name
         try:
             json_data = orjson.dumps(
-                (data.model_dump(mode="json") if isinstance(data, BaseModel) else data),
+                (
+                    dataclasses.asdict(data)
+                    if dataclasses.is_dataclass(data)
+                    else data
+                ),
                 option=orjson.OPT_INDENT_2
                 | orjson.OPT_SERIALIZE_NUMPY
                 | orjson.OPT_NON_STR_KEYS,
@@ -347,15 +334,12 @@ class Model(Generic[T]):
             async with self.file_operation(file_path, "wb") as file:
                 await file.write(json_data)
 
-            self._data_cache[file_name] = data
+            self.model_cache[file_name] = data
             logger.info(f"Successfully saved data to {file_name}")
 
         except Exception as e:
             logger.error(f"Error saving {file_name}: {e}", exc_info=True)
             raise
-
-    def __del__(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 @dataclass
@@ -529,8 +513,8 @@ class Roles(interactions.Extension):
         self.reaction_roles: Dict[str, Dict[str, Any]] = {}
         self.message_monitoring_enabled: bool = False
         self.divider_contains: str = "[]"
-        self.last_messages = {}
-        self._last_save_time = 0
+        self.last_messages: Dict[str, float] = {}
+        self.last_save_time = 0
         self.validation_flags: Dict[str, bool] = {
             "repetition": True,
             "digit_ratio": True,
@@ -548,11 +532,11 @@ class Roles(interactions.Extension):
             self.config.APPROVED_ROLE_ID,
             self.config.TEMPORARY_ROLE_ID,
         }
-
+        self.TEMPORARY_GRACE_PERIOD = 5
         self.cache = TTLCache(maxsize=100, ttl=300)
 
         self.base_path: Path = Path(__file__).parent
-        self.model: Model[Any] = Model()
+        self.model: Model = Model()
         self.load_tasks: List[Coroutine] = [
             self.model.load_data("vetting.json", Data),
             self.model.load_data("custom.json", dict),
@@ -611,16 +595,14 @@ class Roles(interactions.Extension):
 
     # Decorator
 
-    ContextType = TypeVar("ContextType", bound=interactions.BaseContext)
-
     @staticmethod
     def error_handler(
-        func: Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]
-    ) -> Callable[Concatenate[Any, ContextType, P], Coroutine[Any, Any, T]]:
+        func: Callable[..., Coroutine[Any, Any, Any]]
+    ) -> Callable[..., Coroutine[Any, Any, Any]]:
         @wraps(func)
         async def wrapper(
-            self, ctx: interactions.BaseContext, *args: P.args, **kwargs: P.kwargs
-        ) -> T:
+            self, ctx: interactions.BaseContext, *args: Any, **kwargs: Any
+        ) -> Any:
             try:
                 result = await asyncio.shield(func(self, ctx, *args, **kwargs))
                 logger.info(f"`{func.__name__}` completed successfully: {result}")
@@ -783,8 +765,7 @@ class Roles(interactions.Extension):
         if guild and guild.icon:
             embed.set_footer(text=guild.name, icon_url=guild.icon.url)
 
-        embed.timestamp = datetime.now(timezone.utc)
-        embed.set_footer(text="鍵政大舞台")
+        embed.timestamp = interactions.Timestamp.now(timezone.utc)
         return embed
 
     async def notify_vetting_reviewers(
@@ -1116,10 +1097,10 @@ class Roles(interactions.Extension):
                 )
 
                 if (
-                    not self.sticky_roles._cleanup_task
-                    or self.sticky_roles._cleanup_task.done()
+                    not self.sticky_roles.cleanup_task
+                    or self.sticky_roles.cleanup_task.done()
                 ):
-                    self.sticky_roles._cleanup_task = asyncio.create_task(
+                    self.sticky_roles.cleanup_task = asyncio.create_task(
                         self.sticky_roles.cleanup_inactive_roles()
                     )
 
@@ -1698,6 +1679,260 @@ class Roles(interactions.Extension):
 
     # Inactive members
 
+    @interactions.listen(MessageCreate)
+    async def on_message_create_for_last_message(self, event: MessageCreate) -> None:
+        if not (msg := event.message) or msg.author.bot:
+            return
+
+        try:
+            current_time = int(time.time())
+            self.last_messages[str(msg.author.id)] = current_time
+            await self.model.save_data("last_messages.json", self.last_messages)
+            self.last_save_time = current_time
+            logger.debug("Saved %d message timestamps", len(self.last_messages))
+
+        except Exception as e:
+            logger.error(
+                "Failed to track message timestamp for %d: %s",
+                msg.author.id,
+                e,
+                exc_info=True,
+            )
+
+    @interactions.Task.create(interactions.IntervalTrigger(hours=24))
+    async def check_inactive_members(self) -> None:
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+
+            roles = [
+                await guild.fetch_role(role_id)
+                for role_id in (
+                    self.config.TEMPORARY_ROLE_ID,
+                    self.config.ELECTORAL_ROLE_ID,
+                    self.config.APPROVED_ROLE_ID,
+                    self.config.MISSING_ROLE_ID,
+                )
+            ]
+            temp_role, electoral_role, approved_role, missing_role = roles
+
+            if not all(roles):
+                logger.error("Required roles not found for inactive check")
+                return
+
+            now = datetime.now(timezone.utc)
+            cutoffs = {
+                temp_role.id: now - timedelta(days=15),
+                electoral_role.id: now - timedelta(days=30),
+                approved_role.id: now - timedelta(days=30),
+            }
+
+            processed = skipped = updated = 0
+            members = list(guild.members)
+
+            for batch in (members[i : i + 10] for i in range(0, len(members), 10)):
+                for member in batch:
+                    try:
+                        if member.bot:
+                            skipped += 1
+                            continue
+
+                        member_roles = {role.id for role in member.roles}
+                        last_msg_time = (
+                            datetime.fromtimestamp(
+                                float(self.last_messages[str(member.id)]), timezone.utc
+                            )
+                            if str(member.id) in self.last_messages
+                            else None
+                        )
+
+                        if (
+                            temp_role.id in member_roles
+                            and member.joined_at
+                            and (now - member.joined_at).days
+                            <= self.TEMPORARY_GRACE_PERIOD
+                        ):
+                            skipped += 1
+                            continue
+
+                        roles_to_remove = {
+                            role_id
+                            for role_id, cutoff in cutoffs.items()
+                            if role_id in member_roles
+                            and (not last_msg_time or last_msg_time <= cutoff)
+                        }
+
+                        if roles_to_remove:
+                            new_roles = (member_roles - roles_to_remove) | {
+                                missing_role.id
+                            }
+                            try:
+                                await member.edit(
+                                    roles=list(new_roles),
+                                    reason="Automated inactive member processing",
+                                )
+                                await self.send_success(
+                                    None,
+                                    f"Member {member.mention} has been marked as inactive due to no activity in the past {15 if temp_role.id in member_roles else 30} days.",
+                                )
+                                updated += 1
+                                logger.info(
+                                    f"Updated roles for inactive member {member.id} - Removed: {roles_to_remove}, Added: {missing_role.id}"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to update roles for member {member.id}: {e}"
+                                )
+
+                        processed += 1
+
+                    except Exception as e:
+                        logger.error(f"Error processing member {member.id}: {e}")
+                        continue
+
+                await asyncio.sleep(2.0)
+
+            logger.info(
+                f"Daily inactive check completed - Processed: {processed}, Updated: {updated}, Skipped: {skipped}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in check_inactive_members: {e}", exc_info=True)
+
+    @module_group_debug.subcommand(
+        "scan", sub_cmd_description="Scan channels to update last message timestamps"
+    )
+    @interactions.slash_option(
+        name="channel",
+        description="Channel ID to scan",
+        opt_type=interactions.OptionType.CHANNEL,
+        required=True,
+    )
+    @interactions.slash_option(
+        name="days",
+        description="Number of days to scan back (default: 30, max: 90)",
+        opt_type=interactions.OptionType.INTEGER,
+        min_value=1,
+        max_value=90,
+    )
+    @error_handler
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    @interactions.max_concurrency(interactions.Buckets.GUILD, 2)
+    async def scan_messages(
+        self,
+        ctx: interactions.SlashContext,
+        channel: interactions.BaseChannel,
+        days: Optional[int] = 30,
+    ) -> None:
+        logger.info(f"Starting scan_messages command with days={days}")
+
+        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
+            logger.warning(
+                f"User {ctx.author.id} attempted to run scan_messages without admin permissions"
+            )
+            return await self.send_error(
+                ctx, "This command requires Administrator permission."
+            )
+
+        await ctx.defer(ephemeral=True)
+
+        try:
+            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
+            logger.info(f"Scanning messages for guild {guild.id} ({guild.name})")
+
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days or 30)
+            cutoff_ms = int(cutoff_date.timestamp() * 1000)
+            logger.info(f"Cutoff date set to {cutoff_date} ({cutoff_ms}ms)")
+
+            channel_id_list = [channel.id]
+            logger.info(f"Using provided channel: {channel.id}")
+
+            channels = [
+                c
+                for c in [await guild.fetch_channel(cid) for cid in channel_id_list]
+                if isinstance(c, (interactions.GuildText, interactions.ThreadChannel))
+                and c.type
+                in {
+                    interactions.ChannelType.GUILD_TEXT,
+                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
+                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
+                }
+            ]
+
+            logger.info(f"Found {len(channels)} text channels to scan")
+
+            processed_msgs = 0
+            new_timestamps: Dict[str, float] = {}
+            progress_counter = 0
+
+            async def scan_channel(channel):
+                nonlocal processed_msgs, progress_counter
+                logger.info(f"Scanning channel {channel.id} ({channel.name})")
+
+                try:
+                    last_message_id = None
+                    while True:
+                        messages = await channel.fetch_messages(
+                            limit=100, before=last_message_id
+                        )
+                        if not messages:
+                            break
+
+                        for message in messages:
+                            if message.timestamp.timestamp() < cutoff_date.timestamp():
+                                return
+
+                            if not message.author.bot:
+                                msg_time = float(
+                                    (
+                                        message.edited_timestamp or message.timestamp
+                                    ).timestamp()
+                                )
+                                processed_msgs += 1
+                                member_id = str(message.author.id)
+                                new_timestamps[member_id] = max(
+                                    new_timestamps.get(member_id, float("-inf")),
+                                    msg_time,
+                                )
+
+                        last_message_id = messages[-1].id
+
+                        progress_counter += 1
+                        if not progress_counter % 2:
+                            await self.send_success(
+                                ctx,
+                                f"Progress update:\n"
+                                f"- Channels scanned: {progress_counter}/{len(channels)}\n"
+                                f"- Messages processed: {processed_msgs:,}",
+                                log_to_channel=False,
+                            )
+
+                except Exception as e:
+                    logger.error(f"Error scanning channel {channel.id}: {e}")
+
+            tasks = [asyncio.create_task(scan_channel(ch)) for ch in channels]
+            await asyncio.wait(tasks)
+
+            self.last_messages.update(new_timestamps)
+            await self.model.save_data("last_messages.json", self.last_messages)
+
+            logger.info(
+                f"Scan completed - Messages: {processed_msgs}, Members updated: {len(new_timestamps)}"
+            )
+            await self.send_success(
+                ctx,
+                f"Scan completed:\n"
+                f"- Channels scanned: {len(channels)}\n"
+                f"- Messages processed: {processed_msgs:,}\n"
+                f"- Members updated: {len(new_timestamps):,}\n"
+                f"- Time period: Last {days} days",
+            )
+
+        except Exception as e:
+            logger.error(f"Error in scan_messages: {e}", exc_info=True)
+            await self.send_error(ctx, f"An error occurred during the scan: {str(e)}")
+
     @module_group_debug.subcommand(
         "inactive",
         sub_cmd_description="Convert inactive members to missing members",
@@ -1947,26 +2182,6 @@ class Roles(interactions.Extension):
                 ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
             )
 
-    @interactions.listen(MessageCreate)
-    async def on_message(self, event: MessageCreate) -> None:
-        if not (msg := event.message) or msg.author.bot:
-            return
-
-        try:
-            current_time = int(time.time())
-            self.last_messages[str(msg.author.id)] = current_time
-            await self.model.save_data("last_messages.json", self.last_messages)
-            self._last_save_time = current_time
-            logger.debug("Saved %d message timestamps", len(self.last_messages))
-
-        except Exception as e:
-            logger.error(
-                "Failed to track message timestamp for %d: %s",
-                msg.author.id,
-                e,
-                exc_info=True,
-            )
-
     @module_group_debug.subcommand(
         "missing",
         sub_cmd_description="Add missing role to members without last message records",
@@ -1988,45 +2203,37 @@ class Roles(interactions.Extension):
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
 
-            roles = await asyncio.gather(
-                guild.fetch_role(self.config.MISSING_ROLE_ID),
-                guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
-                guild.fetch_role(self.config.APPROVED_ROLE_ID),
-                guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
-            )
-            missing_role, electoral_role, approved_role, temp_role = roles
+            roles = {
+                "missing": await guild.fetch_role(self.config.MISSING_ROLE_ID),
+                "electoral": await guild.fetch_role(self.config.ELECTORAL_ROLE_ID),
+                "approved": await guild.fetch_role(self.config.APPROVED_ROLE_ID),
+                "temp": await guild.fetch_role(self.config.TEMPORARY_ROLE_ID),
+            }
 
-            if not all(roles):
+            if not all(roles.values()):
                 return await self.send_error(
                     ctx, "One or more required roles could not be found."
                 )
 
             processed = skipped = updated = 0
-            BATCH_SIZE = 10
             members = list(ctx.guild.members)
+            member_chunks = [members[i : i + 10] for i in range(0, len(members), 10)]
+            roles_to_remove = {
+                roles["electoral"].id,
+                roles["approved"].id,
+                roles["temp"].id,
+            }
 
-            for i in range(0, len(members), BATCH_SIZE):
-                batch = members[i : i + BATCH_SIZE]
-
-                for member in batch:
+            for chunk in member_chunks:
+                for member in chunk:
                     try:
-                        if member.bot:
+                        if member.bot or str(member.id) in self.last_messages:
                             skipped += 1
                             continue
 
-                        if str(member.id) in self.last_messages:
-                            skipped += 1
-                            continue
-
-                        current_roles = set(role.id for role in member.roles)
-                        roles_to_remove = {
-                            electoral_role.id,
-                            approved_role.id,
-                            temp_role.id,
-                        }
-
+                        current_roles = {role.id for role in member.roles}
                         new_roles = (current_roles - roles_to_remove) | {
-                            missing_role.id
+                            roles["missing"].id
                         }
 
                         if new_roles != current_roles:
@@ -2037,18 +2244,13 @@ class Roles(interactions.Extension):
                             updated += 1
 
                             removed = current_roles & roles_to_remove
-                            if removed:
-                                logger.info(
-                                    f"Member {member.id}: Removed roles {removed} and added {missing_role.id}"
-                                )
-                            else:
-                                logger.info(
-                                    f"Member {member.id}: Added {missing_role.id}"
-                                )
+                            logger.info(
+                                f"Member {member.id}: {'Removed roles ' + str(removed) + ' and ' if removed else ''} Added {roles['missing'].id}"
+                            )
 
                         processed += 1
 
-                        if processed % 50 == 0:
+                        if not processed % 50:
                             await self.send_success(
                                 ctx,
                                 f"Progress update:\n"
@@ -2056,7 +2258,6 @@ class Roles(interactions.Extension):
                                 f"- Updated: {updated}\n"
                                 f"- Skipped: {skipped}",
                                 log_to_channel=False,
-                                ephemeral=True,
                             )
 
                     except Exception as e:
@@ -2081,143 +2282,6 @@ class Roles(interactions.Extension):
             await self.send_error(
                 ctx, f"An error occurred while processing members: {str(e)}"
             )
-
-    @module_group_debug.subcommand(
-        "scan",
-        sub_cmd_description="Scan all channels to update last message timestamps",
-    )
-    @interactions.slash_option(
-        name="days",
-        description="Number of days to scan back (default: 30, max: 90)",
-        opt_type=interactions.OptionType.INTEGER,
-        min_value=1,
-        max_value=90,
-    )
-    @error_handler
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
-    )
-    @interactions.max_concurrency(interactions.Buckets.GUILD, 2)
-    async def scan_messages(
-        self, ctx: interactions.SlashContext, days: Optional[int] = 30
-    ) -> None:
-        logger.info(f"Starting scan_messages command with days={days}")
-
-        if not ctx.author.guild_permissions & interactions.Permissions.ADMINISTRATOR:
-            logger.warning(
-                f"User {ctx.author.id} attempted to run scan_messages without admin permissions"
-            )
-            return await self.send_error(
-                ctx, "This command requires Administrator permission."
-            )
-
-        await ctx.defer(ephemeral=True)
-
-        try:
-            guild = await self.bot.fetch_guild(self.config.GUILD_ID)
-            logger.info(f"Scanning messages for guild {guild.id} ({guild.name})")
-
-            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days or 30)
-            cutoff_ms = int(cutoff_date.timestamp() * 1000)
-            logger.info(f"Cutoff date set to {cutoff_date} ({cutoff_ms}ms)")
-
-            channel_ids = [
-                1150630511136481322,
-                1151389184779636766,
-                1151690834383732797,
-                1310812059155300382,
-            ]
-            logger.info(f"Using predefined channel IDs: {channel_ids}")
-
-            channels = []
-            for channel_id in channel_ids:
-                channel = await guild.fetch_channel(channel_id)
-                if isinstance(
-                    channel, (interactions.GuildText, interactions.ThreadChannel)
-                ) and channel.type in (
-                    interactions.ChannelType.GUILD_TEXT,
-                    interactions.ChannelType.GUILD_PUBLIC_THREAD,
-                    interactions.ChannelType.GUILD_PRIVATE_THREAD,
-                ):
-                    channels.append(channel)
-                    logger.debug(
-                        f"Added channel {channel.id} ({channel.name}) to scan list"
-                    )
-
-            logger.info(f"Found {len(channels)} text channels to scan")
-
-            processed_msgs = 0
-            new_timestamps: Dict[str, float] = {}
-            progress_counter = 0
-
-            async def scan_channel(channel):
-                nonlocal processed_msgs, progress_counter
-                logger.info(f"Scanning channel {channel.id} ({channel.name})")
-
-                try:
-                    last_message_id = None
-                    while True:
-                        messages = await channel.fetch_messages(
-                            limit=100, before=last_message_id
-                        )
-                        if not messages:
-                            break
-
-                        for message in messages:
-                            if message.timestamp.timestamp() < cutoff_date.timestamp():
-                                return
-
-                            if not message.author.bot:
-                                msg_time = float(
-                                    (
-                                        message.edited_timestamp or message.timestamp
-                                    ).timestamp()
-                                )
-                                processed_msgs += 1
-                                member_id = str(message.author.id)
-                                if (
-                                    member_id not in new_timestamps
-                                    or msg_time > new_timestamps[member_id]
-                                ):
-                                    new_timestamps[member_id] = msg_time
-
-                        last_message_id = messages[-1].id
-
-                        progress_counter += 1
-                        if progress_counter % 2 == 0:
-                            await self.send_success(
-                                ctx,
-                                f"Progress update:\n"
-                                f"- Channels scanned: {progress_counter}/{len(channels)}\n"
-                                f"- Messages processed: {processed_msgs:,}",
-                                log_to_channel=False,
-                            )
-
-                except Exception as e:
-                    logger.error(f"Error scanning channel {channel.id}: {e}")
-
-            await asyncio.gather(*[scan_channel(channel) for channel in channels])
-
-            for member_id, timestamp in new_timestamps.items():
-                self.last_messages[member_id] = timestamp
-
-            await self.model.save_data("last_messages.json", self.last_messages)
-
-            logger.info(
-                f"Scan completed - Messages: {processed_msgs}, Members updated: {len(new_timestamps)}"
-            )
-            await self.send_success(
-                ctx,
-                f"Scan completed:\n"
-                f"- Channels scanned: {len(channels)}\n"
-                f"- Messages processed: {processed_msgs:,}\n"
-                f"- Members updated: {len(new_timestamps):,}\n"
-                f"- Time period: Last {days} days",
-            )
-
-        except Exception as e:
-            logger.error(f"Error in scan_messages: {e}", exc_info=True)
-            await self.send_error(ctx, f"An error occurred during the scan: {str(e)}")
 
     # Check and resolve role conflicts
 
@@ -4041,6 +4105,7 @@ class Roles(interactions.Extension):
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
         self.cleanup_stats.start()
+        self.check_inactive_members.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
@@ -4049,6 +4114,7 @@ class Roles(interactions.Extension):
             self.cleanup_old_locks,
             self.check_incarcerated_members,
             self.cleanup_stats,
+            self.check_inactive_members,
         )
         for task in tasks_to_stop:
             task.stop()
