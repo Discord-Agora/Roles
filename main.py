@@ -321,11 +321,7 @@ class Model:
         file_path = self.base_path / file_name
         try:
             json_data = orjson.dumps(
-                (
-                    dataclasses.asdict(data)
-                    if dataclasses.is_dataclass(data)
-                    else data
-                ),
+                (dataclasses.asdict(data) if dataclasses.is_dataclass(data) else data),
                 option=orjson.OPT_INDENT_2
                 | orjson.OPT_SERIALIZE_NUMPY
                 | orjson.OPT_NON_STR_KEYS,
@@ -515,6 +511,7 @@ class Roles(interactions.Extension):
         self.divider_contains: str = "[]"
         self.last_messages: Dict[str, float] = {}
         self.last_save_time = 0
+        self.inactive_check_task: interactions.Task | None = None
         self.validation_flags: Dict[str, bool] = {
             "repetition": True,
             "digit_ratio": True,
@@ -1699,7 +1696,47 @@ class Roles(interactions.Extension):
                 exc_info=True,
             )
 
-    @interactions.Task.create(interactions.IntervalTrigger(hours=24))
+    @module_group_debug.subcommand(
+        "check", sub_cmd_description="Toggle the inactive member check task"
+    )
+    @interactions.slash_option(
+        name="enabled",
+        description="Enable or disable the task",
+        opt_type=interactions.OptionType.BOOLEAN,
+        required=True,
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    @error_handler
+    async def toggle_inactive_check(
+        self, ctx: interactions.SlashContext, enabled: bool
+    ) -> None:
+        if enabled:
+            if self.inactive_check_task is None:
+                self.inactive_check_task = interactions.Task(
+                    self.check_inactive_members, interactions.IntervalTrigger(hours=24)
+                )
+                self.inactive_check_task.start()
+                await self.send_success(
+                    ctx, "Inactive member check task has been enabled."
+                )
+                logger.info("Inactive member check task enabled")
+            else:
+                await self.send_error(
+                    ctx, "Inactive member check task is already running."
+                )
+        else:
+            if self.inactive_check_task is not None:
+                self.inactive_check_task.stop()
+                self.inactive_check_task = None
+                await self.send_success(
+                    ctx, "Inactive member check task has been disabled."
+                )
+                logger.info("Inactive member check task disabled")
+            else:
+                await self.send_error(ctx, "Inactive member check task is not running.")
+
     async def check_inactive_members(self) -> None:
         try:
             guild = await self.bot.fetch_guild(self.config.GUILD_ID)
@@ -4105,7 +4142,6 @@ class Roles(interactions.Extension):
         self.cleanup_old_locks.start()
         self.check_incarcerated_members.start()
         self.cleanup_stats.start()
-        self.check_inactive_members.start()
 
     @interactions.listen(ExtensionUnload)
     async def on_extension_unload(self, event: ExtensionUnload) -> None:
