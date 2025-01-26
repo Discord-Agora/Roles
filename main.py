@@ -511,6 +511,7 @@ class Roles(interactions.Extension):
         self.divider_contains: str = "[]"
         self.last_messages: Dict[str, float] = {}
         self.last_save_time = 0
+        self.last_messages_initialized = False
         self.inactive_check_task: interactions.Task | None = None
         self.validation_flags: Dict[str, bool] = {
             "repetition": True,
@@ -986,6 +987,12 @@ class Roles(interactions.Extension):
     module_group_debug: interactions.SlashCommand = module_base.group(
         name="debug", description="Debug commands"
     )
+    module_group_sticky: interactions.SlashCommand = module_base.group(
+        name="sticky", description="Sticky roles commands"
+    )
+    module_group_inactive: interactions.SlashCommand = module_base.group(
+        name="inactive", description="Inactive roles commands"
+    )
     module_group_reaction: interactions.SlashCommand = module_base.group(
         name="reaction", description="Reaction commands"
     )
@@ -1080,6 +1087,126 @@ class Roles(interactions.Extension):
             raise
 
     # Sticky roles
+
+    @module_group_sticky.subcommand(
+        "repair", sub_cmd_description="Repair sticky roles data discrepancies"
+    )
+    @interactions.slash_option(
+        name="source",
+        description="Which data source to use as the source of truth",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        choices=[
+            interactions.SlashCommandChoice(name="Current Server", value="server"),
+            interactions.SlashCommandChoice(name="Memory Cache", value="memory"),
+            interactions.SlashCommandChoice(name="JSON Database", value="json"),
+        ],
+    )
+    @interactions.slash_option(
+        name="member",
+        description="Member to repair sticky roles for. If not specified, repairs all members",
+        opt_type=interactions.OptionType.USER,
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    @error_handler
+    async def repair_sticky_roles(
+        self,
+        ctx: interactions.SlashContext,
+        source: str,
+        member: Optional[interactions.Member] = None,
+    ) -> None:
+        await ctx.defer(ephemeral=True)
+
+        try:
+            members_to_process = [member] if member else ctx.guild.members
+            processed = updated = skipped = 0
+
+            json_data = await self.sticky_roles.read_data()
+            memory_data = self.sticky_roles.roles_cache or {}
+
+            source_getters = {
+                "server": lambda m: {role.id for role in m.roles},
+                "memory": lambda m: set(
+                    memory_data.get("members", {})
+                    .get(str(m.id), {})
+                    .get("role_ids", [])
+                ),
+                "json": lambda m: set(
+                    json_data.get("members", {}).get(str(m.id), {}).get("role_ids", [])
+                ),
+            }
+
+            for target_member in filter(lambda m: not m.bot, members_to_process):
+                member_id = str(target_member.id)
+                current_roles = {role.id for role in target_member.roles}
+                source_roles = (
+                    source_getters[source](target_member) - self.excluded_role_ids
+                )
+
+                if source != "server":
+                    try:
+                        roles_delta = (
+                            source_roles - current_roles,
+                            current_roles - source_roles - self.excluded_role_ids,
+                        )
+                        if any(roles_delta):
+                            await target_member.edit(
+                                roles=list(
+                                    (current_roles - roles_delta[1]) | roles_delta[0]
+                                ),
+                                reason="Sticky roles repair",
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to update roles for member {member_id}: {e}"
+                        )
+                        continue
+
+                timestamp = datetime.now(timezone.utc).isoformat()
+                role_data = {"role_ids": list(source_roles), "updated_at": timestamp}
+
+                if source != "memory":
+                    if self.sticky_roles.roles_cache is None:
+                        self.sticky_roles.roles_cache = {"members": {}}
+                    elif "members" not in self.sticky_roles.roles_cache:
+                        self.sticky_roles.roles_cache["members"] = {}
+                    self.sticky_roles.roles_cache["members"][member_id] = role_data
+
+                if source != "json":
+                    json_data.setdefault("members", {})[member_id] = role_data
+
+                updated += 1
+                processed += 1
+
+                if not processed % 10:
+                    await self.send_success(
+                        ctx,
+                        f"Progress update:\n"
+                        f"- Processed: {processed}/{len(members_to_process)}\n"
+                        f"- Updated: {updated}\n"
+                        f"- Skipped: {skipped}",
+                        log_to_channel=False,
+                    )
+
+            if source != "json":
+                await self.sticky_roles.write_data(json_data)
+
+            await self.send_success(
+                ctx,
+                f"Sticky roles repair completed:\n"
+                f"- Total processed: {processed}\n"
+                f"- Updated: {updated}\n"
+                f"- Skipped: {skipped}\n"
+                f"- Source used: {source}",
+            )
+
+        except Exception as e:
+            logger.error(f"Error in repair_sticky_roles: {e}", exc_info=True)
+            await self.send_error(
+                ctx, f"An error occurred while repairing sticky roles: {str(e)}"
+            )
 
     @interactions.listen(MemberRemove)
     async def on_member_remove(self, event: MemberRemove) -> None:
@@ -1682,6 +1809,17 @@ class Roles(interactions.Extension):
             return
 
         try:
+            if not self.last_messages_initialized:
+                try:
+                    stored_messages = await self.model.load_data(
+                        "last_messages.json", dict
+                    )
+                    self.last_messages.update(stored_messages)
+                except Exception as e:
+                    logger.error(f"Failed to load last_messages.json: {e}")
+                finally:
+                    self.last_messages_initialized = True
+
             current_time = int(time.time())
             self.last_messages[str(msg.author.id)] = current_time
             await self.model.save_data("last_messages.json", self.last_messages)
@@ -1696,7 +1834,7 @@ class Roles(interactions.Extension):
                 exc_info=True,
             )
 
-    @module_group_debug.subcommand(
+    @module_group_inactive.subcommand(
         "check", sub_cmd_description="Toggle the inactive member check task"
     )
     @interactions.slash_option(
@@ -1835,7 +1973,7 @@ class Roles(interactions.Extension):
         except Exception as e:
             logger.error(f"Error in check_inactive_members: {e}", exc_info=True)
 
-    @module_group_debug.subcommand(
+    @module_group_inactive.subcommand(
         "scan", sub_cmd_description="Scan channels to update last message timestamps"
     )
     @interactions.slash_option(
@@ -1900,7 +2038,7 @@ class Roles(interactions.Extension):
             logger.info(f"Found {len(channels)} text channels to scan")
 
             processed_msgs = 0
-            new_timestamps: Dict[str, float] = {}
+            new_timestamps: Dict[str, int] = {}
             progress_counter = 0
 
             async def scan_channel(channel):
@@ -1921,7 +2059,7 @@ class Roles(interactions.Extension):
                                 return
 
                             if not message.author.bot:
-                                msg_time = float(
+                                msg_time = int(
                                     (
                                         message.edited_timestamp or message.timestamp
                                     ).timestamp()
@@ -1929,7 +2067,7 @@ class Roles(interactions.Extension):
                                 processed_msgs += 1
                                 member_id = str(message.author.id)
                                 new_timestamps[member_id] = max(
-                                    new_timestamps.get(member_id, float("-inf")),
+                                    new_timestamps.get(member_id, -2147483648),
                                     msg_time,
                                 )
 
@@ -1970,8 +2108,8 @@ class Roles(interactions.Extension):
             logger.error(f"Error in scan_messages: {e}", exc_info=True)
             await self.send_error(ctx, f"An error occurred during the scan: {str(e)}")
 
-    @module_group_debug.subcommand(
-        "inactive",
+    @module_group_inactive.subcommand(
+        "convert",
         sub_cmd_description="Convert inactive members to missing members",
     )
     @error_handler
@@ -2219,7 +2357,7 @@ class Roles(interactions.Extension):
                 ctx, f"An error occurred while converting members:\n```py\n{str(e)}```"
             )
 
-    @module_group_debug.subcommand(
+    @module_group_inactive.subcommand(
         "missing",
         sub_cmd_description="Add missing role to members without last message records",
     )
