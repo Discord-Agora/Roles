@@ -63,13 +63,14 @@ from yarl import URL
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE: str = os.path.join(BASE_DIR, "roles.log")
 
-logger = logging.getLogger(__name__)
+
+logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
-    "%(asctime)s | %(process)d:%(thread)d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
-    "%Y-%m-%d %H:%M:%S.%f %z",
+    "%(asctime)s | %(process)d - %(processName)s | %(thread)d - %(threadName)s | %(taskName)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(pathname)s | %(message)s",
+    "%Y-%m-%d %H:%M:%S,%f %z",
 )
-file_handler = RotatingFileHandler(
+file_handler: RotatingFileHandler = RotatingFileHandler(
     LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
 )
 file_handler.setFormatter(formatter)
@@ -121,11 +122,19 @@ class Config:
     MINISTER_ROLE_ID: int = 1297556675473182720
     MISSING_ROLE_ID: int = 1289949397362409472
     INCARCERATED_ROLE_ID: int = 1247284720044085370
+    DETAINED_ROLE_ID = 1322531189197639720
     AUTHORIZED_CUSTOM_ROLE_IDS: List[int] = field(
         default_factory=lambda: [1213490790341279754]
     )
     AUTHORIZED_PENITENTIARY_ROLE_IDS: List[int] = field(
-        default_factory=lambda: [1200097748259717193, 1247144717083476051]
+        default_factory=lambda: [
+            1200097748259717193,
+            1301094338465501195,
+            1292065942544711781,
+            1297556675473182720,
+            1251935385521750116,
+            1247144717083476051,
+        ]
     )
     REQUIRED_APPROVALS: int = 3
     REQUIRED_REJECTIONS: int = 3
@@ -765,6 +774,11 @@ class Roles(interactions.Extension):
                     value=field.get("value", ""),
                     inline=field.get("inline", True),
                 )
+
+        if self.bot.user:
+            embed.set_author(
+                name=self.bot.user.display_name, icon_url=self.bot.user.avatar_url
+            )
 
         guild: Optional[interactions.Guild] = await self.bot.fetch_guild(
             self.config.GUILD_ID
@@ -2480,10 +2494,11 @@ class Roles(interactions.Extension):
     async def check_role_conflicts(self, ctx: interactions.SlashContext) -> None:
         ROLE_PRIORITIES = {
             self.config.MISSING_ROLE_ID: 1,
-            self.config.INCARCERATED_ROLE_ID: 2,
-            self.config.ELECTORAL_ROLE_ID: 3,
-            self.config.APPROVED_ROLE_ID: 4,
-            self.config.TEMPORARY_ROLE_ID: 5,
+            self.config.DETAINED_ROLE_ID: 2,
+            self.config.INCARCERATED_ROLE_ID: 3,
+            self.config.ELECTORAL_ROLE_ID: 4,
+            self.config.APPROVED_ROLE_ID: 5,
+            self.config.TEMPORARY_ROLE_ID: 6,
         }
         BATCH_SIZE = 8
         ROLE_CHANGE_INTERVAL = 1.0
@@ -3839,12 +3854,23 @@ class Roles(interactions.Extension):
         required=True,
         opt_type=interactions.OptionType.STRING,
     )
+    @interactions.slash_option(
+        name="type",
+        description="Type of confinement",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+        choices=[
+            interactions.SlashCommandChoice(name="Incarcerated", value="incarcerated"),
+            interactions.SlashCommandChoice(name="Detained", value="detained"),
+        ],
+    )
     @error_handler
     async def incarcerate_member(
         self,
         ctx: interactions.SlashContext,
         member: interactions.Member,
         duration: str,
+        type: str,
     ) -> None:
         if not self.validate_penitentiary_permissions(ctx):
             return await self.send_error(
@@ -3864,6 +3890,7 @@ class Roles(interactions.Extension):
             member=member,
             action=Action.INCARCERATE,
             duration=incarceration_duration,
+            confinement_type=type,
         )
 
     @staticmethod
@@ -3964,6 +3991,7 @@ class Roles(interactions.Extension):
     def _get_role_ids(self) -> Dict[str, int]:
         return {
             "incarcerated": self.config.INCARCERATED_ROLE_ID,
+            "detained": self.config.DETAINED_ROLE_ID,
             "electoral": self.config.ELECTORAL_ROLE_ID,
             "approved": self.config.APPROVED_ROLE_ID,
             "temporary": self.config.TEMPORARY_ROLE_ID,
@@ -3975,16 +4003,17 @@ class Roles(interactions.Extension):
         roles: Dict[str, Optional[interactions.Role]],
         ctx: Optional[interactions.SlashContext],
         duration: timedelta,
+        confinement_type: str,
     ) -> None:
         try:
-            incarcerated_role = roles["incarcerated"]
+            role_to_add = roles[confinement_type]
             role_ids = self._get_role_ids()
             member_role_ids = {role.id for role in member.roles}
 
             roles_to_remove = [
                 roles.get(role_key)
                 for role_key, role_id in role_ids.items()
-                if role_key != "incarcerated"
+                if role_key not in ("incarcerated", "detained")
                 and roles.get(role_key) is not None
                 and role_id in member_role_ids
             ]
@@ -4005,15 +4034,15 @@ class Roles(interactions.Extension):
                     f"Removed roles {[r.id for r in roles_to_remove if r is not None]} from {member}"
                 )
 
-            if incarcerated_role:
-                await member.add_roles((incarcerated_role,))
+            if role_to_add:
+                await member.add_roles((role_to_add,))
                 logger.info(
-                    f"Added incarcerated role {incarcerated_role.id} to {member}"
+                    f"Added {confinement_type} role {role_to_add.id} to {member}"
                 )
 
         except Exception as e:
             logger.error(
-                f"Error assigning roles during incarceration: {e}", exc_info=True
+                f"Error assigning roles during {confinement_type}: {e}", exc_info=True
             )
             return
 
@@ -4021,12 +4050,13 @@ class Roles(interactions.Extension):
         self.incarcerated_members[str(member.id)] = {
             "release_time": str(release_time),
             "original_roles": original_roles,
+            "confinement_type": confinement_type,
         }
         await self.save_incarcerated_members()
 
         executor = getattr(ctx, "author", None)
         log_message = (
-            f"{member.mention} has been incarcerated until <t:{release_time}:F> "
+            f"{member.mention} has been {confinement_type} until <t:{release_time}:F> "
             f"(<t:{release_time}:R>) by {executor.mention if executor else 'the system'}."
         )
         await self.send_success(ctx, log_message, ephemeral=False)
@@ -4041,6 +4071,7 @@ class Roles(interactions.Extension):
         member_data = self.incarcerated_members.get(member_id_str, {})
         original_role_ids = frozenset(member_data.get("original_roles", []))
         current_role_ids = {role.id for role in member.roles}
+        confinement_type = member_data.get("confinement_type", "incarcerated")
 
         roles_to_add = tuple(
             role
@@ -4048,9 +4079,9 @@ class Roles(interactions.Extension):
             if role.id in original_role_ids and role.id not in current_role_ids
         )
 
-        if (incarcerated_role := roles.get("incarcerated")) in member.roles:
-            await member.remove_roles((incarcerated_role,))
-            logger.info(f"Removed incarcerated role from {member}")
+        if (confinement_role := roles.get(confinement_type)) in member.roles:
+            await member.remove_roles((confinement_role,))
+            logger.info(f"Removed {confinement_type} role from {member}")
 
         if roles_to_add:
             await member.add_roles(roles_to_add)
@@ -4064,7 +4095,7 @@ class Roles(interactions.Extension):
         executor = getattr(ctx, "author", None) if ctx else None
         release_time = int(float(member_data.get("release_time", 0)))
         current_time = int(time.time())
-        log_message = f"{member.mention} has been released by {executor.mention if executor else 'the system'} at <t:{current_time}:F>. Scheduled: <t:{release_time}:F>."
+        log_message = f"{member.mention} has been released from {confinement_type} status by {executor.mention if executor else 'the system'} at <t:{current_time}:F>. Scheduled: <t:{release_time}:F>."
         await self.send_success(ctx, log_message, ephemeral=False)
 
     async def schedule_release(
