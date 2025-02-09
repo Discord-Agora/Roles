@@ -67,7 +67,7 @@ LOG_FILE: str = os.path.join(BASE_DIR, "roles.log")
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
-    "%(asctime)s | %(process)d - %(processName)s | %(thread)d - %(threadName)s | %(taskName)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(pathname)s | %(message)s",
+    "%(asctime)s | %(process)d - %(processName)s | %(thread)d - %(threadName)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(pathname)s | %(message)s",
     "%Y-%m-%d %H:%M:%S,%f %z",
 )
 file_handler: RotatingFileHandler = RotatingFileHandler(
