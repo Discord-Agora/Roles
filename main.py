@@ -129,7 +129,6 @@ class Config:
     AUTHORIZED_PENITENTIARY_ROLE_IDS: List[int] = field(
         default_factory=lambda: [
             1241802041576390687,
-            1292065942544711781,
             1297556675473182720,
             1247144717083476051,
         ]
